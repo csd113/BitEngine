@@ -60,7 +60,9 @@ impl ProcessHandle {
         unsafe { libc::kill(pid, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if Instant::now() >= deadline { break; }
+            if Instant::now() >= deadline {
+                break;
+            }
             match self.child.try_wait() {
                 Ok(Some(_)) => return,
                 _ => thread::sleep(Duration::from_millis(200)),
@@ -127,10 +129,14 @@ pub fn launch_electrs(
 
     let cmd = [
         electrs.to_string_lossy().into_owned(),
-        "--network".into(),           "bitcoin".into(),
-        "--daemon-dir".into(),        bitcoin_data_dir.to_string_lossy().into_owned(),
-        "--db-dir".into(),            electrs_db_dir.to_string_lossy().into_owned(),
-        "--electrum-rpc-addr".into(), "127.0.0.1:50001".into(),
+        "--network".into(),
+        "bitcoin".into(),
+        "--daemon-dir".into(),
+        bitcoin_data_dir.to_string_lossy().into_owned(),
+        "--db-dir".into(),
+        electrs_db_dir.to_string_lossy().into_owned(),
+        "--electrum-rpc-addr".into(),
+        "127.0.0.1:50001".into(),
     ];
 
     push_line(&queue, format!("$ {}", cmd.join(" ")));

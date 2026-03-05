@@ -65,15 +65,15 @@ impl Config {
 
     fn defaults(ssd_root: &PathBuf) -> Self {
         Self {
-            binaries_path:     ssd_root.join("Binaries"),
+            binaries_path: ssd_root.join("Binaries"),
             bitcoin_data_path: ssd_root.join("BitcoinChain"),
             electrs_data_path: ssd_root.join("ElectrsDB"),
         }
     }
 
     fn load_from_file(path: &PathBuf) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read config {:?}", path))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read config {:?}", path))?;
         serde_json::from_str(&text).context("parse config JSON")
     }
 }

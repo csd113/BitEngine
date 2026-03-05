@@ -25,25 +25,25 @@ fn http_client() -> Result<Client> {
 #[derive(Debug, Clone, Serialize)]
 struct RpcRequest<'a> {
     jsonrpc: &'a str,
-    id:      &'a str,
-    method:  &'a str,
-    params:  Value,
+    id: &'a str,
+    method: &'a str,
+    params: Value,
 }
 
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
     result: Option<Value>,
-    error:  Option<Value>,
+    error: Option<Value>,
 }
 
 /// Parsed result of `getblockchaininfo`.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct BlockchainInfo {
-    pub blocks:               u64,
-    pub headers:              u64,
+    pub blocks: u64,
+    pub headers: u64,
     pub verification_progress: f64,
-    pub chain:                String,
+    pub chain: String,
     pub initial_block_download: bool,
 }
 
@@ -52,9 +52,9 @@ pub struct BlockchainInfo {
 /// Authentication credentials for Bitcoin RPC.
 #[derive(Debug, Clone)]
 pub struct RpcAuth {
-    pub user:     String,
+    pub user: String,
     pub password: String,
-    pub port:     u16,
+    pub port: u16,
 }
 
 impl RpcAuth {
@@ -77,7 +77,7 @@ impl RpcAuth {
                 let contents = contents.trim();
                 if let Some((u, p)) = contents.split_once(':') {
                     return Self {
-                        user:     u.to_owned(),
+                        user: u.to_owned(),
                         password: p.to_owned(),
                         port,
                     };
@@ -88,7 +88,11 @@ impl RpcAuth {
         // Fall back to static credentials
         let (user, password) = read_static_credentials(data_dir)
             .unwrap_or_else(|| ("bitcoin".into(), "bitcoinrpc".into()));
-        Self { user, password, port }
+        Self {
+            user,
+            password,
+            port,
+        }
     }
 }
 
@@ -109,8 +113,12 @@ fn read_static_credentials(data_dir: &Path) -> Option<(String, String)> {
     let mut password = None;
     for line in conf.lines() {
         let line = line.trim();
-        if let Some(v) = line.strip_prefix("rpcuser=")     { user     = Some(v.trim().to_owned()); }
-        if let Some(v) = line.strip_prefix("rpcpassword=") { password = Some(v.trim().to_owned()); }
+        if let Some(v) = line.strip_prefix("rpcuser=") {
+            user = Some(v.trim().to_owned());
+        }
+        if let Some(v) = line.strip_prefix("rpcpassword=") {
+            password = Some(v.trim().to_owned());
+        }
     }
     match (user, password) {
         (Some(u), Some(p)) => Some((u, p)),
@@ -127,7 +135,7 @@ pub async fn call(auth: &RpcAuth, method: &str, params: Value) -> Result<Value> 
 
     let req = RpcRequest {
         jsonrpc: "1.0",
-        id:      "bnm",
+        id: "bnm",
         method,
         params,
     };
@@ -159,10 +167,10 @@ pub async fn get_blockchain_info(auth: &RpcAuth) -> Result<BlockchainInfo> {
     let v = call(auth, "getblockchaininfo", Value::Array(vec![])).await?;
 
     Ok(BlockchainInfo {
-        blocks:               v["blocks"].as_u64().unwrap_or(0),
-        headers:              v["headers"].as_u64().unwrap_or(0),
+        blocks: v["blocks"].as_u64().unwrap_or(0),
+        headers: v["headers"].as_u64().unwrap_or(0),
         verification_progress: v["verificationprogress"].as_f64().unwrap_or(0.0),
-        chain:                v["chain"].as_str().unwrap_or("").to_owned(),
+        chain: v["chain"].as_str().unwrap_or("").to_owned(),
         initial_block_download: v["initialblockdownload"].as_bool().unwrap_or(true),
     })
 }

@@ -21,54 +21,125 @@
 //!
 //! This keeps the UI thread non-blocking at all times.
 
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use iced::widget::scrollable::{Direction, Id as ScrollId, Scrollbar};
 use iced::{
     font::Font,
     time,
-    widget::{
-        button, column, container, row, scrollable, text, text_input, Space,
-    },
+    widget::{button, column, container, row, scrollable, text, text_input, Space},
     Alignment, Color, Element, Length, Padding, Subscription, Task,
 };
-use iced::widget::scrollable::{Direction, Scrollbar, Id as ScrollId};
 use iced_runtime;
 
 use crate::{
     config::Config,
-    process_manager::{
-        self, is_electrs_synced_line, new_queue, OutputQueue, ProcessHandle,
-    },
+    process_manager::{self, is_electrs_synced_line, new_queue, OutputQueue, ProcessHandle},
     rpc::{self, BlockchainInfo, RpcAuth},
     updater::{self, UpdateResult},
 };
 
 // ── Colour palette ────────────────────────────────────────────────────────────
 
-const BG:       Color = Color { r: 0.949, g: 0.949, b: 0.969, a: 1.0 }; // #f2f2f7
-const PANEL:    Color = Color { r: 1.0,   g: 1.0,   b: 1.0,   a: 1.0 }; // white
-const BAR:      Color = Color { r: 1.0,   g: 1.0,   b: 1.0,   a: 1.0 }; // white
-const BORDER:   Color = Color { r: 0.820, g: 0.820, b: 0.839, a: 1.0 }; // #d1d1d6
-const TERM_BG:  Color = Color { r: 0.118, g: 0.118, b: 0.118, a: 1.0 }; // #1e1e1e
-const TERM_FG:  Color = Color { r: 0.831, g: 0.831, b: 0.831, a: 1.0 }; // #d4d4d4
-const GREEN:    Color = Color { r: 0.204, g: 0.780, b: 0.349, a: 1.0 }; // #34c759
-const OFF:      Color = Color { r: 0.820, g: 0.820, b: 0.839, a: 1.0 }; // #d1d1d6
-const MAC_BLUE: Color = Color { r: 0.0,   g: 0.478, b: 1.0,   a: 1.0 }; // #007aff
-const MAC_RED:  Color = Color { r: 1.0,   g: 0.231, b: 0.188, a: 1.0 }; // #ff3b30
-const MAC_ORG:  Color = Color { r: 1.0,   g: 0.584, b: 0.0,   a: 1.0 }; // #ff9500
-const BTC_ACC:  Color = Color { r: 0.973, g: 0.580, b: 0.102, a: 1.0 }; // #f7931a
-const ELS_ACC:  Color = Color { r: 0.345, g: 0.337, b: 0.839, a: 1.0 }; // #5856d6
-const TEXT_SEC: Color = Color { r: 0.282, g: 0.282, b: 0.290, a: 1.0 }; // #48484a
-const TEXT_TER: Color = Color { r: 0.557, g: 0.557, b: 0.576, a: 1.0 }; // #8e8e93
+const BG: Color = Color {
+    r: 0.949,
+    g: 0.949,
+    b: 0.969,
+    a: 1.0,
+}; // #f2f2f7
+const PANEL: Color = Color {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 1.0,
+}; // white
+const BAR: Color = Color {
+    r: 1.0,
+    g: 1.0,
+    b: 1.0,
+    a: 1.0,
+}; // white
+const BORDER: Color = Color {
+    r: 0.820,
+    g: 0.820,
+    b: 0.839,
+    a: 1.0,
+}; // #d1d1d6
+const TERM_BG: Color = Color {
+    r: 0.118,
+    g: 0.118,
+    b: 0.118,
+    a: 1.0,
+}; // #1e1e1e
+const TERM_FG: Color = Color {
+    r: 0.831,
+    g: 0.831,
+    b: 0.831,
+    a: 1.0,
+}; // #d4d4d4
+const GREEN: Color = Color {
+    r: 0.204,
+    g: 0.780,
+    b: 0.349,
+    a: 1.0,
+}; // #34c759
+const OFF: Color = Color {
+    r: 0.820,
+    g: 0.820,
+    b: 0.839,
+    a: 1.0,
+}; // #d1d1d6
+const MAC_BLUE: Color = Color {
+    r: 0.0,
+    g: 0.478,
+    b: 1.0,
+    a: 1.0,
+}; // #007aff
+const MAC_RED: Color = Color {
+    r: 1.0,
+    g: 0.231,
+    b: 0.188,
+    a: 1.0,
+}; // #ff3b30
+const MAC_ORG: Color = Color {
+    r: 1.0,
+    g: 0.584,
+    b: 0.0,
+    a: 1.0,
+}; // #ff9500
+const BTC_ACC: Color = Color {
+    r: 0.973,
+    g: 0.580,
+    b: 0.102,
+    a: 1.0,
+}; // #f7931a
+const ELS_ACC: Color = Color {
+    r: 0.345,
+    g: 0.337,
+    b: 0.839,
+    a: 1.0,
+}; // #5856d6
+const TEXT_SEC: Color = Color {
+    r: 0.282,
+    g: 0.282,
+    b: 0.290,
+    a: 1.0,
+}; // #48484a
+const TEXT_TER: Color = Color {
+    r: 0.557,
+    g: 0.557,
+    b: 0.576,
+    a: 1.0,
+}; // #8e8e93
 
 // ── Scrollable IDs for programmatic scroll-to-bottom ─────────────────────────
 
-fn bitcoin_scroll_id() -> ScrollId { ScrollId::new("bitcoin_terminal") }
-fn electrs_scroll_id() -> ScrollId { ScrollId::new("electrs_terminal") }
+fn bitcoin_scroll_id() -> ScrollId {
+    ScrollId::new("bitcoin_terminal")
+}
+fn electrs_scroll_id() -> ScrollId {
+    ScrollId::new("electrs_terminal")
+}
 
 // ── Message ───────────────────────────────────────────────────────────────────
 
@@ -103,7 +174,7 @@ pub enum Message {
     // ── Async results ─────────────────────────────────────────────────────────
     BlockchainInfoReceived(Result<BlockchainInfo, String>),
     UpdateBinaries,
-    UpdateResult(String),      // human-readable outcome message
+    UpdateResult(String), // human-readable outcome message
 
     // ── Modal / overlay ───────────────────────────────────────────────────────
     /// Dismiss the info/error overlay.
@@ -122,43 +193,43 @@ pub struct App {
     config: Config,
 
     // ── Editable path fields (may differ from saved config until Save Paths) ──
-    binaries_path_edit:     String,
+    binaries_path_edit: String,
     bitcoin_data_path_edit: String,
     electrs_data_path_edit: String,
 
     // ── Process handles ───────────────────────────────────────────────────────
-    bitcoin_handle:  Option<ProcessHandle>,
-    electrs_handle:  Option<ProcessHandle>,
+    bitcoin_handle: Option<ProcessHandle>,
+    electrs_handle: Option<ProcessHandle>,
 
     // ── Output queues (filled by background threads, drained by OutputTick) ──
-    bitcoin_queue:   OutputQueue,
-    electrs_queue:   OutputQueue,
+    bitcoin_queue: OutputQueue,
+    electrs_queue: OutputQueue,
 
     // ── Terminal display buffers ───────────────────────────────────────────────
-    bitcoin_lines:   Vec<String>,
-    electrs_lines:   Vec<String>,
+    bitcoin_lines: Vec<String>,
+    electrs_lines: Vec<String>,
 
     // ── Node status ───────────────────────────────────────────────────────────
     bitcoin_running: bool,
-    bitcoin_synced:  bool,
+    bitcoin_synced: bool,
     electrs_running: bool,
-    electrs_synced:  bool,
-    block_height:    u64,
+    electrs_synced: bool,
+    block_height: u64,
 
     // ── UI state ──────────────────────────────────────────────────────────────
-    paths_visible:   bool,
+    paths_visible: bool,
 
     /// Non-empty ⇒ display an overlay dialog with this message.
     overlay_message: Option<String>,
     /// When `overlay_message` is set, this optional path allows a "Open BitForge" button.
-    bitforge_path:   Option<PathBuf>,
+    bitforge_path: Option<PathBuf>,
 }
 
 impl App {
     pub fn new(ssd_root: PathBuf) -> Self {
         let config = Config::load(&ssd_root);
 
-        let binaries_edit     = config.binaries_path.to_string_lossy().into_owned();
+        let binaries_edit = config.binaries_path.to_string_lossy().into_owned();
         let bitcoin_data_edit = config.bitcoin_data_path.to_string_lossy().into_owned();
         let electrs_data_edit = config.electrs_data_path.to_string_lossy().into_owned();
 
@@ -167,32 +238,47 @@ impl App {
 
         // Log startup info into the terminal queues
         push_msg(&bitcoin_queue, "=== Bitcoin Node Manager started ===");
-        push_msg(&bitcoin_queue, &format!("Config   : {}", Config::config_file_path().display()));
-        push_msg(&bitcoin_queue, &format!("Binaries : {}", config.binaries_path.display()));
-        push_msg(&bitcoin_queue, &format!("Data dir : {}", config.bitcoin_data_path.display()));
+        push_msg(
+            &bitcoin_queue,
+            &format!("Config   : {}", Config::config_file_path().display()),
+        );
+        push_msg(
+            &bitcoin_queue,
+            &format!("Binaries : {}", config.binaries_path.display()),
+        );
+        push_msg(
+            &bitcoin_queue,
+            &format!("Data dir : {}", config.bitcoin_data_path.display()),
+        );
         push_msg(&electrs_queue, "=== Electrs Node Manager started ===");
-        push_msg(&electrs_queue, &format!("Binaries : {}", config.binaries_path.display()));
-        push_msg(&electrs_queue, &format!("DB dir   : {}", config.electrs_data_path.display()));
+        push_msg(
+            &electrs_queue,
+            &format!("Binaries : {}", config.binaries_path.display()),
+        );
+        push_msg(
+            &electrs_queue,
+            &format!("DB dir   : {}", config.electrs_data_path.display()),
+        );
 
         Self {
             config,
-            binaries_path_edit:     binaries_edit,
+            binaries_path_edit: binaries_edit,
             bitcoin_data_path_edit: bitcoin_data_edit,
             electrs_data_path_edit: electrs_data_edit,
-            bitcoin_handle:  None,
-            electrs_handle:  None,
+            bitcoin_handle: None,
+            electrs_handle: None,
             bitcoin_queue,
             electrs_queue,
-            bitcoin_lines:   Vec::new(),
-            electrs_lines:   Vec::new(),
+            bitcoin_lines: Vec::new(),
+            electrs_lines: Vec::new(),
             bitcoin_running: false,
-            bitcoin_synced:  false,
+            bitcoin_synced: false,
             electrs_running: false,
-            electrs_synced:  false,
-            block_height:    0,
-            paths_visible:   true,
+            electrs_synced: false,
+            block_height: 0,
+            paths_visible: true,
             overlay_message: None,
-            bitforge_path:   None,
+            bitforge_path: None,
         }
     }
 
@@ -240,10 +326,10 @@ impl App {
                     if let Some(h) = &mut self.bitcoin_handle {
                         if !h.is_running() {
                             self.bitcoin_running = false;
-                            self.bitcoin_synced  = false;
-                            self.block_height    = 0;
+                            self.bitcoin_synced = false;
+                            self.block_height = 0;
                             // If bitcoin died, electrs status is also invalid
-                            self.electrs_synced  = false;
+                            self.electrs_synced = false;
                             push_msg(&self.bitcoin_queue, "bitcoind has stopped.");
                         }
                     }
@@ -252,7 +338,7 @@ impl App {
                     if let Some(h) = &mut self.electrs_handle {
                         if !h.is_running() {
                             self.electrs_running = false;
-                            self.electrs_synced  = false;
+                            self.electrs_synced = false;
                             push_msg(&self.electrs_queue, "electrs has stopped.");
                         }
                     }
@@ -264,7 +350,10 @@ impl App {
                     tasks.push(
                         scrollable::scroll_to(
                             bitcoin_scroll_id(),
-                            scrollable::AbsoluteOffset { x: 0.0, y: f32::MAX },
+                            scrollable::AbsoluteOffset {
+                                x: 0.0,
+                                y: f32::MAX,
+                            },
                         )
                         .map(|_: iced_runtime::Action<Message>| Message::Noop),
                     );
@@ -273,7 +362,10 @@ impl App {
                     tasks.push(
                         scrollable::scroll_to(
                             electrs_scroll_id(),
-                            scrollable::AbsoluteOffset { x: 0.0, y: f32::MAX },
+                            scrollable::AbsoluteOffset {
+                                x: 0.0,
+                                y: f32::MAX,
+                            },
                         )
                         .map(|_: iced_runtime::Action<Message>| Message::Noop),
                     );
@@ -305,8 +397,7 @@ impl App {
             Message::BlockchainInfoReceived(result) => {
                 if let Ok(info) = result {
                     self.block_height = info.blocks;
-                    self.bitcoin_synced =
-                        info.headers > 0
+                    self.bitcoin_synced = info.headers > 0
                         && info.blocks >= info.headers.saturating_sub(1)
                         && info.verification_progress > 0.9999;
                 }
@@ -314,9 +405,18 @@ impl App {
             }
 
             // ── Path editing ──────────────────────────────────────────────────
-            Message::BinariesPathChanged(s)     => { self.binaries_path_edit     = s; Task::none() }
-            Message::BitcoinDataPathChanged(s)  => { self.bitcoin_data_path_edit = s; Task::none() }
-            Message::ElectrsDataPathChanged(s)  => { self.electrs_data_path_edit = s; Task::none() }
+            Message::BinariesPathChanged(s) => {
+                self.binaries_path_edit = s;
+                Task::none()
+            }
+            Message::BitcoinDataPathChanged(s) => {
+                self.bitcoin_data_path_edit = s;
+                Task::none()
+            }
+            Message::ElectrsDataPathChanged(s) => {
+                self.electrs_data_path_edit = s;
+                Task::none()
+            }
 
             Message::BrowseBinaries => Task::perform(
                 async { browse_folder("Select Binaries Folder").await },
@@ -331,21 +431,36 @@ impl App {
                 Message::ElectrsDataBrowsed,
             ),
 
-            Message::BinariesBrowsed(p)     => { if let Some(s) = p { self.binaries_path_edit = s; }     Task::none() }
-            Message::BitcoinDataBrowsed(p)  => { if let Some(s) = p { self.bitcoin_data_path_edit = s; } Task::none() }
-            Message::ElectrsDataBrowsed(p)  => { if let Some(s) = p { self.electrs_data_path_edit = s; } Task::none() }
+            Message::BinariesBrowsed(p) => {
+                if let Some(s) = p {
+                    self.binaries_path_edit = s;
+                }
+                Task::none()
+            }
+            Message::BitcoinDataBrowsed(p) => {
+                if let Some(s) = p {
+                    self.bitcoin_data_path_edit = s;
+                }
+                Task::none()
+            }
+            Message::ElectrsDataBrowsed(p) => {
+                if let Some(s) = p {
+                    self.electrs_data_path_edit = s;
+                }
+                Task::none()
+            }
 
             Message::SavePaths => {
-                let bins  = self.binaries_path_edit.trim().to_owned();
-                let btc   = self.bitcoin_data_path_edit.trim().to_owned();
-                let els   = self.electrs_data_path_edit.trim().to_owned();
+                let bins = self.binaries_path_edit.trim().to_owned();
+                let btc = self.bitcoin_data_path_edit.trim().to_owned();
+                let els = self.electrs_data_path_edit.trim().to_owned();
 
                 if bins.is_empty() || btc.is_empty() || els.is_empty() {
                     self.overlay_message = Some("All path fields must be filled in.".into());
                     return Task::none();
                 }
 
-                self.config.binaries_path     = PathBuf::from(&bins);
+                self.config.binaries_path = PathBuf::from(&bins);
                 self.config.bitcoin_data_path = PathBuf::from(&btc);
                 self.config.electrs_data_path = PathBuf::from(&els);
 
@@ -405,9 +520,9 @@ impl App {
                     Arc::clone(&self.bitcoin_queue),
                 ) {
                     Ok(handle) => {
-                        self.bitcoin_handle  = Some(handle);
+                        self.bitcoin_handle = Some(handle);
                         self.bitcoin_running = true;
-                        self.bitcoin_synced  = false;
+                        self.bitcoin_synced = false;
                     }
                     Err(e) => {
                         push_msg(&self.bitcoin_queue, &format!("Launch error: {e}"));
@@ -425,7 +540,8 @@ impl App {
                 if !self.bitcoin_running {
                     self.overlay_message = Some(
                         "Bitcoin must be running before starting Electrs.\n\
-                         Launch Bitcoin first and wait for the Running indicator.".into()
+                         Launch Bitcoin first and wait for the Running indicator."
+                            .into(),
                     );
                     return Task::none();
                 }
@@ -436,9 +552,9 @@ impl App {
                     Arc::clone(&self.electrs_queue),
                 ) {
                     Ok(handle) => {
-                        self.electrs_handle  = Some(handle);
+                        self.electrs_handle = Some(handle);
                         self.electrs_running = true;
-                        self.electrs_synced  = false;
+                        self.electrs_synced = false;
                     }
                     Err(e) => {
                         push_msg(&self.electrs_queue, &format!("Launch error: {e}"));
@@ -453,14 +569,14 @@ impl App {
                 self.terminate_electrs_internal();
 
                 if self.bitcoin_running {
-                    let auth     = RpcAuth::from_data_dir(&self.config.bitcoin_data_path);
-                    let btc_q    = Arc::clone(&self.bitcoin_queue);
+                    let auth = RpcAuth::from_data_dir(&self.config.bitcoin_data_path);
+                    let btc_q = Arc::clone(&self.bitcoin_queue);
                     push_msg(&btc_q, "Sending stop via RPC…");
 
                     // Move child out so we can wait on it in a background thread
                     if let Some(mut handle) = self.bitcoin_handle.take() {
                         self.bitcoin_running = false;
-                        self.bitcoin_synced  = false;
+                        self.bitcoin_synced = false;
                         std::thread::spawn(move || {
                             let rt = tokio::runtime::Handle::try_current();
                             // Stop via RPC; if that fails, SIGTERM the process
@@ -478,14 +594,16 @@ impl App {
                                 handle.terminate();
                             } else {
                                 // Wait up to 60 s for graceful shutdown
-                                let deadline = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(60);
+                                let deadline =
+                                    std::time::Instant::now() + std::time::Duration::from_secs(60);
                                 loop {
                                     if std::time::Instant::now() >= deadline {
                                         handle.terminate();
                                         break;
                                     }
-                                    if !handle.is_running() { break; }
+                                    if !handle.is_running() {
+                                        break;
+                                    }
                                     std::thread::sleep(std::time::Duration::from_millis(500));
                                 }
                             }
@@ -504,7 +622,7 @@ impl App {
             // ── Binary update ─────────────────────────────────────────────────
             Message::UpdateBinaries => {
                 let binaries_dst = self.config.binaries_path.clone();
-                let btc_q        = Arc::clone(&self.bitcoin_queue);
+                let btc_q = Arc::clone(&self.bitcoin_queue);
                 Task::perform(
                     async move {
                         let result = updater::run_update(&binaries_dst);
@@ -541,7 +659,7 @@ impl App {
                         "No bitcoin_builds folder found.\n\nBitForge.app is installed — open it to build binaries?".into()
                     );
                 } else {
-                    self.bitforge_path   = None;
+                    self.bitforge_path = None;
                     self.overlay_message = Some(msg);
                 }
                 Task::none()
@@ -549,14 +667,14 @@ impl App {
 
             Message::DismissOverlay => {
                 self.overlay_message = None;
-                self.bitforge_path   = None;
+                self.bitforge_path = None;
                 Task::none()
             }
 
             Message::OpenBitForge(path) => {
                 let _ = std::process::Command::new("open").arg(&path).spawn();
                 self.overlay_message = None;
-                self.bitforge_path   = None;
+                self.bitforge_path = None;
                 Task::none()
             }
 
@@ -576,7 +694,7 @@ impl App {
             });
         }
         self.electrs_running = false;
-        self.electrs_synced  = false;
+        self.electrs_synced = false;
     }
 
     // ── subscription ──────────────────────────────────────────────────────────
@@ -625,7 +743,9 @@ impl App {
             let s = self.block_height.to_string();
             let mut out = String::with_capacity(s.len() + s.len() / 3);
             for (i, ch) in s.chars().rev().enumerate() {
-                if i > 0 && i % 3 == 0 { out.push(','); }
+                if i > 0 && i % 3 == 0 {
+                    out.push(',');
+                }
                 out.push(ch);
             }
             out.chars().rev().collect::<String>()
@@ -634,12 +754,13 @@ impl App {
         };
 
         let block_stat = column![
-            text("BLOCK HEIGHT")
-                .size(9)
-                .color(TEXT_TER),
+            text("BLOCK HEIGHT").size(9).color(TEXT_TER),
             text(height_text)
                 .size(18)
-                .font(Font { weight: iced::font::Weight::Bold, ..Font::default() })
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::default()
+                })
                 .color(Color::BLACK),
         ]
         .spacing(2);
@@ -647,13 +768,9 @@ impl App {
         let update_btn = styled_button("Update Binaries…", ButtonStyle::Secondary)
             .on_press(Message::UpdateBinaries);
 
-        let toolbar_row = row![
-            block_stat,
-            Space::with_width(Length::Fill),
-            update_btn,
-        ]
-        .align_y(Alignment::Center)
-        .padding(Padding::from([0, 16]));
+        let toolbar_row = row![block_stat, Space::with_width(Length::Fill), update_btn,]
+            .align_y(Alignment::Center)
+            .padding(Padding::from([0, 16]));
 
         container(toolbar_row)
             .width(Length::Fill)
@@ -672,11 +789,14 @@ impl App {
 
         let header = row![
             text("DIRECTORY PATHS").size(10).color(TEXT_TER),
-            text(format!("  Config: {}", Config::config_file_path().display()))
-                .size(9).color(TEXT_TER),
+            text(format!(
+                "  Config: {}",
+                Config::config_file_path().display()
+            ))
+            .size(9)
+            .color(TEXT_TER),
             Space::with_width(Length::Fill),
-            styled_button(toggle_label, ButtonStyle::Secondary)
-                .on_press(Message::TogglePathsPanel),
+            styled_button(toggle_label, ButtonStyle::Secondary).on_press(Message::TogglePathsPanel),
         ]
         .align_y(Alignment::Center)
         .padding(Padding::from([10, 20]));
@@ -684,7 +804,10 @@ impl App {
         if !self.paths_visible {
             return container(header)
                 .width(Length::Fill)
-                .style(|_| container::Style { background: Some(BAR.into()), ..Default::default() })
+                .style(|_| container::Style {
+                    background: Some(BAR.into()),
+                    ..Default::default()
+                })
                 .into();
         }
 
@@ -712,10 +835,10 @@ impl App {
             ),
             row![
                 text("Changes take effect on the next node launch.")
-                    .size(10).color(TEXT_TER),
+                    .size(10)
+                    .color(TEXT_TER),
                 Space::with_width(Length::Fill),
-                styled_button("Save Paths", ButtonStyle::Confirm)
-                    .on_press(Message::SavePaths),
+                styled_button("Save Paths", ButtonStyle::Confirm).on_press(Message::SavePaths),
             ]
             .align_y(Alignment::Center)
             .padding(Padding::from([8, 0])),
@@ -723,11 +846,19 @@ impl App {
         .spacing(4)
         .padding(Padding::from([0, 20]));
 
-        let body = column![header, rows].padding(Padding { top: 0.0, right: 0.0, bottom: 4.0, left: 0.0 });
+        let body = column![header, rows].padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 4.0,
+            left: 0.0,
+        });
 
         container(body)
             .width(Length::Fill)
-            .style(|_| container::Style { background: Some(BAR.into()), ..Default::default() })
+            .style(|_| container::Style {
+                background: Some(BAR.into()),
+                ..Default::default()
+            })
             .into()
     }
 
@@ -764,13 +895,13 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn view_node_panel<'a>(
         &'a self,
-        title:   &'a str,
-        accent:  Color,
+        title: &'a str,
+        accent: Color,
         launch_msg: Message,
         running: bool,
-        synced:  bool,
-        ready:   bool,
-        lines:   &'a [String],
+        synced: bool,
+        ready: bool,
+        lines: &'a [String],
         scroll_id: ScrollId,
     ) -> Element<'a, Message> {
         // Accent top bar (3 px)
@@ -785,8 +916,11 @@ impl App {
         let launch_btn = button(
             text("Launch")
                 .size(13)
-                .font(Font { weight: iced::font::Weight::Bold, ..Font::default() })
-                .color(Color::WHITE)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::default()
+                })
+                .color(Color::WHITE),
         )
         .padding(Padding::from([5, 18]))
         .style(move |_, status| button::Style {
@@ -795,7 +929,11 @@ impl App {
                 _ => accent.into(),
             }),
             text_color: Color::WHITE,
-            border: iced::Border { color: Color::TRANSPARENT, width: 0.0, radius: 6.0.into() },
+            border: iced::Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 6.0.into(),
+            },
             shadow: iced::Shadow::default(),
         })
         .on_press(launch_msg);
@@ -803,21 +941,29 @@ impl App {
         let header = row![
             text(title)
                 .size(20)
-                .font(Font { weight: iced::font::Weight::Bold, ..Font::default() })
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::default()
+                })
                 .color(Color::BLACK),
             Space::with_width(Length::Fill),
             launch_btn,
         ]
         .align_y(Alignment::Center)
-        .padding(Padding { top: 14.0, right: 20.0, bottom: 10.0, left: 20.0 });
+        .padding(Padding {
+            top: 14.0,
+            right: 20.0,
+            bottom: 10.0,
+            left: 20.0,
+        });
 
         // Indicators
         let indicators = row![
             indicator_badge("Running", running),
             Space::with_width(24),
-            indicator_badge("Synced",  synced),
+            indicator_badge("Synced", synced),
             Space::with_width(24),
-            indicator_badge("Ready",   ready),
+            indicator_badge("Ready", ready),
         ]
         .align_y(Alignment::Center)
         .padding(Padding::from([8, 20]));
@@ -905,11 +1051,9 @@ impl App {
 // ── Overlay (modal dialog) ────────────────────────────────────────────────────
 
 fn view_overlay<'a>(message: &'a str, bitforge_path: Option<PathBuf>) -> Element<'a, Message> {
-    let mut buttons: Vec<Element<Message>> = vec![
-        styled_button("OK", ButtonStyle::Primary)
-            .on_press(Message::DismissOverlay)
-            .into(),
-    ];
+    let mut buttons: Vec<Element<Message>> = vec![styled_button("OK", ButtonStyle::Primary)
+        .on_press(Message::DismissOverlay)
+        .into()];
 
     if let Some(path) = bitforge_path {
         buttons.insert(
@@ -932,9 +1076,18 @@ fn view_overlay<'a>(message: &'a str, bitforge_path: Option<PathBuf>) -> Element
     )
     .style(|_| container::Style {
         background: Some(Color::WHITE.into()),
-        border: iced::Border { color: BORDER, width: 1.0, radius: 12.0.into() },
+        border: iced::Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 12.0.into(),
+        },
         shadow: iced::Shadow {
-            color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.25 },
+            color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.25,
+            },
             offset: iced::Vector { x: 0.0, y: 4.0 },
             blur_radius: 20.0,
         },
@@ -947,7 +1100,15 @@ fn view_overlay<'a>(message: &'a str, bitforge_path: Option<PathBuf>) -> Element
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .style(|_| container::Style {
-            background: Some(Color { r: 0.0, g: 0.0, b: 0.0, a: 0.4 }.into()),
+            background: Some(
+                Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.4,
+                }
+                .into(),
+            ),
             ..Default::default()
         });
 
@@ -978,27 +1139,23 @@ fn indicator_badge<'a>(label: &'a str, active: bool) -> Element<'a, Message> {
 }
 
 fn path_row<'a>(
-    label:        &'a str,
-    value:        &'a str,
-    on_change:    impl Fn(String) -> Message + 'a,
-    browse_msg:   Message,
-    exists:       bool,
+    label: &'a str,
+    value: &'a str,
+    on_change: impl Fn(String) -> Message + 'a,
+    browse_msg: Message,
+    exists: bool,
 ) -> Element<'a, Message> {
     let exists_dot = text("●").size(13).color(if exists { GREEN } else { OFF });
 
     row![
-        text(label)
-            .size(11)
-            .color(TEXT_SEC)
-            .width(180),
+        text(label).size(11).color(TEXT_SEC).width(180),
         text_input("", value)
             .on_input(on_change)
             .padding(Padding::from([4, 6]))
             .font(Font::MONOSPACE)
             .size(11),
         Space::with_width(6),
-        styled_button("Browse…", ButtonStyle::Secondary)
-            .on_press(browse_msg),
+        styled_button("Browse…", ButtonStyle::Secondary).on_press(browse_msg),
         Space::with_width(6),
         exists_dot,
     ]
@@ -1021,11 +1178,25 @@ enum ButtonStyle {
 
 fn styled_button(label: &str, style: ButtonStyle) -> button::Button<'_, Message> {
     let (bg, hover_bg, fg) = match style {
-        ButtonStyle::Primary     => (MAC_BLUE,                          darken(MAC_BLUE), Color::WHITE),
-        ButtonStyle::Secondary   => (Color{r:0.898,g:0.898,b:0.918,a:1.0}, Color{r:0.847,g:0.847,b:0.871,a:1.0}, Color::BLACK),
-        ButtonStyle::Destructive => (MAC_RED,                           darken(MAC_RED),  Color::WHITE),
-        ButtonStyle::Warning     => (MAC_ORG,                           darken(MAC_ORG),  Color::WHITE),
-        ButtonStyle::Confirm     => (GREEN,                             darken(GREEN),    Color::WHITE),
+        ButtonStyle::Primary => (MAC_BLUE, darken(MAC_BLUE), Color::WHITE),
+        ButtonStyle::Secondary => (
+            Color {
+                r: 0.898,
+                g: 0.898,
+                b: 0.918,
+                a: 1.0,
+            },
+            Color {
+                r: 0.847,
+                g: 0.847,
+                b: 0.871,
+                a: 1.0,
+            },
+            Color::BLACK,
+        ),
+        ButtonStyle::Destructive => (MAC_RED, darken(MAC_RED), Color::WHITE),
+        ButtonStyle::Warning => (MAC_ORG, darken(MAC_ORG), Color::WHITE),
+        ButtonStyle::Confirm => (GREEN, darken(GREEN), Color::WHITE),
     };
 
     button(text(label).size(11).color(fg))
@@ -1036,7 +1207,11 @@ fn styled_button(label: &str, style: ButtonStyle) -> button::Button<'_, Message>
                 _ => bg.into(),
             }),
             text_color: fg,
-            border: iced::Border { color: Color::TRANSPARENT, width: 0.0, radius: 6.0.into() },
+            border: iced::Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 6.0.into(),
+            },
             shadow: iced::Shadow::default(),
         })
 }
@@ -1066,7 +1241,9 @@ async fn browse_folder(title: &str) -> Option<String> {
 
 fn push_msg(queue: &OutputQueue, msg: &str) {
     if let Ok(mut q) = queue.lock() {
-        if q.len() > 10_000 { q.pop_front(); }
+        if q.len() > 10_000 {
+            q.pop_front();
+        }
         q.push_back(msg.to_owned());
     }
 }

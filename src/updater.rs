@@ -68,8 +68,7 @@ pub fn find_latest_version(search_dir: &Path, prefix: &str) -> Option<String> {
 ///
 /// Returns the list of binary names that were actually copied.
 pub fn copy_binaries(src_dir: &Path, dst_dir: &Path, names: &[&str]) -> Result<Vec<String>> {
-    fs::create_dir_all(dst_dir)
-        .with_context(|| format!("create binaries dir {:?}", dst_dir))?;
+    fs::create_dir_all(dst_dir).with_context(|| format!("create binaries dir {:?}", dst_dir))?;
 
     let mut copied = Vec::new();
 
@@ -84,20 +83,17 @@ pub fn copy_binaries(src_dir: &Path, dst_dir: &Path, names: &[&str]) -> Result<V
         let tmp = dst_dir.join(format!(".{name}.tmp"));
 
         // Write to temp first
-        fs::copy(&src, &tmp)
-            .with_context(|| format!("copy {name} to temp {:?}", tmp))?;
+        fs::copy(&src, &tmp).with_context(|| format!("copy {name} to temp {:?}", tmp))?;
 
         // Set executable permissions before rename
         let mut perms = fs::metadata(&tmp)
             .with_context(|| format!("stat {:?}", tmp))?
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&tmp, perms)
-            .with_context(|| format!("chmod {:?}", tmp))?;
+        fs::set_permissions(&tmp, perms).with_context(|| format!("chmod {:?}", tmp))?;
 
         // Atomic rename
-        fs::rename(&tmp, &dst)
-            .with_context(|| format!("rename {:?} → {:?}", tmp, dst))?;
+        fs::rename(&tmp, &dst).with_context(|| format!("rename {:?} → {:?}", tmp, dst))?;
 
         copied.push(name.to_owned());
     }
@@ -196,10 +192,10 @@ mod tests {
 
     #[test]
     fn semver_parsing() {
-        assert_eq!(parse_semver("27.0"),   Some((27, 0, 0)));
+        assert_eq!(parse_semver("27.0"), Some((27, 0, 0)));
         assert_eq!(parse_semver("0.10.5"), Some((0, 10, 5)));
-        assert_eq!(parse_semver("1"),      Some((1, 0, 0)));
-        assert_eq!(parse_semver(""),       None);
+        assert_eq!(parse_semver("1"), Some((1, 0, 0)));
+        assert_eq!(parse_semver(""), None);
     }
 
     #[test]

@@ -103,7 +103,7 @@ fn resolve_ssd_root() -> PathBuf {
     // If inside <something>.app/Contents/MacOS/
     // walk up three levels to get the .app's parent directory.
     let maybe_bundle_root = exe_dir
-        .parent()           // Contents/
+        .parent() // Contents/
         .and_then(|p| p.parent()) // <Name>.app/
         .and_then(|p| p.parent()); // SSD root
 
