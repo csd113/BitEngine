@@ -19,7 +19,6 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use libc;
 
 // ── Thread-safe output queue ─────────────────────────────────────────────────
 

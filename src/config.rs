@@ -3,7 +3,7 @@
 //! Stored as JSON in `~/Library/Application Support/BitcoinNodeManager/config.json`
 //! (macOS) or `~/.config/BitcoinNodeManager/config.json` (other Unix).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -25,7 +25,7 @@ pub struct Config {
 
 impl Config {
     /// Load from disk, falling back to sensible defaults derived from `ssd_root`.
-    pub fn load(ssd_root: &PathBuf) -> Self {
+    pub fn load(ssd_root: &Path) -> Self {
         let defaults = Self::defaults(ssd_root);
         let path = Self::config_file_path();
 
@@ -63,7 +63,7 @@ impl Config {
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    fn defaults(ssd_root: &PathBuf) -> Self {
+    fn defaults(ssd_root: &Path) -> Self {
         Self {
             binaries_path: ssd_root.join("Binaries"),
             bitcoin_data_path: ssd_root.join("BitcoinChain"),

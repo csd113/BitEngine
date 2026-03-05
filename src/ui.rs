@@ -6,7 +6,7 @@
 //!
 //!   * `App`            — immutable snapshot of all UI state.
 //!   * `Message`        — every possible event (user action, timer tick,
-//!                        async task result, process output).
+//!     async task result, process output).
 //!   * `App::update()`  — pure function: state + message → new state + `Task`.
 //!   * `App::view()`    — pure function: state → `Element<Message>`.
 //!   * `App::subscription()` — declares recurring subscriptions (timers).
@@ -30,7 +30,6 @@ use iced::{
     widget::{button, column, container, row, scrollable, text, text_input, Space},
     Alignment, Color, Element, Length, Padding, Subscription, Task,
 };
-use iced_runtime;
 
 use crate::{
     config::Config,

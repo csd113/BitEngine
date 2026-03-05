@@ -29,6 +29,7 @@ fn acquire_single_instance_lock() -> Option<fs::File> {
 
     let file = OpenOptions::new()
         .create(true)
+        .truncate(true)
         .write(true)
         .mode(0o600)
         .open(&lock_path)
