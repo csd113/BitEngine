@@ -187,6 +187,7 @@ pub enum Message {
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     // ── Config ───────────────────────────────────────────────────────────────
     config: Config,
@@ -220,13 +221,13 @@ pub struct App {
 
     /// Non-empty ⇒ display an overlay dialog with this message.
     overlay_message: Option<String>,
-    /// When `overlay_message` is set, this optional path allows a "Open BitForge" button.
+    /// When `overlay_message` is set, this optional path allows a "Open `BitForge`" button.
     bitforge_path: Option<PathBuf>,
 }
 
 impl App {
-    pub fn new(ssd_root: PathBuf) -> Self {
-        let config = Config::load(&ssd_root);
+    pub fn new(ssd_root: &PathBuf) -> Self {
+        let config = Config::load(ssd_root);
 
         let binaries_edit = config.binaries_path.to_string_lossy().into_owned();
         let bitcoin_data_edit = config.bitcoin_data_path.to_string_lossy().into_owned();
@@ -283,10 +284,12 @@ impl App {
 
     // ── update ────────────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_lines)]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             // ── Timer: drain output queues ────────────────────────────────────
             Message::OutputTick => {
+                const MAX: usize = 5_000;
                 let mut btc_new = false;
                 let mut els_new = false;
 
@@ -310,7 +313,6 @@ impl App {
                 }
 
                 // Trim terminal buffers to last 5 000 lines
-                const MAX: usize = 5_000;
                 if self.bitcoin_lines.len() > MAX {
                     let drain_to = self.bitcoin_lines.len() - MAX;
                     self.bitcoin_lines.drain(..drain_to);
@@ -474,10 +476,10 @@ impl App {
                         let _ = std::fs::create_dir_all(&config_clone.bitcoin_data_path);
                         let _ = std::fs::create_dir_all(&config_clone.electrs_data_path);
                         push_msg(&btc_q, "--- Paths updated ---");
-                        push_msg(&btc_q, &format!("Binaries : {}", bins));
-                        push_msg(&btc_q, &format!("Data dir : {}", btc));
+                        push_msg(&btc_q, &format!("Binaries : {bins}"));
+                        push_msg(&btc_q, &format!("Data dir : {btc}"));
                         push_msg(&els_q, "--- Paths updated ---");
-                        push_msg(&els_q, &format!("DB dir   : {}", els));
+                        push_msg(&els_q, &format!("DB dir   : {els}"));
                         Ok(())
                     },
                     Message::PathsSaved,
@@ -579,19 +581,17 @@ impl App {
                         std::thread::spawn(move || {
                             let rt = tokio::runtime::Handle::try_current();
                             // Stop via RPC; if that fails, SIGTERM the process
-                            let stopped_via_rpc = if let Ok(rt) = rt {
-                                rt.block_on(rpc::stop_bitcoind(&auth)).is_ok()
-                            } else {
-                                // Fallback: build a mini runtime
-                                tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .map(|r| r.block_on(rpc::stop_bitcoind(&auth)).is_ok())
-                                    .unwrap_or(false)
-                            };
-                            if !stopped_via_rpc {
-                                handle.terminate();
-                            } else {
+                            let stopped_via_rpc = rt.map_or_else(
+                                |_| {
+                                    tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build()
+                                        .map(|r| r.block_on(rpc::stop_bitcoind(&auth)).is_ok())
+                                        .unwrap_or(false)
+                                },
+                                |rt| rt.block_on(rpc::stop_bitcoind(&auth)).is_ok(),
+                            );
+                            if stopped_via_rpc {
                                 // Wait up to 60 s for graceful shutdown
                                 let deadline =
                                     std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -605,6 +605,8 @@ impl App {
                                     }
                                     std::thread::sleep(std::time::Duration::from_millis(500));
                                 }
+                            } else {
+                                handle.terminate();
                             }
                             push_msg(&btc_q, "bitcoind stopped.");
                         });
@@ -698,6 +700,7 @@ impl App {
 
     // ── subscription ──────────────────────────────────────────────────────────
 
+    #[allow(clippy::unused_self)]
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             time::every(Duration::from_millis(100)).map(|_| Message::OutputTick),
@@ -719,19 +722,19 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        // Overlay dialog (modal-like)
-        if let Some(msg) = &self.overlay_message {
-            view_overlay(msg, self.bitforge_path.clone())
-        } else {
-            container(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|_| container::Style {
-                    background: Some(BG.into()),
-                    ..Default::default()
-                })
-                .into()
-        }
+        self.overlay_message.as_ref().map_or_else(
+            || {
+                container(content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_| container::Style {
+                        background: Some(BG.into()),
+                        ..Default::default()
+                    })
+                    .into()
+            },
+            |msg| view_overlay(msg, self.bitforge_path.clone()),
+        )
     }
 
     // ── Toolbar ───────────────────────────────────────────────────────────────
@@ -892,6 +895,8 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::unused_self)]
     fn view_node_panel<'a>(
         &'a self,
         title: &'a str,
@@ -1026,6 +1031,7 @@ impl App {
 
     // ── Bottom bar ────────────────────────────────────────────────────────────
 
+    #[allow(clippy::unused_self)]
     fn view_bottom_bar(&self) -> Element<'_, Message> {
         let shutdown_both = styled_button("Shutdown Bitcoind & Electrs", ButtonStyle::Destructive)
             .on_press(Message::ShutdownBoth);
@@ -1049,7 +1055,7 @@ impl App {
 
 // ── Overlay (modal dialog) ────────────────────────────────────────────────────
 
-fn view_overlay<'a>(message: &'a str, bitforge_path: Option<PathBuf>) -> Element<'a, Message> {
+fn view_overlay(message: &str, bitforge_path: Option<PathBuf>) -> Element<'_, Message> {
     let mut buttons: Vec<Element<Message>> = vec![styled_button("OK", ButtonStyle::Primary)
         .on_press(Message::DismissOverlay)
         .into()];
@@ -1126,7 +1132,7 @@ fn horizontal_rule<'a>() -> Element<'a, Message> {
         .into()
 }
 
-fn indicator_badge<'a>(label: &'a str, active: bool) -> Element<'a, Message> {
+fn indicator_badge(label: &str, active: bool) -> Element<'_, Message> {
     let dot_color = if active { GREEN } else { OFF };
     row![
         text("●").size(14).color(dot_color),

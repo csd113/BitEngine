@@ -54,7 +54,7 @@ impl ProcessHandle {
 
     /// Graceful SIGTERM → 10 s wait → SIGKILL.
     pub fn terminate(&mut self) {
-        let pid = self.child.id() as i32;
+        let pid = self.child.id().cast_signed();
         // Attempt graceful shutdown with SIGTERM
         unsafe { libc::kill(pid, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -89,7 +89,7 @@ pub fn launch_bitcoind(
     }
 
     std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("create bitcoin data dir {:?}", data_dir))?;
+        .with_context(|| format!("create bitcoin data dir {}", data_dir.display()))?;
 
     let cmd = [
         bitcoind.to_string_lossy().into_owned(),
@@ -104,9 +104,9 @@ pub fn launch_bitcoind(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawn bitcoind {:?}", bitcoind))?;
+        .with_context(|| format!("spawn bitcoind {}", bitcoind.display()))?;
 
-    spawn_reader_thread(child, queue)
+    spawn_reader_thread(child, &queue)
 }
 
 // ── Electrs ───────────────────────────────────────────────────────────────────
@@ -124,7 +124,7 @@ pub fn launch_electrs(
     }
 
     std::fs::create_dir_all(electrs_db_dir)
-        .with_context(|| format!("create electrs db dir {:?}", electrs_db_dir))?;
+        .with_context(|| format!("create electrs db dir {}", electrs_db_dir.display()))?;
 
     let cmd = [
         electrs.to_string_lossy().into_owned(),
@@ -145,9 +145,9 @@ pub fn launch_electrs(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawn electrs {:?}", electrs))?;
+        .with_context(|| format!("spawn electrs {}", electrs.display()))?;
 
-    spawn_reader_thread(child, queue)
+    spawn_reader_thread(child, &queue)
 }
 
 // ── Reader thread ─────────────────────────────────────────────────────────────
@@ -157,14 +157,14 @@ pub fn launch_electrs(
 ///
 /// Both stdout and stderr are read concurrently on separate threads that both
 /// push into the same queue, preserving approximate interleaving order.
-fn spawn_reader_thread(mut child: Child, queue: OutputQueue) -> Result<ProcessHandle> {
+fn spawn_reader_thread(mut child: Child, queue: &OutputQueue) -> Result<ProcessHandle> {
     // Take stdout and stderr pipes before the child is moved into ProcessHandle
     let stdout = child.stdout.take().context("no stdout pipe")?;
     let stderr = child.stderr.take().context("no stderr pipe")?;
 
     // stdout reader
     {
-        let q = Arc::clone(&queue);
+        let q = Arc::clone(queue);
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 match line {
@@ -177,7 +177,7 @@ fn spawn_reader_thread(mut child: Child, queue: OutputQueue) -> Result<ProcessHa
 
     // stderr reader
     {
-        let q = Arc::clone(&queue);
+        let q = Arc::clone(queue);
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 match line {

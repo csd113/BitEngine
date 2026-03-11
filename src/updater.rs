@@ -42,9 +42,8 @@ pub fn find_latest_version(search_dir: &Path, prefix: &str) -> Option<String> {
             continue;
         }
         // Must match `<prefix>-<version>`
-        let version_str = match name.strip_prefix(&format!("{}-", prefix)) {
-            Some(v) => v,
-            None => continue,
+        let Some(version_str) = name.strip_prefix(&format!("{prefix}-")) else {
+            continue;
         };
         if let Some(ver) = parse_semver(version_str) {
             match &best {
@@ -68,7 +67,8 @@ pub fn find_latest_version(search_dir: &Path, prefix: &str) -> Option<String> {
 ///
 /// Returns the list of binary names that were actually copied.
 pub fn copy_binaries(src_dir: &Path, dst_dir: &Path, names: &[&str]) -> Result<Vec<String>> {
-    fs::create_dir_all(dst_dir).with_context(|| format!("create binaries dir {:?}", dst_dir))?;
+    fs::create_dir_all(dst_dir)
+        .with_context(|| format!("create binaries dir {}", dst_dir.display()))?;
 
     let mut copied = Vec::new();
 
@@ -83,17 +83,18 @@ pub fn copy_binaries(src_dir: &Path, dst_dir: &Path, names: &[&str]) -> Result<V
         let tmp = dst_dir.join(format!(".{name}.tmp"));
 
         // Write to temp first
-        fs::copy(&src, &tmp).with_context(|| format!("copy {name} to temp {:?}", tmp))?;
+        fs::copy(&src, &tmp).with_context(|| format!("copy {name} to temp {}", tmp.display()))?;
 
         // Set executable permissions before rename
         let mut perms = fs::metadata(&tmp)
-            .with_context(|| format!("stat {:?}", tmp))?
+            .with_context(|| format!("stat {}", tmp.display()))?
             .permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&tmp, perms).with_context(|| format!("chmod {:?}", tmp))?;
+        fs::set_permissions(&tmp, perms).with_context(|| format!("chmod {}", tmp.display()))?;
 
         // Atomic rename
-        fs::rename(&tmp, &dst).with_context(|| format!("rename {:?} → {:?}", tmp, dst))?;
+        fs::rename(&tmp, &dst)
+            .with_context(|| format!("rename {} → {}", tmp.display(), dst.display()))?;
 
         copied.push(name.to_owned());
     }
@@ -179,9 +180,7 @@ pub fn run_update(binaries_dst: &Path) -> UpdateResult {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

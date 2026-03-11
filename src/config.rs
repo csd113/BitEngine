@@ -13,6 +13,7 @@ const APP_NAME: &str = "BitcoinNodeManager";
 const CONFIG_FILENAME: &str = "config.json";
 
 /// All persisted settings for the node manager.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Directory containing `bitcoind`, `bitcoin-cli`, `electrs`, etc.
@@ -44,21 +45,19 @@ impl Config {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("create config dir {:?}", parent))?;
+                .with_context(|| format!("create config dir {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self).context("serialise config")?;
-        std::fs::write(&path, json).with_context(|| format!("write config {:?}", path))?;
+        std::fs::write(&path, json).with_context(|| format!("write config {}", path.display()))?;
         Ok(())
     }
 
     /// Path to the JSON config file on this platform.
     pub fn config_file_path() -> PathBuf {
-        if let Some(proj) = ProjectDirs::from("", "", APP_NAME) {
-            proj.config_dir().join(CONFIG_FILENAME)
-        } else {
-            // Fallback
-            dirs_fallback().join(CONFIG_FILENAME)
-        }
+        ProjectDirs::from("", "", APP_NAME).map_or_else(
+            || dirs_fallback().join(CONFIG_FILENAME),
+            |proj| proj.config_dir().join(CONFIG_FILENAME),
+        )
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
@@ -72,8 +71,8 @@ impl Config {
     }
 
     fn load_from_file(path: &PathBuf) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("read config {:?}", path))?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read config {}", path.display()))?;
         serde_json::from_str(&text).context("parse config JSON")
     }
 }

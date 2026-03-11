@@ -49,12 +49,9 @@ fn main() -> iced::Result {
     // macOS can fire two consecutive "open" events for the same .app bundle,
     // causing the app to open and immediately close.  We hold an exclusive
     // flock() for the lifetime of the process.
-    let _lock = match acquire_single_instance_lock() {
-        Some(f) => f,
-        None => {
-            // Another instance is already running — exit silently.
-            process::exit(0);
-        }
+    let Some(_lock) = acquire_single_instance_lock() else {
+        // Another instance is already running — exit silently.
+        process::exit(0);
     };
 
     // ── Resolve SSD / working root ───────────────────────────────────────────
@@ -79,7 +76,7 @@ fn main() -> iced::Result {
         ..Default::default()
     })
     .run_with(move || {
-        let app = ui::App::new(ssd_root.clone());
+        let app = ui::App::new(&ssd_root);
         (app, Task::none())
     })
 }
