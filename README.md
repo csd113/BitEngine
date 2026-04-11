@@ -7,6 +7,7 @@
 Built with Rust · Iced · Metal-accelerated · Apple Silicon native
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%2012%2B-blue?logo=apple)](https://www.apple.com/macos/)
 [![Architecture](https://img.shields.io/badge/arch-arm64%20%7C%20x86__64-lightgrey)](#build)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
@@ -171,6 +172,8 @@ lipo -create \
 
 codesign --force --deep --sign "-" dist/BitEngine.app
 ```
+
+Tagged `v*` releases are built automatically in GitHub Actions, packaged as a zipped universal `.app`, and attached to the GitHub Release.
 
 ---
 

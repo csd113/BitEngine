@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            arch: arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            arch: x86_64
+
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTC_WRAPPER: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload compiled binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitengine-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/bitcoin_node_manager
+          if-no-files-found: error
+
+  package:
+    name: Package universal app
+    runs-on: macos-14
+    needs: build
+    env:
+      RUSTC_WRAPPER: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: bitengine-arm64
+          path: /tmp/bitengine-release/arm64
+
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: bitengine-x86_64
+          path: /tmp/bitengine-release/x86_64
+
+      - name: Assemble app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_ROOT="/tmp/bitengine-release/dist/BitEngine.app"
+          MACOS_DIR="$APP_ROOT/Contents/MacOS"
+          RESOURCES_DIR="$APP_ROOT/Contents/Resources"
+          SHORT_VERSION="${GITHUB_REF_NAME#v}"
+          BUILD_VERSION="${GITHUB_RUN_NUMBER}"
+
+          mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+
+          cat > "$APP_ROOT/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key>
+            <string>en</string>
+            <key>CFBundleDisplayName</key>
+            <string>BitEngine</string>
+            <key>CFBundleExecutable</key>
+            <string>BitEngine</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.csd113.BitEngine</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>BitEngine</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${SHORT_VERSION}</string>
+            <key>CFBundleVersion</key>
+            <string>${BUILD_VERSION}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>12.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          lipo -create \
+            /tmp/bitengine-release/arm64/bitcoin_node_manager \
+            /tmp/bitengine-release/x86_64/bitcoin_node_manager \
+            -output "$MACOS_DIR/BitEngine"
+
+          chmod +x "$MACOS_DIR/BitEngine"
+          codesign --force --deep --sign "-" "$APP_ROOT"
+
+          mkdir -p /tmp/bitengine-release/out
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$APP_ROOT" \
+            "/tmp/bitengine-release/out/BitEngine-${SHORT_VERSION}.zip"
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BitEngine-app
+          path: /tmp/bitengine-release/out/BitEngine-*.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: /tmp/bitengine-release/out/BitEngine-*.zip
+          generate_release_notes: true

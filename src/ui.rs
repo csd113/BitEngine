@@ -21,7 +21,11 @@
 //!
 //! This keeps the UI thread non-blocking at all times.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use iced::widget::scrollable::{Direction, Id as ScrollId, Scrollbar};
 use iced::{
@@ -65,17 +69,35 @@ const BORDER: Color = Color {
     a: 1.0,
 }; // #d1d1d6
 const TERM_BG: Color = Color {
-    r: 0.118,
-    g: 0.118,
-    b: 0.118,
+    r: 0.102,
+    g: 0.102,
+    b: 0.114,
     a: 1.0,
-}; // #1e1e1e
+}; // #1a1a1d
+const TERM_FRAME: Color = Color {
+    r: 0.145,
+    g: 0.145,
+    b: 0.157,
+    a: 1.0,
+}; // #252528
+const TERM_BORDER: Color = Color {
+    r: 0.224,
+    g: 0.224,
+    b: 0.239,
+    a: 1.0,
+}; // #39393d
 const TERM_FG: Color = Color {
-    r: 0.831,
-    g: 0.831,
-    b: 0.831,
+    r: 0.851,
+    g: 0.859,
+    b: 0.875,
     a: 1.0,
-}; // #d4d4d4
+}; // #d9dbe0
+const TERM_DIM: Color = Color {
+    r: 0.612,
+    g: 0.623,
+    b: 0.643,
+    a: 1.0,
+}; // #9c9fb4
 const GREEN: Color = Color {
     r: 0.204,
     g: 0.780,
@@ -226,7 +248,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(ssd_root: &PathBuf) -> Self {
+    pub fn new(ssd_root: &Path) -> Self {
         let config = Config::load(ssd_root);
 
         let binaries_edit = config.binaries_path.to_string_lossy().into_owned();
@@ -972,22 +994,53 @@ impl App {
         .align_y(Alignment::Center)
         .padding(Padding::from([8, 20]));
 
+        let terminal_header = container(
+            row![
+                row![
+                    text("TERMINAL").size(9).color(TEXT_TER),
+                    Space::with_width(6),
+                    text(format!("{} lines", lines.len()))
+                        .size(9)
+                        .color(TERM_DIM),
+                ]
+                .align_y(Alignment::Center),
+                Space::with_width(Length::Fill),
+                row![
+                    text("●").size(11).color(if running { GREEN } else { OFF }),
+                    Space::with_width(4),
+                    text(if running { "Live" } else { "Idle" })
+                        .size(9)
+                        .color(TERM_DIM),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .align_y(Alignment::Center)
+            .padding(Padding {
+                top: 0.0,
+                right: 2.0,
+                bottom: 0.0,
+                left: 2.0,
+            }),
+        )
+        .padding(Padding::from([8, 10]))
+        .style(|_| container::Style {
+            background: Some(TERM_FRAME.into()),
+            border: iced::Border {
+                color: TERM_BORDER,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        });
+
         // Terminal
-        let terminal_lines: Vec<Element<Message>> = lines
-            .iter()
-            .map(|l| {
-                text(l.as_str())
-                    .size(11)
-                    .font(Font::MONOSPACE)
-                    .color(TERM_FG)
-                    .into()
-            })
-            .collect();
+        let terminal_lines: Vec<Element<Message>> =
+            lines.iter().map(|l| terminal_line_element(l)).collect();
 
         let terminal_content = column(terminal_lines)
             .spacing(0)
             .width(Length::Fill)
-            .padding(Padding::from([8, 10]));
+            .padding(Padding::from([10, 12]));
 
         let terminal = scrollable(terminal_content)
             .id(scroll_id)
@@ -995,11 +1048,17 @@ impl App {
             .height(Length::Fill)
             .width(Length::Fill);
 
-        let terminal_container = container(terminal)
+        let terminal_container = container(column![terminal_header, terminal].spacing(8))
             .width(Length::Fill)
             .height(Length::Fill)
+            .padding(12)
             .style(|_| container::Style {
                 background: Some(TERM_BG.into()),
+                border: iced::Border {
+                    color: TERM_BORDER,
+                    width: 1.0,
+                    radius: 14.0.into(),
+                },
                 ..Default::default()
             });
 
@@ -1141,6 +1200,91 @@ fn indicator_badge(label: &str, active: bool) -> Element<'_, Message> {
     ]
     .align_y(Alignment::Center)
     .into()
+}
+
+struct TerminalTextStyle {
+    color: Color,
+    bold: bool,
+}
+
+fn terminal_line_element(line: &str) -> Element<'_, Message> {
+    let style = terminal_line_style(line);
+    let font = if style.bold {
+        Font {
+            weight: iced::font::Weight::Bold,
+            ..Font::MONOSPACE
+        }
+    } else {
+        Font::MONOSPACE
+    };
+
+    text(line).size(11).font(font).color(style.color).into()
+}
+
+fn terminal_line_style(line: &str) -> TerminalTextStyle {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if trimmed.starts_with('$') {
+        return TerminalTextStyle {
+            color: GREEN,
+            bold: true,
+        };
+    }
+
+    if trimmed.starts_with("===") || trimmed.starts_with("---") {
+        return TerminalTextStyle {
+            color: MAC_BLUE,
+            bold: true,
+        };
+    }
+
+    if lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("fatal")
+        || lower.contains("panic")
+        || lower.contains("cannot")
+    {
+        return TerminalTextStyle {
+            color: MAC_RED,
+            bold: true,
+        };
+    }
+
+    if lower.contains("warning") || lower.contains("warn") {
+        return TerminalTextStyle {
+            color: MAC_ORG,
+            bold: false,
+        };
+    }
+
+    if lower.contains("synced")
+        || lower.contains("running")
+        || lower.contains("listening")
+        || lower.contains("ready")
+        || lower.contains("done")
+    {
+        return TerminalTextStyle {
+            color: GREEN,
+            bold: false,
+        };
+    }
+
+    if lower.contains("config")
+        || lower.contains("binaries")
+        || lower.contains("data dir")
+        || lower.contains("db dir")
+    {
+        return TerminalTextStyle {
+            color: TERM_DIM,
+            bold: false,
+        };
+    }
+
+    TerminalTextStyle {
+        color: TERM_FG,
+        bold: false,
+    }
 }
 
 fn path_row<'a>(
