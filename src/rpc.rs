@@ -38,13 +38,10 @@ struct RpcResponse {
 
 /// Parsed result of `getblockchaininfo`.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct BlockchainInfo {
     pub blocks: u64,
     pub headers: u64,
     pub verification_progress: f64,
-    pub chain: String,
-    pub initial_block_download: bool,
 }
 
 // ── Authentication ────────────────────────────────────────────────────────────
@@ -66,63 +63,71 @@ impl RpcAuth {
     ///   3. `rpcuser` / `rpcpassword` from `bitcoin.conf`
     ///   4. Hardcoded fallback ("bitcoin" / "bitcoinrpc")
     pub fn from_data_dir(data_dir: &Path) -> Self {
-        let port = read_rpc_port(data_dir).unwrap_or(8332);
+        let conf = BitcoinConf::load(data_dir);
 
-        // Try cookie files
+        if let Some((user, password)) = conf.cookie_credentials {
+            return Self {
+                user,
+                password,
+                port: conf.port.unwrap_or(8332),
+            };
+        }
+
+        Self {
+            user: conf.rpcuser.unwrap_or_else(|| "bitcoin".to_owned()),
+            password: conf.rpcpassword.unwrap_or_else(|| "bitcoinrpc".to_owned()),
+            port: conf.port.unwrap_or(8332),
+        }
+    }
+}
+
+struct BitcoinConf {
+    port: Option<u16>,
+    rpcuser: Option<String>,
+    rpcpassword: Option<String>,
+    cookie_credentials: Option<(String, String)>,
+}
+
+impl BitcoinConf {
+    fn load(data_dir: &Path) -> Self {
+        let mut conf = Self {
+            port: None,
+            rpcuser: None,
+            rpcpassword: None,
+            cookie_credentials: None,
+        };
+
+        let Ok(text) = std::fs::read_to_string(data_dir.join("bitcoin.conf")) else {
+            return conf;
+        };
+
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("rpcport=") {
+                conf.port = rest.trim().parse().ok();
+            }
+            if let Some(v) = line.strip_prefix("rpcuser=") {
+                conf.rpcuser = Some(v.trim().to_owned());
+            }
+            if let Some(v) = line.strip_prefix("rpcpassword=") {
+                conf.rpcpassword = Some(v.trim().to_owned());
+            }
+        }
+
         for cookie_path in [
             data_dir.join(".cookie"),
             data_dir.join("mainnet").join(".cookie"),
         ] {
             if let Ok(contents) = std::fs::read_to_string(&cookie_path) {
                 let contents = contents.trim();
-                if let Some((u, p)) = contents.split_once(':') {
-                    return Self {
-                        user: u.to_owned(),
-                        password: p.to_owned(),
-                        port,
-                    };
+                if let Some((user, password)) = contents.split_once(':') {
+                    conf.cookie_credentials = Some((user.to_owned(), password.to_owned()));
+                    break;
                 }
             }
         }
 
-        // Fall back to static credentials
-        let (user, password) = read_static_credentials(data_dir)
-            .unwrap_or_else(|| ("bitcoin".into(), "bitcoinrpc".into()));
-        Self {
-            user,
-            password,
-            port,
-        }
-    }
-}
-
-fn read_rpc_port(data_dir: &Path) -> Option<u16> {
-    let conf = std::fs::read_to_string(data_dir.join("bitcoin.conf")).ok()?;
-    for line in conf.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("rpcport=") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
-}
-
-fn read_static_credentials(data_dir: &Path) -> Option<(String, String)> {
-    let conf = std::fs::read_to_string(data_dir.join("bitcoin.conf")).ok()?;
-    let mut user = None;
-    let mut password = None;
-    for line in conf.lines() {
-        let line = line.trim();
-        if let Some(v) = line.strip_prefix("rpcuser=") {
-            user = Some(v.trim().to_owned());
-        }
-        if let Some(v) = line.strip_prefix("rpcpassword=") {
-            password = Some(v.trim().to_owned());
-        }
-    }
-    match (user, password) {
-        (Some(u), Some(p)) => Some((u, p)),
-        _ => None,
+        conf
     }
 }
 
@@ -170,8 +175,6 @@ pub async fn get_blockchain_info(auth: &RpcAuth) -> Result<BlockchainInfo> {
         blocks: v["blocks"].as_u64().unwrap_or(0),
         headers: v["headers"].as_u64().unwrap_or(0),
         verification_progress: v["verificationprogress"].as_f64().unwrap_or(0.0),
-        chain: v["chain"].as_str().unwrap_or("").to_owned(),
-        initial_block_download: v["initialblockdownload"].as_bool().unwrap_or(true),
     })
 }
 

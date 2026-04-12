@@ -1,6 +1,6 @@
 [package]
 name = "bitcoin-node-manager"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Bitcoin & Electrs Node Manager — macOS GUI"
 authors = ["Bitcoin Node Manager"]

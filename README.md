@@ -6,6 +6,8 @@
 
 Built with Rust · Iced · Metal-accelerated · Apple Silicon native
 
+Current release: `0.1.1`
+
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%2012%2B-blue?logo=apple)](https://www.apple.com/macos/)
@@ -27,6 +29,11 @@ BitEngine is a macOS desktop application that lets you launch, monitor, and shut
 - Binary updater: scans `~/Downloads/bitcoin_builds/` and atomically replaces binaries
 - Fully configurable data paths, persisted across sessions
 - Single-binary distribution — no runtime, no WebView, no Electron
+
+Recent release work in `0.1.1`:
+- Split the large UI module into smaller rendering and update helpers so the code is easier to maintain
+- Tightened filesystem and config error handling so setup failures surface clearly instead of being ignored
+- Kept GitHub Actions macOS-only and enforced `cargo fmt --all --check`, strict Clippy, tests, and a release build
 
 ---
 
@@ -137,6 +144,13 @@ rustup target add x86_64-apple-darwin
 cargo build
 ./target/debug/bitcoin_node_manager
 ```
+
+The GitHub Actions CI workflow uses the same macOS toolchain and runs:
+
+- `cargo fmt --all --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo build --release`
 
 ### Release build (optimised, ~5 MB)
 

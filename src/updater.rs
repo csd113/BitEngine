@@ -180,7 +180,9 @@ pub fn run_update(binaries_dst: &Path) -> UpdateResult {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from)
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

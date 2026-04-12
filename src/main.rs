@@ -14,7 +14,7 @@ mod updater;
 use std::{
     fs::{self, OpenOptions},
     os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
 };
 
@@ -100,15 +100,13 @@ fn resolve_ssd_root() -> PathBuf {
 
     // If inside <something>.app/Contents/MacOS/
     // walk up three levels to get the .app's parent directory.
-    let maybe_bundle_root = exe_dir
-        .parent() // Contents/
-        .and_then(|p| p.parent()) // <Name>.app/
-        .and_then(|p| p.parent()); // SSD root
-
-    if let Some(bundle_parent) = maybe_bundle_root {
-        // Confirm we really are inside a .app bundle
-        let exe_dir_str = exe_dir.to_string_lossy();
-        if exe_dir_str.contains(".app/Contents/MacOS") {
+    if exe_dir.ends_with(Path::new("Contents/MacOS")) {
+        if let Some(bundle_parent) = exe_dir
+            .parent() // Contents/
+            .and_then(|p| p.parent()) // <Name>.app/
+            .and_then(|p| p.parent())
+        // SSD root
+        {
             return bundle_parent.to_path_buf();
         }
     }

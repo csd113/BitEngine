@@ -1,4 +1,4 @@
-name: CI
+name: macOS CI
 
 on:
   push:
@@ -12,8 +12,9 @@ permissions:
 
 jobs:
   macos:
-    name: macOS
+    name: macOS 14
     runs-on: macos-14
+    timeout-minutes: 30
     env:
       RUSTC_WRAPPER: ""
 

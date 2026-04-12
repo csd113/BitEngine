@@ -26,15 +26,16 @@ pub struct Config {
 
 impl Config {
     /// Load from disk, falling back to sensible defaults derived from `ssd_root`.
-    pub fn load(ssd_root: &Path) -> Self {
+    pub fn load(ssd_root: &Path) -> (Self, Option<String>) {
         let defaults = Self::defaults(ssd_root);
         let path = Self::config_file_path();
 
         match Self::load_from_file(&path) {
-            Ok(cfg) => cfg,
+            Ok(cfg) => (cfg, None),
             Err(e) => {
-                eprintln!("Config load error ({e}), using defaults.");
-                defaults
+                let warning = format!("Config load error ({e}), using defaults.");
+                eprintln!("{warning}");
+                (defaults, Some(warning))
             }
         }
     }

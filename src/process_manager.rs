@@ -32,7 +32,7 @@ pub fn new_queue() -> OutputQueue {
 fn push_line(queue: &OutputQueue, line: String) {
     if let Ok(mut q) = queue.lock() {
         // Cap at 10 000 lines to bound memory usage.
-        if q.len() > 10_000 {
+        if q.len() >= 10_000 {
             q.pop_front();
         }
         q.push_back(line);
@@ -56,7 +56,7 @@ impl ProcessHandle {
     pub fn terminate(&mut self) {
         let pid = self.child.id().cast_signed();
         // Attempt graceful shutdown with SIGTERM
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if Instant::now() >= deadline {
