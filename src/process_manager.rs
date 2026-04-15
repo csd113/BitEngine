@@ -200,5 +200,23 @@ pub fn is_electrs_synced_line(line: &str) -> bool {
         || l.contains("electrs running")
         || l.contains("waiting for new block")
         || l.contains("index update completed")
+        // electrs 0.10.x reports that initial sync is complete with this
+        // chain update message once it has caught up to the current tip.
+        || l.contains("chain updated:")
         || l.contains("chain best block")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_electrs_synced_line;
+
+    #[test]
+    fn detects_electrs_sync_completion_messages() {
+        assert!(is_electrs_synced_line(
+            "[2024-08-10T19:07:03.932Z INFO  electrs::chain] chain updated: tip=0000, height=856201"
+        ));
+        assert!(!is_electrs_synced_line(
+            "[2024-08-10T19:07:02.860Z INFO  electrs::chain] loading 856201 headers, tip=0000"
+        ));
+    }
 }
