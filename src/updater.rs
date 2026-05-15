@@ -10,11 +10,11 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 
 // ── Version parsing ───────────────────────────────────────────────────────────
 
@@ -200,13 +200,14 @@ mod tests {
     }
 
     #[test]
-    fn latest_version_selection() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn latest_version_selection() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
         let dir = tmp.path();
-        std::fs::create_dir(dir.join("bitcoin-26.0")).unwrap();
-        std::fs::create_dir(dir.join("bitcoin-27.1")).unwrap();
-        std::fs::create_dir(dir.join("bitcoin-27.0")).unwrap();
+        std::fs::create_dir(dir.join("bitcoin-26.0"))?;
+        std::fs::create_dir(dir.join("bitcoin-27.1"))?;
+        std::fs::create_dir(dir.join("bitcoin-27.0"))?;
         let latest = find_latest_version(dir, "bitcoin");
         assert_eq!(latest.as_deref(), Some("bitcoin-27.1"));
+        Ok(())
     }
 }

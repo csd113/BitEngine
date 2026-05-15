@@ -292,9 +292,9 @@ fn view_node_panels(app: &App) -> Element<'_, Message> {
         title: "Electrs",
         accent: ELS_ACC,
         launch_msg: Message::LaunchElectrs,
-        running: app.electrs_running,
-        synced: app.electrs_synced,
-        ready: app.electrs_running && app.electrs_synced,
+        running: app.electrs_status.running,
+        synced: app.electrs_status.synced,
+        ready: app.electrs_status.ready,
         lines: &app.electrs_lines,
         scroll_id: electrs_scroll_id(),
     });

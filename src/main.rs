@@ -6,6 +6,7 @@
 //!   3. Hands off to the Iced application loop.
 
 mod config;
+mod electrs_status;
 mod process_manager;
 mod rpc;
 mod ui;
@@ -13,7 +14,7 @@ mod updater;
 
 use std::{
     fs::{self, OpenOptions},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::OpenOptionsExt as _,
     path::{Path, PathBuf},
     process,
 };
@@ -24,7 +25,7 @@ use iced::{window, Size, Task};
 /// Returns an open file handle on success (caller must keep it alive).
 /// Returns `None` if another instance already holds the lock.
 fn acquire_single_instance_lock() -> Option<fs::File> {
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::io::AsRawFd as _;
     let lock_path = std::env::temp_dir().join("BitcoinNodeManager.lock");
 
     let file = OpenOptions::new()
@@ -35,7 +36,8 @@ fn acquire_single_instance_lock() -> Option<fs::File> {
         .open(&lock_path)
         .ok()?;
 
-    // LOCK_EX | LOCK_NB  — non-blocking exclusive lock
+    // SAFETY: `file` is a live file descriptor opened in this function and
+    // `flock` only inspects that descriptor to acquire an advisory lock.
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if ret == 0 {
         Some(file)

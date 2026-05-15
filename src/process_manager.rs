@@ -10,7 +10,7 @@
 
 use std::{
     collections::VecDeque,
-    io::{BufRead, BufReader},
+    io::{BufRead as _, BufReader},
     path::Path,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context as _, Result};
 
 // ── Thread-safe output queue ─────────────────────────────────────────────────
 
@@ -55,7 +55,8 @@ impl ProcessHandle {
     /// Graceful SIGTERM → 10 s wait → SIGKILL.
     pub fn terminate(&mut self) {
         let pid = self.child.id().cast_signed();
-        // Attempt graceful shutdown with SIGTERM
+        // SAFETY: `pid` comes from a live child process owned by this handle,
+        // and `kill` only sends a signal to that operating-system process.
         let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -81,7 +82,7 @@ impl ProcessHandle {
 pub fn launch_bitcoind(
     binaries_path: &Path,
     data_dir: &Path,
-    queue: OutputQueue,
+    queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
     let bitcoind = binaries_path.join("bitcoind");
     if !bitcoind.exists() {
@@ -97,7 +98,7 @@ pub fn launch_bitcoind(
         "-printtoconsole".into(),
     ];
 
-    push_line(&queue, format!("$ {}", cmd.join(" ")));
+    push_line(queue, format!("$ {}", cmd.join(" ")));
 
     let child = Command::new(&cmd[0])
         .args(&cmd[1..])
@@ -106,7 +107,7 @@ pub fn launch_bitcoind(
         .spawn()
         .with_context(|| format!("spawn bitcoind {}", bitcoind.display()))?;
 
-    spawn_reader_thread(child, &queue)
+    spawn_reader_thread(child, queue)
 }
 
 // ── Electrs ───────────────────────────────────────────────────────────────────
@@ -116,7 +117,8 @@ pub fn launch_electrs(
     binaries_path: &Path,
     bitcoin_data_dir: &Path,
     electrs_db_dir: &Path,
-    queue: OutputQueue,
+    electrum_addr: &str,
+    queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
     let electrs = binaries_path.join("electrs");
     if !electrs.exists() {
@@ -135,10 +137,10 @@ pub fn launch_electrs(
         "--db-dir".into(),
         electrs_db_dir.to_string_lossy().into_owned(),
         "--electrum-rpc-addr".into(),
-        "127.0.0.1:50001".into(),
+        electrum_addr.to_owned(),
     ];
 
-    push_line(&queue, format!("$ {}", cmd.join(" ")));
+    push_line(queue, format!("$ {}", cmd.join(" ")));
 
     let child = Command::new(&cmd[0])
         .args(&cmd[1..])
@@ -147,7 +149,7 @@ pub fn launch_electrs(
         .spawn()
         .with_context(|| format!("spawn electrs {}", electrs.display()))?;
 
-    spawn_reader_thread(child, &queue)
+    spawn_reader_thread(child, queue)
 }
 
 // ── Reader thread ─────────────────────────────────────────────────────────────
@@ -189,34 +191,4 @@ fn spawn_reader_thread(mut child: Child, queue: &OutputQueue) -> Result<ProcessH
     }
 
     Ok(ProcessHandle { child })
-}
-
-// ── Sync detection helpers ────────────────────────────────────────────────────
-
-/// Check whether a line from electrs output indicates it is fully synced.
-pub fn is_electrs_synced_line(line: &str) -> bool {
-    let l = line.to_ascii_lowercase();
-    l.contains("finished full compaction")
-        || l.contains("electrs running")
-        || l.contains("waiting for new block")
-        || l.contains("index update completed")
-        // electrs 0.10.x reports that initial sync is complete with this
-        // chain update message once it has caught up to the current tip.
-        || l.contains("chain updated:")
-        || l.contains("chain best block")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_electrs_synced_line;
-
-    #[test]
-    fn detects_electrs_sync_completion_messages() {
-        assert!(is_electrs_synced_line(
-            "[2024-08-10T19:07:03.932Z INFO  electrs::chain] chain updated: tip=0000, height=856201"
-        ));
-        assert!(!is_electrs_synced_line(
-            "[2024-08-10T19:07:02.860Z INFO  electrs::chain] loading 856201 headers, tip=0000"
-        ));
-    }
 }
