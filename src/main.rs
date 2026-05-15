@@ -1,4 +1,4 @@
-//! Bitcoin & Electrs Node Manager — macOS
+//! `BitEngine` — macOS
 //!
 //! Entry point.  Responsibilities:
 //!   1. Single-instance lock (prevents double-launch from macOS .app open events).
@@ -26,7 +26,7 @@ use iced::{window, Size, Task};
 /// Returns `None` if another instance already holds the lock.
 fn acquire_single_instance_lock() -> Option<fs::File> {
     use std::os::unix::io::AsRawFd as _;
-    let lock_path = std::env::temp_dir().join("BitcoinNodeManager.lock");
+    let lock_path = std::env::temp_dir().join("BitEngine.lock");
 
     let file = OpenOptions::new()
         .create(true)
@@ -63,33 +63,37 @@ fn main() -> iced::Result {
     let ssd_root = resolve_ssd_root();
 
     // ── Launch Iced application ──────────────────────────────────────────────
-    iced::application(
-        "Bitcoin & Electrs Node Manager",
-        ui::App::update,
-        ui::App::view,
-    )
-    .subscription(ui::App::subscription)
-    .theme(|_| iced::Theme::Dark)
-    .window(window::Settings {
-        size: Size::new(1440.0, 960.0),
-        min_size: Some(Size::new(900.0, 700.0)),
-        resizable: true,
-        decorations: true,
-        ..Default::default()
-    })
-    .run_with(move || {
-        let app = ui::App::new(&ssd_root);
-        (app, Task::none())
-    })
+    iced::application("BitEngine", ui::App::update, ui::App::view)
+        .subscription(ui::App::subscription)
+        .theme(|_| iced::Theme::Dark)
+        .window(window::Settings {
+            size: Size::new(1440.0, 960.0),
+            min_size: Some(Size::new(900.0, 700.0)),
+            resizable: true,
+            decorations: true,
+            ..Default::default()
+        })
+        .run_with(move || {
+            let app = ui::App::new(&ssd_root);
+            (app, Task::none())
+        })
 }
 
 /// Determine the SSD root directory.
 ///
 /// Priority:
-///   1. If `BITCOIN_NODE_MANAGER_ROOT` env var is set, use that.
-///   2. If the binary is inside a `.app` bundle, walk up to the bundle's parent.
-///   3. Otherwise, use the directory containing the binary.
+///   1. If `BITENGINE_ROOT` env var is set, use that.
+///   2. If the legacy `BITCOIN_NODE_MANAGER_ROOT` env var is set, use that.
+///   3. If the binary is inside a `.app` bundle, walk up to the bundle's parent.
+///   4. Otherwise, use the directory containing the binary.
 fn resolve_ssd_root() -> PathBuf {
+    if let Ok(env_root) = std::env::var("BITENGINE_ROOT") {
+        let p = PathBuf::from(env_root);
+        if p.is_dir() {
+            return p;
+        }
+    }
+
     if let Ok(env_root) = std::env::var("BITCOIN_NODE_MANAGER_ROOT") {
         let p = PathBuf::from(env_root);
         if p.is_dir() {

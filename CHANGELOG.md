@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 - 2026-05-15
+
+- Renamed the app, config namespace, and packaged binary to `BitEngine`
+- Bumped the crate and release version to `0.1.2`
+
 ## 0.1.1 - 2026-04-11
 
 - Split the UI into smaller rendering and update modules to reduce the size of `src/ui.rs`

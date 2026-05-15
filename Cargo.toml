@@ -1,12 +1,15 @@
 [package]
-name = "bitcoin-node-manager"
-version = "0.1.1"
+name = "bitengine"
+version = "0.1.2"
 edition = "2021"
-description = "Bitcoin & Electrs Node Manager — macOS GUI"
-authors = ["Bitcoin Node Manager"]
+description = "BitEngine macOS GUI for Bitcoin Core and Electrs"
+license = "MIT"
+repository = "https://github.com/csd113/BitEngine"
+keywords = ["bitcoin", "electrs", "macos"]
+categories = ["gui"]
 
 [[bin]]
-name = "bitcoin_node_manager"
+name = "bitengine"
 path = "src/main.rs"
 
 [dependencies]

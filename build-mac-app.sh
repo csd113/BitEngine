@@ -3,10 +3,10 @@ set -euo pipefail
 
 APP_NAME="BitEngine"
 BUNDLE_ID="com.yourname.bitengine"
-VERSION="1.0"
+VERSION="0.1.2"
 
 # Set this to your actual Cargo binary name if different
-BIN_NAME="bitcoin_node_manager"
+BIN_NAME="bitengine"
 
 ICON_FILE="app-icon.icns"
 APP_DIR="${APP_NAME}.app"

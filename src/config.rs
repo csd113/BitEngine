@@ -1,7 +1,7 @@
 //! Application configuration.
 //!
-//! Stored as JSON in `~/Library/Application Support/BitcoinNodeManager/config.json`
-//! (macOS) or `~/.config/BitcoinNodeManager/config.json` (other Unix).
+//! Stored as JSON in `~/Library/Application Support/BitEngine/config.json`
+//! (macOS) or `~/.config/BitEngine/config.json` (other Unix).
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,8 @@ use anyhow::{Context as _, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-const APP_NAME: &str = "BitcoinNodeManager";
+const APP_NAME: &str = "BitEngine";
+const LEGACY_APP_NAME: &str = "BitcoinNodeManager";
 const CONFIG_FILENAME: &str = "config.json";
 pub const DEFAULT_ELECTRS_METRICS_ADDR: &str = "127.0.0.1:4224";
 pub const DEFAULT_ELECTRUM_ADDR: &str = "127.0.0.1:50001";
@@ -37,8 +38,25 @@ impl Config {
 
         match Self::load_from_file(&path) {
             Ok(cfg) => (cfg, None),
-            Err(e) => {
-                let warning = format!("Config load error ({e}), using defaults.");
+            Err(primary_err) => {
+                if matches!(
+                    primary_err.downcast_ref::<std::io::Error>(),
+                    Some(err) if err.kind() == std::io::ErrorKind::NotFound
+                ) {
+                    let legacy_path = Self::legacy_config_file_path();
+                    if legacy_path.exists() {
+                        return match Self::load_from_file(&legacy_path) {
+                            Ok(cfg) => (cfg, None),
+                            Err(legacy_err) => {
+                                let warning =
+                                    format!("Config load error ({legacy_err}), using defaults.");
+                                (defaults, Some(warning))
+                            }
+                        };
+                    }
+                }
+
+                let warning = format!("Config load error ({primary_err}), using defaults.");
                 (defaults, Some(warning))
             }
         }
@@ -60,7 +78,14 @@ impl Config {
     /// Path to the JSON config file on this platform.
     pub fn config_file_path() -> PathBuf {
         ProjectDirs::from("", "", APP_NAME).map_or_else(
-            || dirs_fallback().join(CONFIG_FILENAME),
+            || dirs_fallback(APP_NAME).join(CONFIG_FILENAME),
+            |proj| proj.config_dir().join(CONFIG_FILENAME),
+        )
+    }
+
+    fn legacy_config_file_path() -> PathBuf {
+        ProjectDirs::from("", "", LEGACY_APP_NAME).map_or_else(
+            || dirs_fallback(LEGACY_APP_NAME).join(CONFIG_FILENAME),
             |proj| proj.config_dir().join(CONFIG_FILENAME),
         )
     }
@@ -90,7 +115,7 @@ impl Config {
     }
 }
 
-fn dirs_fallback() -> PathBuf {
+fn dirs_fallback(app_name: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config").join(APP_NAME)
+    PathBuf::from(home).join(".config").join(app_name)
 }

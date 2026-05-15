@@ -141,7 +141,7 @@ impl App {
         let electrs_queue = new_queue();
 
         // Log startup info into the terminal queues
-        push_msg(&bitcoin_queue, "=== Bitcoin Node Manager started ===");
+        push_msg(&bitcoin_queue, "=== BitEngine started ===");
         if let Some(warning) = config_warning.as_ref() {
             push_msg(&bitcoin_queue, warning);
             push_msg(&electrs_queue, warning);
@@ -158,7 +158,7 @@ impl App {
             &bitcoin_queue,
             &format!("Data dir : {}", config.bitcoin_data_path.display()),
         );
-        push_msg(&electrs_queue, "=== Electrs Node Manager started ===");
+        push_msg(&electrs_queue, "=== BitEngine started ===");
         push_msg(
             &electrs_queue,
             &format!("Binaries : {}", config.binaries_path.display()),

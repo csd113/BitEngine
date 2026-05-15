@@ -6,7 +6,7 @@
 
 Built with Rust · Iced · Metal-accelerated · Apple Silicon native
 
-Current release: `0.1.1`
+Current release: `0.1.2`
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
@@ -30,10 +30,10 @@ BitEngine is a macOS desktop application that lets you launch, monitor, and shut
 - Fully configurable data paths, persisted across sessions
 - Single-binary distribution — no runtime, no WebView, no Electron
 
-Recent release work in `0.1.1`:
-- Split the large UI module into smaller rendering and update helpers so the code is easier to maintain
-- Tightened filesystem and config error handling so setup failures surface clearly instead of being ignored
-- Kept GitHub Actions macOS-only and enforced `cargo fmt --all --check`, strict Clippy, tests, and a release build
+Recent release work in `0.1.2`:
+- Renamed the app, config namespace, and built binary to `BitEngine`
+- Bumped the crate and release version to `0.1.2`
+- Kept the macOS build and release workflow aligned with the renamed executable
 
 ---
 
@@ -94,7 +94,7 @@ If `bitcoin_builds` is not found, BitEngine checks for **BitForge.app** in `/App
 - Shutdown runs in a background thread so the UI stays responsive
 
 ### Configurable paths
-All three data directories (Binaries, Bitcoin data, Electrs DB) are editable in the UI and persisted to `~/Library/Application Support/BitcoinNodeManager/config.json`. Changes take effect on the next node launch.
+All three data directories (Binaries, Bitcoin data, Electrs DB) are editable in the UI and persisted to `~/Library/Application Support/BitEngine/config.json`. Changes take effect on the next node launch.
 
 ---
 
@@ -116,7 +116,7 @@ BitEngine expects this structure on your external SSD:
 └── ElectrsDB/
 ```
 
-The SSD root is **auto-detected** from the binary's location. When running as a `.app` bundle the binary lives at `Contents/MacOS/`, so BitEngine walks up three directories to find the SSD root. You can override this with the `BITCOIN_NODE_MANAGER_ROOT` environment variable.
+The SSD root is **auto-detected** from the binary's location. When running as a `.app` bundle the binary lives at `Contents/MacOS/`, so BitEngine walks up three directories to find the SSD root. You can override this with the `BITENGINE_ROOT` environment variable; the legacy `BITCOIN_NODE_MANAGER_ROOT` name is still accepted for compatibility.
 
 ---
 
@@ -142,7 +142,7 @@ rustup target add x86_64-apple-darwin
 
 ```bash
 cargo build
-./target/debug/bitcoin_node_manager
+./target/debug/bitengine
 ```
 
 The GitHub Actions CI workflow uses the same macOS toolchain and runs:
@@ -180,8 +180,8 @@ cargo build --release --target aarch64-apple-darwin
 cargo build --release --target x86_64-apple-darwin
 
 lipo -create \
-  target/aarch64-apple-darwin/release/bitcoin_node_manager \
-  target/x86_64-apple-darwin/release/bitcoin_node_manager \
+  target/aarch64-apple-darwin/release/bitengine \
+  target/x86_64-apple-darwin/release/bitengine \
   -output dist/BitEngine.app/Contents/MacOS/BitEngine
 
 codesign --force --deep --sign "-" dist/BitEngine.app
@@ -220,7 +220,7 @@ xcrun stapler staple dist/BitEngine.app
 Config is stored at:
 
 ```
-~/Library/Application Support/BitcoinNodeManager/config.json
+~/Library/Application Support/BitEngine/config.json
 ```
 
 Example:
