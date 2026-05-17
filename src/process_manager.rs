@@ -10,7 +10,7 @@
 
 use std::{
     collections::VecDeque,
-    io::{BufRead, BufReader},
+    io::{BufRead as _, BufReader},
     path::Path,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -18,7 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context as _, Result};
+
+use crate::platform;
 
 // ── Thread-safe output queue ─────────────────────────────────────────────────
 
@@ -52,11 +54,9 @@ impl ProcessHandle {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Graceful SIGTERM → 10 s wait → SIGKILL.
+    /// Graceful termination request → 10 s wait → kill fallback.
     pub fn terminate(&mut self) {
-        let pid = self.child.id().cast_signed();
-        // Attempt graceful shutdown with SIGTERM
-        let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+        platform::terminate_child(&self.child);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if Instant::now() >= deadline {
@@ -67,7 +67,7 @@ impl ProcessHandle {
                 _ => thread::sleep(Duration::from_millis(200)),
             }
         }
-        // Escalate to SIGKILL
+        // Escalate to the platform kill fallback.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -81,9 +81,9 @@ impl ProcessHandle {
 pub fn launch_bitcoind(
     binaries_path: &Path,
     data_dir: &Path,
-    queue: OutputQueue,
+    queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
-    let bitcoind = binaries_path.join("bitcoind");
+    let bitcoind = binaries_path.join(platform::executable_name("bitcoind"));
     if !bitcoind.exists() {
         bail!("bitcoind not found at {}", bitcoind.display());
     }
@@ -91,22 +91,24 @@ pub fn launch_bitcoind(
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("create bitcoin data dir {}", data_dir.display()))?;
 
-    let cmd = [
-        bitcoind.to_string_lossy().into_owned(),
+    let args = [
         format!("-datadir={}", data_dir.display()),
         "-printtoconsole".into(),
     ];
 
-    push_line(&queue, format!("$ {}", cmd.join(" ")));
+    push_line(
+        queue,
+        format!("$ {}", platform::command_display(&bitcoind, &args)),
+    );
 
-    let child = Command::new(&cmd[0])
-        .args(&cmd[1..])
+    let child = Command::new(&bitcoind)
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn bitcoind {}", bitcoind.display()))?;
 
-    spawn_reader_thread(child, &queue)
+    spawn_reader_thread(child, queue)
 }
 
 // ── Electrs ───────────────────────────────────────────────────────────────────
@@ -116,9 +118,10 @@ pub fn launch_electrs(
     binaries_path: &Path,
     bitcoin_data_dir: &Path,
     electrs_db_dir: &Path,
-    queue: OutputQueue,
+    electrum_addr: &str,
+    queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
-    let electrs = binaries_path.join("electrs");
+    let electrs = binaries_path.join(platform::electrs_binary_name());
     if !electrs.exists() {
         bail!("electrs not found at {}", electrs.display());
     }
@@ -126,8 +129,7 @@ pub fn launch_electrs(
     std::fs::create_dir_all(electrs_db_dir)
         .with_context(|| format!("create electrs db dir {}", electrs_db_dir.display()))?;
 
-    let cmd = [
-        electrs.to_string_lossy().into_owned(),
+    let args = [
         "--network".into(),
         "bitcoin".into(),
         "--daemon-dir".into(),
@@ -135,19 +137,22 @@ pub fn launch_electrs(
         "--db-dir".into(),
         electrs_db_dir.to_string_lossy().into_owned(),
         "--electrum-rpc-addr".into(),
-        "127.0.0.1:50001".into(),
+        electrum_addr.to_owned(),
     ];
 
-    push_line(&queue, format!("$ {}", cmd.join(" ")));
+    push_line(
+        queue,
+        format!("$ {}", platform::command_display(&electrs, &args)),
+    );
 
-    let child = Command::new(&cmd[0])
-        .args(&cmd[1..])
+    let child = Command::new(&electrs)
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn electrs {}", electrs.display()))?;
 
-    spawn_reader_thread(child, &queue)
+    spawn_reader_thread(child, queue)
 }
 
 // ── Reader thread ─────────────────────────────────────────────────────────────
@@ -189,16 +194,4 @@ fn spawn_reader_thread(mut child: Child, queue: &OutputQueue) -> Result<ProcessH
     }
 
     Ok(ProcessHandle { child })
-}
-
-// ── Sync detection helpers ────────────────────────────────────────────────────
-
-/// Check whether a line from electrs output indicates it is fully synced.
-pub fn is_electrs_synced_line(line: &str) -> bool {
-    let l = line.to_ascii_lowercase();
-    l.contains("finished full compaction")
-        || l.contains("electrs running")
-        || l.contains("waiting for new block")
-        || l.contains("index update completed")
-        || l.contains("chain best block")
 }

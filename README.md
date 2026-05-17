@@ -2,16 +2,16 @@
 
 # ⚙️ BitEngine
 
-**A native macOS GUI for managing your Bitcoin Core and Electrs nodes on an external SSD**
+**A native cross-platform GUI for managing Bitcoin Core and Electrs nodes**
 
-Built with Rust · Iced · Metal-accelerated · Apple Silicon native
+Built with Rust · Iced · Native desktop rendering
 
-Current release: `0.1.1`
+Current release: `0.1.2`
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
-[![Platform](https://img.shields.io/badge/platform-macOS%2012%2B-blue?logo=apple)](https://www.apple.com/macos/)
-[![Architecture](https://img.shields.io/badge/arch-arm64%20%7C%20x86__64-lightgrey)](#build)
+[![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%2Farm64-blue)](#supported-platforms)
+[![Architecture](https://img.shields.io/badge/macos-Apple%20Silicon%20only-lightgrey)](#supported-platforms)
 [![License](https://img.shields.io/badge/license-MIT-green)](#license)
 
 </div>
@@ -20,20 +20,34 @@ Current release: `0.1.1`
 
 ## What is BitEngine?
 
-BitEngine is a macOS desktop application that lets you launch, monitor, and shut down a self-hosted **Bitcoin Core** (`bitcoind`) and **Electrs** indexer node — both stored on an external SSD — without touching the terminal.
+BitEngine is a desktop application that lets you launch, monitor, and shut down a self-hosted **Bitcoin Core** (`bitcoind`) and **Electrs** indexer node without touching the terminal.
 
 - Dual side-by-side terminal panels with live log streaming
 - Real-time block height display via JSON-RPC
 - Green/grey status indicators: **Running · Synced · Ready** for each node
-- One-click graceful shutdown (RPC stop → SIGTERM → SIGKILL)
-- Binary updater: scans `~/Downloads/bitcoin_builds/` and atomically replaces binaries
+- One-click shutdown (Bitcoin RPC stop first, then platform fallback)
+- Binary updater: scans the platform Downloads `bitcoin_builds/` folder and atomically replaces binaries
 - Fully configurable data paths, persisted across sessions
 - Single-binary distribution — no runtime, no WebView, no Electron
 
-Recent release work in `0.1.1`:
-- Split the large UI module into smaller rendering and update helpers so the code is easier to maintain
-- Tightened filesystem and config error handling so setup failures surface clearly instead of being ignored
-- Kept GitHub Actions macOS-only and enforced `cargo fmt --all --check`, strict Clippy, tests, and a release build
+Recent release work in `0.1.2`:
+- Renamed the app, config namespace, and built binary to `BitEngine`
+- Bumped the crate and release version to `0.1.2`
+- Added first-class release artifacts for macOS Apple Silicon, Linux x86_64, and Linux ARM64
+
+---
+
+## Supported platforms
+
+BitEngine supports these release targets:
+
+| Platform | Target | Release artifact |
+|---|---|---|
+| macOS Apple Silicon | `aarch64-apple-darwin` | `BitEngine-macos-arm64.zip` containing `BitEngine.app` |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | `BitEngine-linux-x64.tar.gz` |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | `BitEngine-linux-arm64.tar.gz` |
+
+macOS Intel/x86_64 and universal macOS app bundles are intentionally not built or supported.
 
 ---
 
@@ -47,9 +61,9 @@ Recent release work in `0.1.1`:
 │  895,234                                                             │
 ├─────────────────────────────────────────────────────────────────────┤
 │  DIRECTORY PATHS                                              [Hide] │
-│  Binaries Folder        /Volumes/SSD/Binaries          [Browse…]  ● │
-│  Bitcoin Data Directory /Volumes/SSD/BitcoinChain      [Browse…]  ● │
-│  Electrs DB Directory   /Volumes/SSD/ElectrsDB         [Browse…]  ● │
+│  Binaries Folder        /path/to/BitEngine/Binaries    [Browse…]  ● │
+│  Bitcoin Data Directory /path/to/BitEngine/BitcoinChain[Browse…]  ● │
+│  Electrs DB Directory   /path/to/BitEngine/ElectrsDB   [Browse…]  ● │
 │                          Changes take effect on next launch [Save]   │
 ├───────────────────────────────┬─────────────────────────────────────┤
 │ Bitcoin              [Launch] │ Electrs              [Launch]        │
@@ -84,27 +98,27 @@ Three per node, updated automatically:
 Polls `getblockchaininfo` via JSON-RPC every 5 seconds and displays the current block height with comma formatting (e.g. `895,234`).
 
 ### Binary updater
-Click **Update Binaries…** to scan `~/Downloads/bitcoin_builds/binaries/` for versioned folders (`bitcoin-27.0`, `electrs-0.10.5`), pick the highest semantic version, and atomically replace binaries in your SSD `Binaries/` folder.
+Click **Update Binaries…** to scan the platform Downloads `bitcoin_builds/binaries/` folder for versioned folders (`bitcoin-27.0`, `electrs-0.10.5`), pick the highest semantic version, and atomically replace binaries in your configured `Binaries/` folder.
 
-If `bitcoin_builds` is not found, BitEngine checks for **BitForge.app** in `/Applications` and offers to open it, or shows the download link.
+On macOS, if `bitcoin_builds` is not found, BitEngine checks for **BitForge.app** in `/Applications` and offers to open it. Linux users should place platform-specific Bitcoin Core and Electrs builds in the same Downloads layout.
 
 ### Graceful shutdown
-- **Electrs only**: SIGTERM → 10 s wait → SIGKILL
-- **Bitcoin (and Electrs)**: RPC `stop` command → 60 s wait → SIGKILL fallback
+- **Electrs only**: graceful termination on Unix where available, then kill fallback
+- **Bitcoin (and Electrs)**: RPC `stop` command → 60 s wait → platform kill fallback
 - Shutdown runs in a background thread so the UI stays responsive
 
 ### Configurable paths
-All three data directories (Binaries, Bitcoin data, Electrs DB) are editable in the UI and persisted to `~/Library/Application Support/BitcoinNodeManager/config.json`. Changes take effect on the next node launch.
+All three data directories (Binaries, Bitcoin data, Electrs DB) are editable in the UI and persisted in the platform config directory. Changes take effect on the next node launch.
 
 ---
 
-## SSD directory layout
+## Default directory layout
 
-BitEngine expects this structure on your external SSD:
+BitEngine derives default paths from the directory containing the executable. On macOS `.app` bundles, it walks from `BitEngine.app/Contents/MacOS/` to the bundle's parent directory for compatibility with the original external SSD layout.
 
 ```
-<SSD root>/
-├── BitEngine.app            ← this application
+<root>/
+├── BitEngine.app or bitengine executable
 ├── Binaries/
 │   ├── bitcoind
 │   ├── bitcoin-cli
@@ -116,7 +130,7 @@ BitEngine expects this structure on your external SSD:
 └── ElectrsDB/
 ```
 
-The SSD root is **auto-detected** from the binary's location. When running as a `.app` bundle the binary lives at `Contents/MacOS/`, so BitEngine walks up three directories to find the SSD root. You can override this with the `BITCOIN_NODE_MANAGER_ROOT` environment variable.
+You can override this with the `BITENGINE_ROOT` environment variable; the legacy `BITCOIN_NODE_MANAGER_ROOT` name is still accepted for compatibility.
 
 ---
 
@@ -129,65 +143,48 @@ The SSD root is **auto-detected** from the binary's location. When running as a 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
-# Apple Silicon target (already present on arm64 Macs — add to be sure)
+# Supported release targets
 rustup target add aarch64-apple-darwin
-
-# Intel Mac target
-rustup target add x86_64-apple-darwin
+rustup target add x86_64-unknown-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
 ```
 
-> **Requires:** Rust 1.75+, macOS 12 Monterey or later, Xcode Command Line Tools (`xcode-select --install`)
+> **Requires:** Rust 1.80+. macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
 
 ### Development build
 
 ```bash
 cargo build
-./target/debug/bitcoin_node_manager
+./target/debug/bitengine
 ```
 
-The GitHub Actions CI workflow uses the same macOS toolchain and runs:
+The GitHub Actions CI workflow runs:
 
 - `cargo fmt --all --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --all-targets --all-features`
-- `cargo build --release`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --workspace --all-features`
+- release build checks for macOS Apple Silicon, Linux x86_64, and Linux ARM64
 
 ### Release build (optimised, ~5 MB)
 
 ```bash
-# Apple Silicon
 cargo build --release --target aarch64-apple-darwin
-
-# Intel
-cargo build --release --target x86_64-apple-darwin
+cargo build --release --target x86_64-unknown-linux-gnu
+cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
 ### Bundle as a `.app`
 
 ```bash
-./build_bundle.sh
-# Output: ./dist/BitEngine.app
+./build-mac-app.sh
+# Output: ./BitEngine.app
 
-open dist/BitEngine.app
+open BitEngine.app
 ```
 
 The script compiles, assembles the `.app` directory structure, writes `Info.plist`, copies the binary, and applies an ad-hoc codesign so Gatekeeper doesn't block local execution.
 
-#### Universal binary (arm64 + x86_64)
-
-```bash
-cargo build --release --target aarch64-apple-darwin
-cargo build --release --target x86_64-apple-darwin
-
-lipo -create \
-  target/aarch64-apple-darwin/release/bitcoin_node_manager \
-  target/x86_64-apple-darwin/release/bitcoin_node_manager \
-  -output dist/BitEngine.app/Contents/MacOS/BitEngine
-
-codesign --force --deep --sign "-" dist/BitEngine.app
-```
-
-Tagged `v*` releases are built automatically in GitHub Actions, packaged as a zipped universal `.app`, and attached to the GitHub Release.
+Tagged `v*` releases are built automatically in GitHub Actions. The macOS artifact is Apple Silicon only; no macOS Intel or universal artifact is produced.
 
 ---
 
@@ -220,16 +217,17 @@ xcrun stapler staple dist/BitEngine.app
 Config is stored at:
 
 ```
-~/Library/Application Support/BitcoinNodeManager/config.json
+macOS:   ~/Library/Application Support/BitEngine/config.json
+Linux:   $XDG_CONFIG_HOME/BitEngine/config.json or ~/.config/BitEngine/config.json
 ```
 
 Example:
 
 ```json
 {
-  "binaries_path":     "/Volumes/SSD/Binaries",
-  "bitcoin_data_path": "/Volumes/SSD/BitcoinChain",
-  "electrs_data_path": "/Volumes/SSD/ElectrsDB"
+  "binaries_path":     "/path/to/BitEngine/Binaries",
+  "bitcoin_data_path": "/path/to/BitEngine/BitcoinChain",
+  "electrs_data_path": "/path/to/BitEngine/ElectrsDB"
 }
 ```
 
@@ -256,12 +254,12 @@ Cookie-based RPC authentication (`.cookie` file) is used by default. BitEngine c
 
 **Update Binaries…** (toolbar button) runs the following flow:
 
-1. Check `~/Downloads/bitcoin_builds/binaries/`
+1. Check the platform Downloads `bitcoin_builds/binaries/` directory
 2. Scan for folders matching `bitcoin-X.Y.Z` and `electrs-X.Y.Z`
 3. Pick the highest semantic version for each (major.minor.patch tuple comparison)
 4. Copy binaries into the configured `Binaries/` folder:
    - Written to a `.tmp` file first
-   - `chmod 755` applied
+   - executable permissions applied on Unix platforms
    - Atomically renamed to the final path — a running binary is never half-replaced
 5. Report what was updated in an overlay dialog
 
@@ -269,8 +267,8 @@ If `bitcoin_builds` is not found:
 
 | Condition | Behaviour |
 |---|---|
-| `/Applications/BitForge.app` exists | Offers to open BitForge |
-| BitForge not found | Shows link to [BitForge on GitHub](https://github.com/csd113/BitForge-Python) |
+| macOS `/Applications/BitForge.app` exists | Offers to open BitForge |
+| BitForge not found or non-macOS platform | Shows instructions to place platform-specific builds in Downloads |
 
 ---
 
@@ -279,14 +277,18 @@ If `bitcoin_builds` is not found:
 ```
 src/
 ├── main.rs            Entry point
-│                      · Single-instance lock (fcntl LOCK_EX | LOCK_NB)
-│                      · SSD root auto-detection from binary path
+│                      · Cross-platform single-instance lock
+│                      · Default root auto-detection from binary path
 │                      · Iced application bootstrap
+│
+├── platform.rs        Platform boundary
+│                      · Supported target detection
+│                      · Downloads/home fallbacks
+│                      · Unix executable permissions and termination signal
 │
 ├── config.rs          Persistent configuration
 │                      · Serialised as JSON via serde_json
-│                      · Stored in ~/Library/Application Support (macOS)
-│                      · directories crate handles platform path resolution
+│                      · directories crate handles platform config path resolution
 │
 ├── rpc.rs             Bitcoin JSON-RPC client
 │                      · reqwest + rustls (no OpenSSL dependency)
@@ -297,15 +299,14 @@ src/
 ├── process_manager.rs Child process lifecycle
 │                      · Spawns bitcoind / electrs with stdout+stderr pipes
 │                      · Two OS reader threads per process → Arc<Mutex<VecDeque>>
-│                      · SIGTERM → 10 s grace period → SIGKILL
-│                      · Electrs sync-line detection (5 log patterns)
+│                      · Platform termination request → 10 s grace period → kill
 │
 ├── updater.rs         Binary update system
 │                      · Semver folder scanning (tuple comparison, no regex)
-│                      · Atomic copy: temp file → chmod 755 → rename
-│                      · BitForge.app detection and fallback link
+│                      · Atomic copy: temp file → executable bit on Unix → rename
+│                      · macOS BitForge.app detection and fallback instructions
 │
-└── ui.rs              Iced 0.13 MVU application
+└── ui.rs              Iced 0.14 MVU application
                        · App state struct
                        · Message enum (all events)
                        · update() — state transitions + Task dispatch
@@ -334,16 +335,16 @@ The Iced update loop is the only writer to UI state. The background threads only
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `iced` | 0.13 | GUI framework (Metal-accelerated, Elm/MVU) |
+| `iced` | 0.14 | GUI framework (native rendering, Elm/MVU) |
 | `tokio` | 1 | Async runtime (driven by iced's tokio feature) |
-| `reqwest` | 0.12 | HTTP client for Bitcoin RPC (rustls, no OpenSSL) |
+| `reqwest` | 0.13 | HTTP client for Bitcoin RPC (rustls, no OpenSSL) |
 | `serde` / `serde_json` | 1 | Config and RPC serialisation |
 | `anyhow` | 1 | Ergonomic error propagation |
-| `thiserror` | 1 | Structured error type definitions |
-| `rfd` | 0.15 | Native macOS file/folder picker dialog |
-| `directories` | 5 | XDG / macOS Application Support path resolution |
-| `libc` | 0.2 | `flock()` for single-instance guard, `SIGTERM` |
-| `iced_runtime` | 0.13 | `Action<T>` type for scroll task mapping |
+| `thiserror` | 2 | Structured error type definitions |
+| `rfd` | 0.17 | Native file/folder picker dialog |
+| `directories` | 6 | Platform config and user directory resolution |
+| `libc` | 0.2 | Unix `SIGTERM` for graceful process shutdown |
+| `iced_runtime` | 0.14 | `Action<T>` type for scroll task mapping |
 
 ---
 
@@ -357,12 +358,12 @@ The Iced update loop is the only writer to UI state. The background threads only
 | Threading | GIL limits true parallelism | Real OS threads |
 | Terminal memory | Unbounded growth | Hard cap: 5 000 lines per panel |
 | UI blocking | `messagebox` blocks event loop | Overlay widget, never blocks |
-| Process shutdown | `terminate()` only | RPC stop → SIGTERM → SIGKILL |
-| Binary copy safety | `shutil.copy2` (non-atomic) | temp file → chmod → atomic rename |
+| Process shutdown | `terminate()` only | RPC stop → platform termination → kill |
+| Binary copy safety | `shutil.copy2` (non-atomic) | temp file → executable bit on Unix → atomic rename |
 | Semver comparison | Regex + string sort | Tuple comparison `(major, minor, patch)` |
 | Electrs sync detection | 3 log patterns | 5 log patterns |
 | RPC auth | Cookie + fallback | Same, cleaner error messages |
-| Single-instance guard | `fcntl.flock` | `libc::flock` (no GIL risk) |
+| Single-instance guard | Unix file lock | localhost listener guard |
 | Error handling | `try/except`, silent failures | `Result<T,E>` throughout, no `unwrap()` |
 | Type safety | Runtime | Compile-time |
 
@@ -376,6 +377,6 @@ MIT — see [LICENSE](LICENSE).
 
 ## Related projects
 
-- [BitForge](https://github.com/csd113/BitForge-Rust) — builds Bitcoin Core and Electrs binaries for use with BitEngine
+- [BitForge](https://github.com/csd113/BitForge) — builds Bitcoin Core and Electrs binaries for use with BitEngine
 - [Bitcoin Core](https://github.com/bitcoin/bitcoin)
 - [Electrs](https://github.com/romanz/electrs)

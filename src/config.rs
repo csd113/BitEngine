@@ -1,19 +1,23 @@
 //! Application configuration.
 //!
-//! Stored as JSON in `~/Library/Application Support/BitcoinNodeManager/config.json`
-//! (macOS) or `~/.config/BitcoinNodeManager/config.json` (other Unix).
+//! Stored as JSON in the platform config directory resolved by `directories`.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-const APP_NAME: &str = "BitcoinNodeManager";
+const LEGACY_APP_NAME: &str = "BitcoinNodeManager";
 const CONFIG_FILENAME: &str = "config.json";
+pub const DEFAULT_ELECTRS_METRICS_ADDR: &str = "127.0.0.1:4224";
+pub const DEFAULT_ELECTRUM_ADDR: &str = "127.0.0.1:50001";
 
 /// All persisted settings for the node manager.
-#[allow(clippy::struct_field_names)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "persisted fields mirror the stored config keys"
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Directory containing `bitcoind`, `bitcoin-cli`, `electrs`, etc.
@@ -32,9 +36,25 @@ impl Config {
 
         match Self::load_from_file(&path) {
             Ok(cfg) => (cfg, None),
-            Err(e) => {
-                let warning = format!("Config load error ({e}), using defaults.");
-                eprintln!("{warning}");
+            Err(primary_err) => {
+                if matches!(
+                    primary_err.downcast_ref::<std::io::Error>(),
+                    Some(err) if err.kind() == std::io::ErrorKind::NotFound
+                ) {
+                    let legacy_path = Self::legacy_config_file_path();
+                    if legacy_path.exists() {
+                        return match Self::load_from_file(&legacy_path) {
+                            Ok(cfg) => (cfg, None),
+                            Err(legacy_err) => {
+                                let warning =
+                                    format!("Config load error ({legacy_err}), using defaults.");
+                                (defaults, Some(warning))
+                            }
+                        };
+                    }
+                }
+
+                let warning = format!("Config load error ({primary_err}), using defaults.");
                 (defaults, Some(warning))
             }
         }
@@ -55,10 +75,25 @@ impl Config {
 
     /// Path to the JSON config file on this platform.
     pub fn config_file_path() -> PathBuf {
-        ProjectDirs::from("", "", APP_NAME).map_or_else(
-            || dirs_fallback().join(CONFIG_FILENAME),
+        ProjectDirs::from("", "", crate::platform::APP_NAME).map_or_else(
+            || dirs_fallback(crate::platform::APP_NAME).join(CONFIG_FILENAME),
             |proj| proj.config_dir().join(CONFIG_FILENAME),
         )
+    }
+
+    fn legacy_config_file_path() -> PathBuf {
+        ProjectDirs::from("", "", LEGACY_APP_NAME).map_or_else(
+            || dirs_fallback(LEGACY_APP_NAME).join(CONFIG_FILENAME),
+            |proj| proj.config_dir().join(CONFIG_FILENAME),
+        )
+    }
+
+    pub fn electrs_metrics_url() -> String {
+        format!("http://{DEFAULT_ELECTRS_METRICS_ADDR}/metrics")
+    }
+
+    pub const fn electrum_addr() -> &'static str {
+        DEFAULT_ELECTRUM_ADDR
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
@@ -78,7 +113,6 @@ impl Config {
     }
 }
 
-fn dirs_fallback() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config").join(APP_NAME)
+fn dirs_fallback(app_name: &str) -> PathBuf {
+    crate::platform::home_dir().join(".config").join(app_name)
 }

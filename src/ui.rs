@@ -2,7 +2,7 @@
 //!
 //! Architecture overview
 //! ─────────────────────
-//! The app follows the Elm/MVU pattern enforced by Iced 0.13:
+//! The app follows the Elm/MVU pattern enforced by Iced 0.14:
 //!
 //!   * `App`            — immutable snapshot of all UI state.
 //!   * `Message`        — every possible event (user action, timer tick,
@@ -30,11 +30,17 @@ use std::{
 #[path = "ui_render.rs"]
 mod ui_render;
 
-use iced::{time, widget::scrollable, Element, Subscription, Task};
+use iced::{
+    time,
+    widget::{self, scrollable},
+    Element, Subscription, Task,
+};
 
 use crate::{
     config::Config,
-    process_manager::{self, is_electrs_synced_line, new_queue, OutputQueue, ProcessHandle},
+    electrs_status::{self, ElectrsStatus},
+    platform::{self, Platform},
+    process_manager::{self, new_queue, OutputQueue, ProcessHandle},
     rpc::{self, BlockchainInfo, RpcAuth},
     updater::{self, UpdateResult},
 };
@@ -70,7 +76,7 @@ pub enum Message {
     ShutdownElectrsOnly,
 
     // ── Async results ─────────────────────────────────────────────────────────
-    BlockchainInfoReceived(Result<BlockchainInfo, String>),
+    StatusPollReceived(StatusPollResult),
     UpdateBinaries,
     UpdateResult(String), // human-readable outcome message
 
@@ -79,14 +85,10 @@ pub enum Message {
     DismissOverlay,
     /// Open BitForge.app (update flow).
     OpenBitForge(PathBuf),
-
-    // ── No-op (used to complete Tasks that return nothing useful) ─────────────
-    Noop,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
-#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     // ── Config ───────────────────────────────────────────────────────────────
     config: Config,
@@ -111,8 +113,7 @@ pub struct App {
     // ── Node status ───────────────────────────────────────────────────────────
     bitcoin_running: bool,
     bitcoin_synced: bool,
-    electrs_running: bool,
-    electrs_synced: bool,
+    electrs_status: ElectrsStatus,
     block_height: u64,
 
     // ── UI state ──────────────────────────────────────────────────────────────
@@ -122,6 +123,12 @@ pub struct App {
     overlay_message: Option<String>,
     /// When `overlay_message` is set, this optional path allows a "Open `BitForge`" button.
     bitforge_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusPollResult {
+    blockchain_info: Result<BlockchainInfo, String>,
+    electrs_status: ElectrsStatus,
 }
 
 impl App {
@@ -136,7 +143,11 @@ impl App {
         let electrs_queue = new_queue();
 
         // Log startup info into the terminal queues
-        push_msg(&bitcoin_queue, "=== Bitcoin Node Manager started ===");
+        push_msg(&bitcoin_queue, "=== BitEngine started ===");
+        push_msg(
+            &bitcoin_queue,
+            &format!("Platform : {}", Platform::current().label()),
+        );
         if let Some(warning) = config_warning.as_ref() {
             push_msg(&bitcoin_queue, warning);
             push_msg(&electrs_queue, warning);
@@ -149,15 +160,21 @@ impl App {
             &bitcoin_queue,
             &format!("Binaries : {}", config.binaries_path.display()),
         );
+        log_binary_resolution(&bitcoin_queue, &config.binaries_path, "bitcoind");
         push_msg(
             &bitcoin_queue,
             &format!("Data dir : {}", config.bitcoin_data_path.display()),
         );
-        push_msg(&electrs_queue, "=== Electrs Node Manager started ===");
+        push_msg(&electrs_queue, "=== BitEngine started ===");
+        push_msg(
+            &electrs_queue,
+            &format!("Platform : {}", Platform::current().label()),
+        );
         push_msg(
             &electrs_queue,
             &format!("Binaries : {}", config.binaries_path.display()),
         );
+        log_binary_resolution(&electrs_queue, &config.binaries_path, "electrs");
         push_msg(
             &electrs_queue,
             &format!("DB dir   : {}", config.electrs_data_path.display()),
@@ -176,8 +193,7 @@ impl App {
             electrs_lines: Vec::new(),
             bitcoin_running: false,
             bitcoin_synced: false,
-            electrs_running: false,
-            electrs_synced: false,
+            electrs_status: ElectrsStatus::default(),
             block_height: 0,
             paths_visible: true,
             overlay_message: None,
@@ -243,13 +259,16 @@ impl App {
             Message::LaunchElectrs => self.launch_electrs(),
             Message::ShutdownBoth => self.shutdown_both(),
             Message::ShutdownElectrsOnly => self.shutdown_electrs_only(),
-            Message::BlockchainInfoReceived(result) => {
-                if let Ok(info) = result {
+            Message::StatusPollReceived(result) => {
+                if let Ok(info) = result.blockchain_info {
                     self.block_height = info.blocks;
                     self.bitcoin_synced = info.headers > 0
                         && info.blocks >= info.headers.saturating_sub(1)
                         && info.verification_progress > 0.9999;
+                } else if !self.bitcoin_running {
+                    self.block_height = 0;
                 }
+                self.apply_electrs_status(result.electrs_status);
                 Task::none()
             }
             Message::UpdateBinaries => self.update_binaries(),
@@ -263,12 +282,16 @@ impl App {
                 Task::none()
             }
             Message::OpenBitForge(path) => {
-                let _ = std::process::Command::new("open").arg(&path).spawn();
+                if let Err(err) = platform::open_path(&path) {
+                    self.overlay_message =
+                        Some(format!("Failed to open {}:\n{err}", path.display()));
+                    self.bitforge_path = None;
+                    return Task::none();
+                }
                 self.overlay_message = None;
                 self.bitforge_path = None;
                 Task::none()
             }
-            Message::Noop => Task::none(),
         }
     }
 
@@ -286,9 +309,6 @@ impl App {
 
         if let Ok(mut q) = self.electrs_queue.lock() {
             while let Some(line) = q.pop_front() {
-                if is_electrs_synced_line(&line) {
-                    self.electrs_synced = true;
-                }
                 self.electrs_lines.push(line);
                 els_new = true;
             }
@@ -303,52 +323,45 @@ impl App {
             self.electrs_lines.drain(..drain_to);
         }
 
-        if self.bitcoin_running {
-            if let Some(h) = &mut self.bitcoin_handle {
-                if !h.is_running() {
-                    self.bitcoin_running = false;
-                    self.bitcoin_synced = false;
-                    self.block_height = 0;
-                    self.electrs_synced = false;
-                    push_msg(&self.bitcoin_queue, "bitcoind has stopped.");
-                }
+        if let Some(h) = &mut self.bitcoin_handle {
+            if !h.is_running() {
+                self.bitcoin_handle = None;
+                self.bitcoin_running = false;
+                self.bitcoin_synced = false;
+                self.block_height = 0;
+                self.electrs_status.synced = false;
+                push_msg(&self.bitcoin_queue, "bitcoind has stopped.");
             }
         }
 
-        if self.electrs_running {
-            if let Some(h) = &mut self.electrs_handle {
-                if !h.is_running() {
-                    self.electrs_running = false;
-                    self.electrs_synced = false;
-                    push_msg(&self.electrs_queue, "electrs has stopped.");
-                }
+        if let Some(h) = &mut self.electrs_handle {
+            if !h.is_running() {
+                self.electrs_handle = None;
+                self.electrs_status.running = false;
+                self.electrs_status.synced = false;
+                self.electrs_status.ready = false;
+                push_msg(&self.electrs_queue, "electrs has stopped.");
             }
         }
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
         if btc_new {
-            tasks.push(
-                scrollable::scroll_to(
-                    ui_render::bitcoin_scroll_id(),
-                    scrollable::AbsoluteOffset {
-                        x: 0.0,
-                        y: f32::MAX,
-                    },
-                )
-                .map(|_: iced_runtime::Action<Message>| Message::Noop),
-            );
+            tasks.push(widget::operation::scroll_to(
+                ui_render::bitcoin_scroll_id(),
+                scrollable::AbsoluteOffset {
+                    x: 0.0,
+                    y: f32::MAX,
+                },
+            ));
         }
         if els_new {
-            tasks.push(
-                scrollable::scroll_to(
-                    ui_render::electrs_scroll_id(),
-                    scrollable::AbsoluteOffset {
-                        x: 0.0,
-                        y: f32::MAX,
-                    },
-                )
-                .map(|_: iced_runtime::Action<Message>| Message::Noop),
-            );
+            tasks.push(widget::operation::scroll_to(
+                ui_render::electrs_scroll_id(),
+                scrollable::AbsoluteOffset {
+                    x: 0.0,
+                    y: f32::MAX,
+                },
+            ));
         }
 
         if tasks.is_empty() {
@@ -359,17 +372,27 @@ impl App {
     }
 
     fn handle_rpc_tick(&self) -> Task<Message> {
-        if !self.bitcoin_running {
-            return Task::none();
-        }
         let auth = RpcAuth::from_data_dir(&self.config.bitcoin_data_path);
+        let config = self.config.clone();
+        let process_running = self.electrs_handle.is_some();
+
         Task::perform(
             async move {
-                rpc::get_blockchain_info(&auth)
-                    .await
-                    .map_err(|e| e.to_string())
+                let (blockchain_info, electrs_status) = tokio::join!(
+                    async {
+                        rpc::get_blockchain_info(&auth)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    electrs_status::probe(&config, process_running),
+                );
+
+                StatusPollResult {
+                    blockchain_info,
+                    electrs_status,
+                }
             },
-            Message::BlockchainInfoReceived,
+            Message::StatusPollReceived,
         )
     }
 
@@ -437,7 +460,7 @@ impl App {
         match process_manager::launch_bitcoind(
             &self.config.binaries_path,
             &self.config.bitcoin_data_path,
-            Arc::clone(&self.bitcoin_queue),
+            &self.bitcoin_queue,
         ) {
             Ok(handle) => {
                 self.bitcoin_handle = Some(handle);
@@ -453,7 +476,7 @@ impl App {
     }
 
     fn launch_electrs(&mut self) -> Task<Message> {
-        if self.electrs_running {
+        if self.electrs_status.running {
             self.overlay_message = Some("Electrs is already running.".into());
             return Task::none();
         }
@@ -470,12 +493,15 @@ impl App {
             &self.config.binaries_path,
             &self.config.bitcoin_data_path,
             &self.config.electrs_data_path,
-            Arc::clone(&self.electrs_queue),
+            Config::electrum_addr(),
+            &self.electrs_queue,
         ) {
             Ok(handle) => {
                 self.electrs_handle = Some(handle);
-                self.electrs_running = true;
-                self.electrs_synced = false;
+                self.electrs_status = ElectrsStatus {
+                    running: true,
+                    ..ElectrsStatus::default()
+                };
             }
             Err(e) => {
                 push_msg(&self.electrs_queue, &format!("Launch error: {e}"));
@@ -503,8 +529,7 @@ impl App {
                             tokio::runtime::Builder::new_current_thread()
                                 .enable_all()
                                 .build()
-                                .map(|r| r.block_on(rpc::stop_bitcoind(&auth)).is_ok())
-                                .unwrap_or(false)
+                                .is_ok_and(|r| r.block_on(rpc::stop_bitcoind(&auth)).is_ok())
                         },
                         |rt| rt.block_on(rpc::stop_bitcoind(&auth)).is_ok(),
                     );
@@ -537,7 +562,7 @@ impl App {
         Task::none()
     }
 
-    fn update_binaries(&mut self) -> Task<Message> {
+    fn update_binaries(&self) -> Task<Message> {
         let binaries_dst = self.config.binaries_path.clone();
         let btc_q = Arc::clone(&self.bitcoin_queue);
         Task::perform(
@@ -552,11 +577,12 @@ impl App {
                         format!("__BITFORGE_FOUND__{}", path.display())
                     }
                     UpdateResult::BitForgeNotFound => "No bitcoin_builds folder found.\n\n\
-                         Download BitForge from:\n\
-                         https://github.com/csd113/BitForge-Python"
+                         Place platform-specific bitcoin/electrs builds under your Downloads bitcoin_builds/binaries folder.\n\n\
+                         On macOS, BitForge can build those binaries:\n\
+                         https://github.com/csd113/BitForge"
                         .into(),
                     UpdateResult::BinariesSubfolderMissing => {
-                        "Found ~/Downloads/bitcoin_builds but no 'binaries/' sub-folder inside it."
+                        "Found bitcoin_builds in Downloads but no 'binaries/' sub-folder inside it."
                             .into()
                     }
                     UpdateResult::NothingToUpdate => {
@@ -593,8 +619,71 @@ impl App {
                 push_msg(&els_q, "electrs stopped.");
             });
         }
-        self.electrs_running = false;
-        self.electrs_synced = false;
+        self.electrs_status = ElectrsStatus::default();
+    }
+
+    fn apply_electrs_status(&mut self, mut next_status: ElectrsStatus) {
+        let previous = self.electrs_status.clone();
+        let warnings_ready = self.bitcoin_running && self.bitcoin_synced && next_status.running;
+
+        if !warnings_ready {
+            next_status.metrics_error = None;
+            next_status.bitcoin_error = None;
+            next_status.connect_error = None;
+        }
+
+        if warnings_ready {
+            if previous.metrics_error != next_status.metrics_error {
+                if let Some(error) = next_status.metrics_error.as_deref() {
+                    push_msg(
+                        &self.electrs_queue,
+                        &format!("Electrs metrics check failed: {error}"),
+                    );
+                }
+            }
+
+            if previous.bitcoin_error != next_status.bitcoin_error {
+                if let Some(error) = next_status.bitcoin_error.as_deref() {
+                    push_msg(
+                        &self.electrs_queue,
+                        &format!("Electrs sync check failed: {error}"),
+                    );
+                }
+            }
+
+            if previous.connect_error != next_status.connect_error {
+                if let Some(error) = next_status.connect_error.as_deref() {
+                    push_msg(
+                        &self.electrs_queue,
+                        &format!("Electrs connectivity check failed: {error}"),
+                    );
+                }
+            }
+        }
+
+        if !previous.synced && next_status.synced {
+            let height = next_status.electrs_height.unwrap_or_default();
+            push_msg(
+                &self.electrs_queue,
+                &format!("Electrs synced to Bitcoin Core at height {height}."),
+            );
+        } else if previous.synced != next_status.synced {
+            if let (Some(index_height), Some(blocks)) =
+                (next_status.electrs_height, next_status.bitcoin_blocks)
+            {
+                let headers = next_status
+                    .bitcoin_headers
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+                push_msg(
+                    &self.electrs_queue,
+                    &format!(
+                        "Electrs not yet synced: indexed={index_height}, blocks={blocks}, headers={headers}."
+                    ),
+                );
+            }
+        }
+
+        self.electrs_status = next_status;
     }
 
     // ── subscription ──────────────────────────────────────────────────────────
@@ -630,4 +719,17 @@ fn push_msg(queue: &OutputQueue, msg: &str) {
         }
         q.push_back(msg.to_owned());
     }
+}
+
+fn log_binary_resolution(queue: &OutputQueue, binaries_path: &Path, binary: &str) {
+    let resolved = binaries_path.join(platform::executable_name(binary));
+    let status = if resolved.exists() {
+        "found"
+    } else {
+        "missing"
+    };
+    push_msg(
+        queue,
+        &format!("Resolved {binary}: {} ({status})", resolved.display()),
+    );
 }
