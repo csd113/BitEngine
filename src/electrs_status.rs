@@ -24,6 +24,10 @@ pub struct ElectrsStatus {
 }
 
 pub async fn probe(config: &Config, process_running: bool) -> ElectrsStatus {
+    if !process_running {
+        return ElectrsStatus::default();
+    }
+
     let auth = RpcAuth::from_data_dir(&config.bitcoin_data_path);
     let metrics_url = Config::electrs_metrics_url();
     let electrum_addr = Config::electrum_addr().to_owned();
@@ -148,8 +152,10 @@ async fn check_connectivity(addr: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_status, parse_tip_height};
-    use crate::rpc::BlockchainInfo;
+    use std::path::PathBuf;
+
+    use super::{build_status, parse_tip_height, probe, ElectrsStatus};
+    use crate::{config::Config, rpc::BlockchainInfo};
 
     #[test]
     fn parses_tip_height_metric() {
@@ -318,5 +324,18 @@ electrs_index_height{type=\"tip\"} 856201\n";
         );
 
         assert!(status.running);
+    }
+
+    #[tokio::test]
+    async fn probe_is_quiet_when_electrs_process_is_not_running() {
+        let config = Config {
+            binaries_path: PathBuf::from("/missing/binaries"),
+            bitcoin_data_path: PathBuf::from("/missing/bitcoin"),
+            electrs_data_path: PathBuf::from("/missing/electrs"),
+        };
+
+        let status = probe(&config, false).await;
+
+        assert_eq!(status, ElectrsStatus::default());
     }
 }

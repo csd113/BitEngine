@@ -1,7 +1,6 @@
 //! Application configuration.
 //!
-//! Stored as JSON in `~/Library/Application Support/BitEngine/config.json`
-//! (macOS) or `~/.config/BitEngine/config.json` (other Unix).
+//! Stored as JSON in the platform config directory resolved by `directories`.
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +8,6 @@ use anyhow::{Context as _, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-const APP_NAME: &str = "BitEngine";
 const LEGACY_APP_NAME: &str = "BitcoinNodeManager";
 const CONFIG_FILENAME: &str = "config.json";
 pub const DEFAULT_ELECTRS_METRICS_ADDR: &str = "127.0.0.1:4224";
@@ -77,8 +75,8 @@ impl Config {
 
     /// Path to the JSON config file on this platform.
     pub fn config_file_path() -> PathBuf {
-        ProjectDirs::from("", "", APP_NAME).map_or_else(
-            || dirs_fallback(APP_NAME).join(CONFIG_FILENAME),
+        ProjectDirs::from("", "", crate::platform::APP_NAME).map_or_else(
+            || dirs_fallback(crate::platform::APP_NAME).join(CONFIG_FILENAME),
             |proj| proj.config_dir().join(CONFIG_FILENAME),
         )
     }
@@ -116,6 +114,5 @@ impl Config {
 }
 
 fn dirs_fallback(app_name: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".config").join(app_name)
+    crate::platform::home_dir().join(".config").join(app_name)
 }

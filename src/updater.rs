@@ -1,8 +1,8 @@
 //! Binary update system.
 //!
-//! Scans `~/Downloads/bitcoin_builds/binaries/` for versioned folders,
-//! selects the highest semantic version, and copies the relevant binaries
-//! into the configured `Binaries/` directory on the SSD.
+//! Scans the platform Downloads `bitcoin_builds/binaries/` folder for
+//! versioned folders, selects the highest semantic version, and copies the
+//! relevant binaries into the configured `Binaries/` directory.
 //!
 //! Folder naming convention expected:
 //!   `bitcoin-27.0`          → contains bitcoind, bitcoin-cli, bitcoin-tx, bitcoin-util
@@ -10,11 +10,12 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, Result};
+
+use crate::platform;
 
 // ── Version parsing ───────────────────────────────────────────────────────────
 
@@ -38,7 +39,7 @@ pub fn find_latest_version(search_dir: &Path, prefix: &str) -> Option<String> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         // Must be a directory
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         // Must match `<prefix>-<version>`
@@ -63,7 +64,7 @@ pub fn find_latest_version(search_dir: &Path, prefix: &str) -> Option<String> {
 ///
 /// Each binary is first written to a `.tmp` file, then atomically renamed,
 /// so a partial copy never replaces a working binary.
-/// File permissions are set to 0o755 (rwxr-xr-x).
+/// File permissions are set to 0o755 (rwxr-xr-x) on Unix platforms.
 ///
 /// Returns the list of binary names that were actually copied.
 pub fn copy_binaries(src_dir: &Path, dst_dir: &Path, names: &[&str]) -> Result<Vec<String>> {
@@ -85,12 +86,7 @@ pub fn copy_binaries(src_dir: &Path, dst_dir: &Path, names: &[&str]) -> Result<V
         // Write to temp first
         fs::copy(&src, &tmp).with_context(|| format!("copy {name} to temp {}", tmp.display()))?;
 
-        // Set executable permissions before rename
-        let mut perms = fs::metadata(&tmp)
-            .with_context(|| format!("stat {}", tmp.display()))?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&tmp, perms).with_context(|| format!("chmod {}", tmp.display()))?;
+        platform::set_executable_permissions(&tmp)?;
 
         // Atomic rename
         fs::rename(&tmp, &dst)
@@ -121,15 +117,11 @@ pub enum UpdateResult {
 
 /// Run the full update check.
 pub fn run_update(binaries_dst: &Path) -> UpdateResult {
-    let downloads = home_dir().join("Downloads").join("bitcoin_builds");
+    let downloads = platform::downloads_bitcoin_builds_dir();
 
     if !downloads.exists() {
-        let bitforge = PathBuf::from("/Applications/BitForge.app");
-        return if bitforge.exists() {
-            UpdateResult::BitForgeFound(bitforge)
-        } else {
-            UpdateResult::BitForgeNotFound
-        };
+        return platform::bitforge_app_path()
+            .map_or(UpdateResult::BitForgeNotFound, UpdateResult::BitForgeFound);
     }
 
     let binaries_src = downloads.join("binaries");
@@ -148,11 +140,9 @@ pub fn run_update(binaries_dst: &Path) -> UpdateResult {
 
     if let Some(folder) = btc_folder {
         let src = binaries_src.join(&folder);
-        match copy_binaries(
-            &src,
-            binaries_dst,
-            &["bitcoind", "bitcoin-cli", "bitcoin-tx", "bitcoin-util"],
-        ) {
+        let names = platform::bitcoin_binary_names();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        match copy_binaries(&src, binaries_dst, &names) {
             Ok(copied) if !copied.is_empty() => {
                 messages.push(format!("Bitcoin ({folder}): {}", copied.join(", ")));
             }
@@ -163,7 +153,8 @@ pub fn run_update(binaries_dst: &Path) -> UpdateResult {
 
     if let Some(folder) = etr_folder {
         let src = binaries_src.join(&folder);
-        match copy_binaries(&src, binaries_dst, &["electrs"]) {
+        let electrs = platform::electrs_binary_name();
+        match copy_binaries(&src, binaries_dst, &[electrs.as_str()]) {
             Ok(copied) if !copied.is_empty() => {
                 messages.push(format!("Electrs ({folder}): {}", copied.join(", ")));
             }
@@ -177,12 +168,6 @@ pub fn run_update(binaries_dst: &Path) -> UpdateResult {
     } else {
         UpdateResult::Updated(messages.join("\n"))
     }
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

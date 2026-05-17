@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="BitEngine"
 BUNDLE_ID="com.yourname.bitengine"
 VERSION="0.1.2"
+TARGET="aarch64-apple-darwin"
 
 # Set this to your actual Cargo binary name if different
 BIN_NAME="bitengine"
@@ -11,12 +12,12 @@ BIN_NAME="bitengine"
 ICON_FILE="app-icon.icns"
 APP_DIR="${APP_NAME}.app"
 
-cargo build --release
+cargo build --release --target "${TARGET}"
 
 mkdir -p "${APP_DIR}/Contents/MacOS"
 mkdir -p "${APP_DIR}/Contents/Resources"
 
-cp "target/release/${BIN_NAME}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
+cp "target/${TARGET}/release/${BIN_NAME}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
 cp "${ICON_FILE}" "${APP_DIR}/Contents/Resources/${ICON_FILE}"

@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-use iced::widget::scrollable::{Direction, Id as ScrollId, Scrollbar};
+use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::{
     font::Font,
-    widget::{button, column, container, row, scrollable, text, text_input, Space},
+    widget::{button, column, container, row, scrollable, text, text_input, Id, Space},
     Alignment, Color, Element, Length, Padding,
 };
 
@@ -120,12 +120,12 @@ const TEXT_TER: Color = Color {
     a: 1.0,
 }; // #8e8e93
 
-pub(super) fn bitcoin_scroll_id() -> ScrollId {
-    ScrollId::new("bitcoin_terminal")
+pub(super) const fn bitcoin_scroll_id() -> Id {
+    Id::new("bitcoin_terminal")
 }
 
-pub(super) fn electrs_scroll_id() -> ScrollId {
-    ScrollId::new("electrs_terminal")
+pub(super) const fn electrs_scroll_id() -> Id {
+    Id::new("electrs_terminal")
 }
 
 pub(super) fn view(app: &App) -> Element<'_, Message> {
@@ -185,7 +185,7 @@ fn view_toolbar(app: &App) -> Element<'_, Message> {
     let update_btn =
         styled_button("Update Binaries…", ButtonStyle::Secondary).on_press(Message::UpdateBinaries);
 
-    let toolbar_row = row![block_stat, Space::with_width(Length::Fill), update_btn,]
+    let toolbar_row = row![block_stat, Space::new().width(Length::Fill), update_btn,]
         .align_y(Alignment::Center)
         .padding(Padding::from([0, 16]));
 
@@ -210,7 +210,7 @@ fn view_paths_panel(app: &App) -> Element<'_, Message> {
         ))
         .size(9)
         .color(TEXT_TER),
-        Space::with_width(Length::Fill),
+        Space::new().width(Length::Fill),
         styled_button(toggle_label, ButtonStyle::Secondary).on_press(Message::TogglePathsPanel),
     ]
     .align_y(Alignment::Center)
@@ -252,7 +252,7 @@ fn view_paths_panel(app: &App) -> Element<'_, Message> {
             text("Changes take effect on the next node launch.")
                 .size(10)
                 .color(TEXT_TER),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             styled_button("Save Paths", ButtonStyle::Confirm).on_press(Message::SavePaths),
         ]
         .align_y(Alignment::Center)
@@ -313,7 +313,7 @@ struct NodePanelSpec<'a> {
     synced: bool,
     ready: bool,
     lines: &'a [String],
-    scroll_id: ScrollId,
+    scroll_id: Id,
 }
 
 fn view_node_panel(spec: NodePanelSpec<'_>) -> Element<'_, Message> {
@@ -344,7 +344,7 @@ fn view_node_panel(spec: NodePanelSpec<'_>) -> Element<'_, Message> {
 }
 
 fn accent_bar(accent: Color) -> Element<'static, Message> {
-    container(Space::with_height(3))
+    container(Space::new().height(3))
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(accent.into()),
@@ -376,6 +376,7 @@ fn panel_header(title: &str, accent: Color, launch_msg: Message) -> Element<'_, 
             radius: 6.0.into(),
         },
         shadow: iced::Shadow::default(),
+        snap: false,
     })
     .on_press(launch_msg);
 
@@ -387,7 +388,7 @@ fn panel_header(title: &str, accent: Color, launch_msg: Message) -> Element<'_, 
                 ..Font::default()
             })
             .color(Color::BLACK),
-        Space::with_width(Length::Fill),
+        Space::new().width(Length::Fill),
         launch_btn,
     ]
     .align_y(Alignment::Center)
@@ -403,9 +404,9 @@ fn panel_header(title: &str, accent: Color, launch_msg: Message) -> Element<'_, 
 fn panel_indicators(running: bool, synced: bool, ready: bool) -> Element<'static, Message> {
     row![
         indicator_badge("Running", running),
-        Space::with_width(24),
+        Space::new().width(24),
         indicator_badge("Synced", synced),
-        Space::with_width(24),
+        Space::new().width(24),
         indicator_badge("Ready", ready),
     ]
     .align_y(Alignment::Center)
@@ -413,25 +414,21 @@ fn panel_indicators(running: bool, synced: bool, ready: bool) -> Element<'static
     .into()
 }
 
-fn terminal_container(
-    running: bool,
-    lines: &[String],
-    scroll_id: ScrollId,
-) -> Element<'_, Message> {
+fn terminal_container(running: bool, lines: &[String], scroll_id: Id) -> Element<'_, Message> {
     let terminal_header = container(
         row![
             row![
                 text("TERMINAL").size(9).color(TEXT_TER),
-                Space::with_width(6),
+                Space::new().width(6),
                 text(format!("{} lines", lines.len()))
                     .size(9)
                     .color(TERM_DIM),
             ]
             .align_y(Alignment::Center),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             row![
                 text("●").size(11).color(if running { GREEN } else { OFF }),
-                Space::with_width(4),
+                Space::new().width(4),
                 text(if running { "Live" } else { "Idle" })
                     .size(9)
                     .color(TERM_DIM),
@@ -493,7 +490,7 @@ fn view_bottom_bar() -> Element<'static, Message> {
     let shutdown_els = styled_button("Shutdown Electrs Only", ButtonStyle::Warning)
         .on_press(Message::ShutdownElectrsOnly);
 
-    let btn_row = row![shutdown_both, Space::with_width(8), shutdown_els]
+    let btn_row = row![shutdown_both, Space::new().width(8), shutdown_els]
         .align_y(Alignment::Center)
         .padding(Padding::from([12, 16]));
 
@@ -524,7 +521,7 @@ fn view_overlay(message: &str, bitforge_path: Option<PathBuf>) -> Element<'_, Me
     let dialog = container(
         column![
             text(message).size(14).color(Color::BLACK),
-            Space::with_height(16),
+            Space::new().height(16),
             row(buttons).spacing(8).align_y(Alignment::Center),
         ]
         .spacing(0)
@@ -572,7 +569,7 @@ fn view_overlay(message: &str, bitforge_path: Option<PathBuf>) -> Element<'_, Me
 }
 
 fn horizontal_rule<'a>() -> Element<'a, Message> {
-    container(Space::with_height(1))
+    container(Space::new().height(1))
         .width(Length::Fill)
         .style(|_| container::Style {
             background: Some(BORDER.into()),
@@ -585,7 +582,7 @@ fn indicator_badge(label: &str, active: bool) -> Element<'_, Message> {
     let dot_color = if active { GREEN } else { OFF };
     row![
         text("●").size(14).color(dot_color),
-        Space::with_width(6),
+        Space::new().width(6),
         text(label).size(11).color(TEXT_SEC),
     ]
     .align_y(Alignment::Center)
@@ -693,9 +690,9 @@ fn path_row<'a>(
             .padding(Padding::from([4, 6]))
             .font(Font::MONOSPACE)
             .size(11),
-        Space::with_width(6),
+        Space::new().width(6),
         styled_button("Browse…", ButtonStyle::Secondary).on_press(browse_msg),
-        Space::with_width(6),
+        Space::new().width(6),
         exists_dot,
     ]
     .align_y(Alignment::Center)
@@ -750,6 +747,7 @@ fn styled_button(label: &str, style: ButtonStyle) -> button::Button<'_, Message>
                 radius: 6.0.into(),
             },
             shadow: iced::Shadow::default(),
+            snap: false,
         })
 }
 

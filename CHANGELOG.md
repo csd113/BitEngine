@@ -4,6 +4,9 @@
 
 - Renamed the app, config namespace, and packaged binary to `BitEngine`
 - Bumped the crate and release version to `0.1.2`
+- Added cross-platform support boundaries for macOS Apple Silicon, Linux x86_64, and Linux ARM64
+- Replaced universal/macOS Intel release packaging with supported-platform artifacts only
+- Updated documentation for platform config paths, binary names, and release artifacts
 
 ## 0.1.1 - 2026-04-11
 

@@ -20,6 +20,8 @@ use std::{
 
 use anyhow::{bail, Context as _, Result};
 
+use crate::platform;
+
 // ── Thread-safe output queue ─────────────────────────────────────────────────
 
 /// Lines produced by a child process, drained by the UI every 100 ms.
@@ -52,12 +54,9 @@ impl ProcessHandle {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Graceful SIGTERM → 10 s wait → SIGKILL.
+    /// Graceful termination request → 10 s wait → kill fallback.
     pub fn terminate(&mut self) {
-        let pid = self.child.id().cast_signed();
-        // SAFETY: `pid` comes from a live child process owned by this handle,
-        // and `kill` only sends a signal to that operating-system process.
-        let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+        platform::terminate_child(&self.child);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if Instant::now() >= deadline {
@@ -68,7 +67,7 @@ impl ProcessHandle {
                 _ => thread::sleep(Duration::from_millis(200)),
             }
         }
-        // Escalate to SIGKILL
+        // Escalate to the platform kill fallback.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -84,7 +83,7 @@ pub fn launch_bitcoind(
     data_dir: &Path,
     queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
-    let bitcoind = binaries_path.join("bitcoind");
+    let bitcoind = binaries_path.join(platform::executable_name("bitcoind"));
     if !bitcoind.exists() {
         bail!("bitcoind not found at {}", bitcoind.display());
     }
@@ -92,16 +91,18 @@ pub fn launch_bitcoind(
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("create bitcoin data dir {}", data_dir.display()))?;
 
-    let cmd = [
-        bitcoind.to_string_lossy().into_owned(),
+    let args = [
         format!("-datadir={}", data_dir.display()),
         "-printtoconsole".into(),
     ];
 
-    push_line(queue, format!("$ {}", cmd.join(" ")));
+    push_line(
+        queue,
+        format!("$ {}", platform::command_display(&bitcoind, &args)),
+    );
 
-    let child = Command::new(&cmd[0])
-        .args(&cmd[1..])
+    let child = Command::new(&bitcoind)
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -120,7 +121,7 @@ pub fn launch_electrs(
     electrum_addr: &str,
     queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
-    let electrs = binaries_path.join("electrs");
+    let electrs = binaries_path.join(platform::electrs_binary_name());
     if !electrs.exists() {
         bail!("electrs not found at {}", electrs.display());
     }
@@ -128,8 +129,7 @@ pub fn launch_electrs(
     std::fs::create_dir_all(electrs_db_dir)
         .with_context(|| format!("create electrs db dir {}", electrs_db_dir.display()))?;
 
-    let cmd = [
-        electrs.to_string_lossy().into_owned(),
+    let args = [
         "--network".into(),
         "bitcoin".into(),
         "--daemon-dir".into(),
@@ -140,10 +140,13 @@ pub fn launch_electrs(
         electrum_addr.to_owned(),
     ];
 
-    push_line(queue, format!("$ {}", cmd.join(" ")));
+    push_line(
+        queue,
+        format!("$ {}", platform::command_display(&electrs, &args)),
+    );
 
-    let child = Command::new(&cmd[0])
-        .args(&cmd[1..])
+    let child = Command::new(&electrs)
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
