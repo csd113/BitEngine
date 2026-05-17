@@ -2,7 +2,7 @@
 //!
 //! Architecture overview
 //! ─────────────────────
-//! The app follows the Elm/MVU pattern enforced by Iced 0.13:
+//! The app follows the Elm/MVU pattern enforced by Iced 0.14:
 //!
 //!   * `App`            — immutable snapshot of all UI state.
 //!   * `Message`        — every possible event (user action, timer tick,
