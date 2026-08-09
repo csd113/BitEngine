@@ -23,7 +23,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{mpsc, Arc},
     time::Duration,
 };
 
@@ -37,12 +37,16 @@ use iced::{
 };
 
 use crate::{
+    binaries::{
+        self, AvailableVersions, BinaryKind, BuildEvent, BuildFailure, BuildRequest, BuildService,
+        BuildStage, BuildSummary, InstalledVersions, PersistedBuild, PersistedBuildStatus,
+        ReleaseVersion,
+    },
     config::Config,
     electrs_status::{self, ElectrsStatus},
     platform::{self, Platform},
     process_manager::{self, new_queue, OutputQueue, ProcessHandle},
     rpc::{self, BlockchainInfo, RpcAuth},
-    updater::{self, UpdateResult},
 };
 
 // ── Message ───────────────────────────────────────────────────────────────────
@@ -75,16 +79,119 @@ pub enum Message {
     ShutdownBoth,
     ShutdownElectrsOnly,
 
+    // ── Navigation and binary builds ─────────────────────────────────────────
+    OpenDashboard,
+    OpenBinaries,
+    RefreshBinaryInfo,
+    InstalledVersionsLoaded(InstalledVersions),
+    AvailableVersionsLoaded(AvailableVersions),
+    SelectBitcoinVersion(ReleaseVersion),
+    SelectElectrsVersion(ReleaseVersion),
+    StartBuild(BinaryKind),
+    BuildFinished(Result<BuildSummary, BuildFailure>),
+    CancelBuild,
+    ToggleBuildDetails,
+    ToggleBuildAdvanced,
+
     // ── Async results ─────────────────────────────────────────────────────────
     StatusPollReceived(StatusPollResult),
-    UpdateBinaries,
-    UpdateResult(String), // human-readable outcome message
 
     // ── Modal / overlay ───────────────────────────────────────────────────────
     /// Dismiss the info/error overlay.
     DismissOverlay,
-    /// Open BitForge.app (update flow).
-    OpenBitForge(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Dashboard,
+    Binaries,
+}
+
+#[derive(Debug)]
+struct BinaryPageState {
+    installed_versions: Option<InstalledVersions>,
+    available_versions: Option<AvailableVersions>,
+    installed_load: InventoryLoad,
+    available_load: InventoryLoad,
+    selected_bitcoin: Option<ReleaseVersion>,
+    selected_electrs: Option<ReleaseVersion>,
+    active_kind: Option<BinaryKind>,
+    stage: Option<BuildStage>,
+    progress: f32,
+    log_lines: Vec<String>,
+    disclosures: BinaryDisclosures,
+    cancellation_requested: bool,
+    error: Option<String>,
+    success: Option<String>,
+    last_log_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InventoryLoad {
+    Idle,
+    Loading,
+}
+
+impl InventoryLoad {
+    const fn is_loading(self) -> bool {
+        matches!(self, Self::Loading)
+    }
+}
+
+#[derive(Debug, Default)]
+struct BinaryDisclosures {
+    build_details: bool,
+    advanced: bool,
+}
+
+impl BinaryPageState {
+    fn new(recovered: Option<PersistedBuild>) -> Self {
+        let mut state = Self {
+            installed_versions: None,
+            available_versions: None,
+            installed_load: InventoryLoad::Idle,
+            available_load: InventoryLoad::Idle,
+            selected_bitcoin: None,
+            selected_electrs: None,
+            active_kind: None,
+            stage: None,
+            progress: 0.0,
+            log_lines: Vec::new(),
+            disclosures: BinaryDisclosures::default(),
+            cancellation_requested: false,
+            error: None,
+            success: None,
+            last_log_path: None,
+        };
+
+        if let Some(build) = recovered {
+            state.stage = Some(build.stage);
+            state.progress = build.stage.progress();
+            state.last_log_path = Some(build.log_path);
+            match build.status {
+                PersistedBuildStatus::Complete => {
+                    state.progress = 1.0;
+                    state.success = Some(format!(
+                        "{} {} was installed successfully.",
+                        build.kind.label(),
+                        build.version
+                    ));
+                }
+                PersistedBuildStatus::Failed
+                | PersistedBuildStatus::Cancelled
+                | PersistedBuildStatus::Interrupted => {
+                    state.error = build.error;
+                }
+                PersistedBuildStatus::Running => {
+                    state.error = Some(
+                        "The previous build did not finish. Existing binaries were left unchanged."
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+        state
+    }
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -117,12 +224,15 @@ pub struct App {
     block_height: u64,
 
     // ── UI state ──────────────────────────────────────────────────────────────
+    page: Page,
     paths_visible: bool,
+    binary_page: BinaryPageState,
+    build_service: BuildService,
+    build_event_tx: mpsc::Sender<BuildEvent>,
+    build_event_rx: mpsc::Receiver<BuildEvent>,
 
     /// Non-empty ⇒ display an overlay dialog with this message.
     overlay_message: Option<String>,
-    /// When `overlay_message` is set, this optional path allows a "Open `BitForge`" button.
-    bitforge_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,13 +244,27 @@ pub struct StatusPollResult {
 impl App {
     pub fn new(ssd_root: &Path) -> Self {
         let (config, config_warning) = Config::load(ssd_root);
+        Self::from_config(
+            config,
+            config_warning.as_deref(),
+            Config::build_state_file_path(),
+        )
+    }
 
+    fn from_config(
+        config: Config,
+        config_warning: Option<&str>,
+        build_state_path: PathBuf,
+    ) -> Self {
         let binaries_edit = config.binaries_path.to_string_lossy().into_owned();
         let bitcoin_data_edit = config.bitcoin_data_path.to_string_lossy().into_owned();
         let electrs_data_edit = config.electrs_data_path.to_string_lossy().into_owned();
 
         let bitcoin_queue = new_queue();
         let electrs_queue = new_queue();
+        let (build_event_tx, build_event_rx) = mpsc::channel();
+        let build_service = BuildService::new(build_state_path);
+        let binary_page = BinaryPageState::new(build_service.recovered());
 
         // Log startup info into the terminal queues
         push_msg(&bitcoin_queue, "=== BitEngine started ===");
@@ -148,7 +272,7 @@ impl App {
             &bitcoin_queue,
             &format!("Platform : {}", Platform::current().label()),
         );
-        if let Some(warning) = config_warning.as_ref() {
+        if let Some(warning) = config_warning {
             push_msg(&bitcoin_queue, warning);
             push_msg(&electrs_queue, warning);
         }
@@ -195,14 +319,22 @@ impl App {
             bitcoin_synced: false,
             electrs_status: ElectrsStatus::default(),
             block_height: 0,
+            page: Page::Dashboard,
             paths_visible: true,
+            binary_page,
+            build_service,
+            build_event_tx,
+            build_event_rx,
             overlay_message: None,
-            bitforge_path: None,
         }
     }
 
     // ── update ────────────────────────────────────────────────────────────────
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the exhaustive Iced message dispatcher keeps UI state transitions centralized"
+    )]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::OutputTick => self.handle_output_tick(),
@@ -259,6 +391,49 @@ impl App {
             Message::LaunchElectrs => self.launch_electrs(),
             Message::ShutdownBoth => self.shutdown_both(),
             Message::ShutdownElectrsOnly => self.shutdown_electrs_only(),
+            Message::OpenDashboard => {
+                self.page = Page::Dashboard;
+                Task::none()
+            }
+            Message::OpenBinaries => {
+                self.page = Page::Binaries;
+                self.refresh_binary_info()
+            }
+            Message::RefreshBinaryInfo => self.refresh_binary_info(),
+            Message::InstalledVersionsLoaded(versions) => {
+                self.binary_page.installed_load = InventoryLoad::Idle;
+                self.binary_page.installed_versions = Some(versions);
+                Task::none()
+            }
+            Message::AvailableVersionsLoaded(versions) => {
+                self.apply_available_versions(versions);
+                Task::none()
+            }
+            Message::SelectBitcoinVersion(version) => {
+                self.binary_page.selected_bitcoin = Some(version);
+                Task::none()
+            }
+            Message::SelectElectrsVersion(version) => {
+                self.binary_page.selected_electrs = Some(version);
+                Task::none()
+            }
+            Message::StartBuild(kind) => self.start_build(kind),
+            Message::BuildFinished(result) => self.apply_build_finished(result),
+            Message::CancelBuild => {
+                if self.build_service.cancel_current() {
+                    self.binary_page.cancellation_requested = true;
+                }
+                Task::none()
+            }
+            Message::ToggleBuildDetails => {
+                self.binary_page.disclosures.build_details =
+                    !self.binary_page.disclosures.build_details;
+                Task::none()
+            }
+            Message::ToggleBuildAdvanced => {
+                self.binary_page.disclosures.advanced = !self.binary_page.disclosures.advanced;
+                Task::none()
+            }
             Message::StatusPollReceived(result) => {
                 if let Ok(info) = result.blockchain_info {
                     self.block_height = info.blocks;
@@ -271,25 +446,8 @@ impl App {
                 self.apply_electrs_status(result.electrs_status);
                 Task::none()
             }
-            Message::UpdateBinaries => self.update_binaries(),
-            Message::UpdateResult(msg) => {
-                self.apply_update_result(msg);
-                Task::none()
-            }
             Message::DismissOverlay => {
                 self.overlay_message = None;
-                self.bitforge_path = None;
-                Task::none()
-            }
-            Message::OpenBitForge(path) => {
-                if let Err(err) = platform::open_path(&path) {
-                    self.overlay_message =
-                        Some(format!("Failed to open {}:\n{err}", path.display()));
-                    self.bitforge_path = None;
-                    return Task::none();
-                }
-                self.overlay_message = None;
-                self.bitforge_path = None;
                 Task::none()
             }
         }
@@ -299,6 +457,7 @@ impl App {
         const MAX: usize = 5_000;
         let mut btc_new = false;
         let mut els_new = false;
+        let mut build_new = false;
 
         if let Ok(mut q) = self.bitcoin_queue.lock() {
             while let Some(line) = q.pop_front() {
@@ -314,6 +473,11 @@ impl App {
             }
         }
 
+        while let Ok(event) = self.build_event_rx.try_recv() {
+            build_new |= matches!(event, BuildEvent::Log(_));
+            self.apply_build_event(event);
+        }
+
         if self.bitcoin_lines.len() > MAX {
             let drain_to = self.bitcoin_lines.len() - MAX;
             self.bitcoin_lines.drain(..drain_to);
@@ -321,6 +485,10 @@ impl App {
         if self.electrs_lines.len() > MAX {
             let drain_to = self.electrs_lines.len() - MAX;
             self.electrs_lines.drain(..drain_to);
+        }
+        if self.binary_page.log_lines.len() > MAX {
+            let drain_to = self.binary_page.log_lines.len() - MAX;
+            self.binary_page.log_lines.drain(..drain_to);
         }
 
         if let Some(h) = &mut self.bitcoin_handle {
@@ -357,6 +525,15 @@ impl App {
         if els_new {
             tasks.push(widget::operation::scroll_to(
                 ui_render::electrs_scroll_id(),
+                scrollable::AbsoluteOffset {
+                    x: 0.0,
+                    y: f32::MAX,
+                },
+            ));
+        }
+        if build_new && self.binary_page.disclosures.build_details {
+            tasks.push(widget::operation::scroll_to(
+                ui_render::build_scroll_id(),
                 scrollable::AbsoluteOffset {
                     x: 0.0,
                     y: f32::MAX,
@@ -562,49 +739,140 @@ impl App {
         Task::none()
     }
 
-    fn update_binaries(&self) -> Task<Message> {
-        let binaries_dst = self.config.binaries_path.clone();
-        let btc_q = Arc::clone(&self.bitcoin_queue);
+    fn refresh_binary_info(&mut self) -> Task<Message> {
+        self.binary_page.installed_load = InventoryLoad::Loading;
+        self.binary_page.available_load = InventoryLoad::Loading;
+        let binaries_dir = self.config.binaries_path.clone();
+        Task::batch([
+            Task::perform(
+                async move { InstalledVersions::detect(&binaries_dir).await },
+                Message::InstalledVersionsLoaded,
+            ),
+            Task::perform(AvailableVersions::fetch(), Message::AvailableVersionsLoaded),
+        ])
+    }
+
+    fn apply_available_versions(&mut self, versions: AvailableVersions) {
+        self.binary_page.available_load = InventoryLoad::Idle;
+        if let Ok(releases) = &versions.bitcoin {
+            if !self
+                .binary_page
+                .selected_bitcoin
+                .as_ref()
+                .is_some_and(|selected| releases.contains(selected))
+            {
+                self.binary_page.selected_bitcoin = releases.first().cloned();
+            }
+        }
+        if let Ok(releases) = &versions.electrs {
+            if !self
+                .binary_page
+                .selected_electrs
+                .as_ref()
+                .is_some_and(|selected| releases.contains(selected))
+            {
+                self.binary_page.selected_electrs = releases.first().cloned();
+            }
+        }
+        self.binary_page.available_versions = Some(versions);
+    }
+
+    fn start_build(&mut self, kind: BinaryKind) -> Task<Message> {
+        if self.binary_page.active_kind.is_some() {
+            self.binary_page.error = Some(
+                "A build is already active. Wait for it to finish or cancel it first.".to_owned(),
+            );
+            return Task::none();
+        }
+
+        let selected = match kind {
+            BinaryKind::BitcoinCore => self.binary_page.selected_bitcoin.clone(),
+            BinaryKind::Electrs => self.binary_page.selected_electrs.clone(),
+        };
+        let Some(version) = selected else {
+            self.binary_page.error = Some(
+                "No stable release is available. Refresh the release information and try again."
+                    .to_owned(),
+            );
+            return Task::none();
+        };
+
+        self.binary_page.active_kind = Some(kind);
+        self.binary_page.stage = Some(BuildStage::CheckingRequirements);
+        self.binary_page.progress = BuildStage::CheckingRequirements.progress();
+        self.binary_page.log_lines.clear();
+        self.binary_page.disclosures.build_details = false;
+        self.binary_page.cancellation_requested = false;
+        self.binary_page.error = None;
+        self.binary_page.success = None;
+        self.binary_page.last_log_path = None;
+
+        let service = self.build_service.clone();
+        let event_tx = self.build_event_tx.clone();
+        let request = BuildRequest {
+            kind,
+            version,
+            binaries_dir: self.config.binaries_path.clone(),
+            workspace: binaries::workspace_for(&self.config.binaries_path),
+            cores: build_worker_count(),
+        };
         Task::perform(
-            async move {
-                let result = updater::run_update(&binaries_dst);
-                match result {
-                    UpdateResult::Updated(msg) => {
-                        push_msg(&btc_q, &format!("Update complete: {msg}"));
-                        format!("Successfully updated:\n\n{msg}")
-                    }
-                    UpdateResult::BitForgeFound(path) => {
-                        format!("__BITFORGE_FOUND__{}", path.display())
-                    }
-                    UpdateResult::BitForgeNotFound => "No bitcoin_builds folder found.\n\n\
-                         Place platform-specific bitcoin/electrs builds under your Downloads bitcoin_builds/binaries folder.\n\n\
-                         On macOS, BitForge can build those binaries:\n\
-                         https://github.com/csd113/BitForge"
-                        .into(),
-                    UpdateResult::BinariesSubfolderMissing => {
-                        "Found bitcoin_builds in Downloads but no 'binaries/' sub-folder inside it."
-                            .into()
-                    }
-                    UpdateResult::NothingToUpdate => {
-                        "No bitcoin-X.Y.Z or electrs-X.Y.Z folders found in the binaries folder."
-                            .into()
-                    }
-                }
-            },
-            Message::UpdateResult,
+            async move { service.run(request, event_tx).await },
+            Message::BuildFinished,
         )
     }
 
-    fn apply_update_result(&mut self, msg: String) {
-        if let Some(path_str) = msg.strip_prefix("__BITFORGE_FOUND__") {
-            self.bitforge_path = Some(PathBuf::from(path_str));
-            self.overlay_message = Some(
-                "No bitcoin_builds folder found.\n\nBitForge.app is installed — open it to build binaries?"
-                    .into(),
-            );
-        } else {
-            self.bitforge_path = None;
-            self.overlay_message = Some(msg);
+    fn apply_build_event(&mut self, event: BuildEvent) {
+        match event {
+            BuildEvent::Stage { kind, stage } => {
+                self.binary_page.active_kind = (stage != BuildStage::Complete).then_some(kind);
+                self.binary_page.stage = Some(stage);
+                self.binary_page.progress = stage.progress();
+            }
+            BuildEvent::Progress(progress) => {
+                self.binary_page.progress = progress.clamp(0.0, 1.0);
+            }
+            BuildEvent::Log(message) => {
+                self.binary_page
+                    .log_lines
+                    .extend(message.lines().map(ToOwned::to_owned));
+            }
+        }
+    }
+
+    fn apply_build_finished(
+        &mut self,
+        result: Result<BuildSummary, BuildFailure>,
+    ) -> Task<Message> {
+        self.binary_page.active_kind = None;
+        self.binary_page.cancellation_requested = false;
+        match result {
+            Ok(summary) => {
+                self.binary_page.stage = Some(BuildStage::Complete);
+                self.binary_page.progress = 1.0;
+                self.binary_page.last_log_path = Some(summary.log_path);
+                self.binary_page.success = Some(format!(
+                    "{} {} installed successfully ({}). The new binary will be used on the next launch.",
+                    summary.kind.label(),
+                    summary.version,
+                    summary.installed.join(", ")
+                ));
+                self.binary_page.error = None;
+                self.refresh_binary_info()
+            }
+            Err(failure) => {
+                self.binary_page.error = Some(if failure.conflict {
+                    format!("Build request declined: {}", failure.message)
+                } else {
+                    failure.message
+                });
+                if !failure.cancelled {
+                    self.binary_page.disclosures.build_details =
+                        !self.binary_page.log_lines.is_empty();
+                }
+                self.binary_page.success = None;
+                Task::none()
+            }
         }
     }
 
@@ -732,4 +1000,118 @@ fn log_binary_resolution(queue: &OutputQueue, binaries_path: &Path, binary: &str
         queue,
         &format!("Resolved {binary}: {} ({status})", resolved.display()),
     );
+}
+
+fn build_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, |count| count.get().saturating_sub(1).clamp(1, 8))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(root: &Path) -> App {
+        App::from_config(Config::defaults(root), None, root.join("build-state.json"))
+    }
+
+    #[test]
+    fn update_binaries_navigation_opens_native_page() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        assert_eq!(app.page, Page::Dashboard);
+        drop(app.update(Message::OpenBinaries));
+        assert_eq!(app.page, Page::Binaries);
+        drop(app.update(Message::OpenDashboard));
+        assert_eq!(app.page, Page::Dashboard);
+        Ok(())
+    }
+
+    #[test]
+    fn available_versions_select_the_latest_release() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        let older = "v29.2"
+            .parse::<ReleaseVersion>()
+            .map_err(anyhow::Error::msg)?;
+        let latest = "v30.0"
+            .parse::<ReleaseVersion>()
+            .map_err(anyhow::Error::msg)?;
+        app.binary_page.installed_versions = Some(InstalledVersions {
+            bitcoin: Ok(Some(older.clone())),
+            electrs: Ok(None),
+        });
+        app.apply_available_versions(AvailableVersions {
+            bitcoin: Ok(vec![latest.clone(), older]),
+            electrs: Ok(vec!["v0.10.10"
+                .parse::<ReleaseVersion>()
+                .map_err(anyhow::Error::msg)?]),
+        });
+        assert_eq!(app.binary_page.selected_bitcoin, Some(latest));
+        assert!(app.binary_page.selected_electrs.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn starting_a_target_sets_clear_progress_and_blocks_a_second_request() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        app.binary_page.selected_bitcoin = Some(
+            "v30.0"
+                .parse::<ReleaseVersion>()
+                .map_err(anyhow::Error::msg)?,
+        );
+        drop(app.start_build(BinaryKind::BitcoinCore));
+        assert_eq!(app.binary_page.active_kind, Some(BinaryKind::BitcoinCore));
+        assert_eq!(
+            app.binary_page.stage,
+            Some(BuildStage::CheckingRequirements)
+        );
+        drop(app.start_build(BinaryKind::Electrs));
+        assert!(app
+            .binary_page
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("already active")));
+        Ok(())
+    }
+
+    #[test]
+    fn build_events_update_human_readable_status_and_log() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        app.apply_build_event(BuildEvent::Stage {
+            kind: BinaryKind::Electrs,
+            stage: BuildStage::Compiling,
+        });
+        app.apply_build_event(BuildEvent::Progress(0.7));
+        app.apply_build_event(BuildEvent::Log("Compiling crate\nFinished\n".to_owned()));
+        assert_eq!(app.binary_page.stage, Some(BuildStage::Compiling));
+        assert!((app.binary_page.progress - 0.7).abs() < f32::EPSILON);
+        assert_eq!(
+            app.binary_page.log_lines,
+            vec!["Compiling crate", "Finished"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_failure_clears_active_state_and_preserves_diagnostic() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        app.binary_page.active_kind = Some(BinaryKind::BitcoinCore);
+        drop(app.apply_build_finished(Err(BuildFailure {
+            message:
+                "compiler exited with status 2; installed binaries were not changed".to_owned(),
+            cancelled: false,
+            conflict: false,
+        })));
+        assert_eq!(app.binary_page.active_kind, None);
+        assert!(app
+            .binary_page
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("not changed")));
+        Ok(())
+    }
 }

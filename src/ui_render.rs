@@ -1,15 +1,20 @@
-use std::path::PathBuf;
-
 use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::{
     font::Font,
-    widget::{button, column, container, row, scrollable, text, text_input, Id, Space},
+    widget::{
+        button, column, container, pick_list, progress_bar, row, scrollable, text, text_input, Id,
+        Space,
+    },
     Alignment, Color, Element, Length, Padding,
 };
 
-use crate::{config::Config, platform::APP_NAME};
+use crate::{
+    binaries::{BinaryKind, BuildStage},
+    config::Config,
+    platform::APP_NAME,
+};
 
-use super::{App, Message};
+use super::{App, Message, Page};
 
 const BG: Color = Color {
     r: 0.949,
@@ -134,17 +139,15 @@ pub(super) const fn electrs_scroll_id() -> Id {
     Id::new("electrs_terminal")
 }
 
+pub(super) const fn build_scroll_id() -> Id {
+    Id::new("binary_build_details")
+}
+
 pub(super) fn view(app: &App) -> Element<'_, Message> {
-    let content = column![
-        view_toolbar(app),
-        horizontal_rule(),
-        view_paths_panel(app),
-        view_node_panels(app),
-        horizontal_rule(),
-        view_bottom_bar(app),
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill);
+    let content = match app.page {
+        Page::Dashboard => view_dashboard(app),
+        Page::Binaries => view_binaries_page(app),
+    };
 
     app.overlay_message.as_ref().map_or_else(
         || {
@@ -157,8 +160,662 @@ pub(super) fn view(app: &App) -> Element<'_, Message> {
                 })
                 .into()
         },
-        |msg| view_overlay(msg, app.bitforge_path.clone()),
+        |msg| view_overlay(msg),
     )
+}
+
+fn view_dashboard(app: &App) -> Element<'_, Message> {
+    column![
+        view_toolbar(app),
+        horizontal_rule(),
+        view_paths_panel(app),
+        view_node_panels(app),
+        horizontal_rule(),
+        view_bottom_bar(app),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+fn view_binaries_page(app: &App) -> Element<'_, Message> {
+    let title = column![
+        text("Binaries & Updates")
+            .size(22)
+            .font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::default()
+            })
+            .color(Color::BLACK),
+        text("Build and install Bitcoin Core and electrs without leaving BitEngine.")
+            .size(11)
+            .color(TEXT_SEC),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+    let inventory_loading =
+        app.binary_page.installed_load.is_loading() || app.binary_page.available_load.is_loading();
+    let refresh_label = if inventory_loading {
+        "Checking…"
+    } else {
+        "Refresh"
+    };
+    let header = container(
+        row![
+            styled_button("Back", ButtonStyle::Secondary).on_press(Message::OpenDashboard),
+            Space::new().width(14),
+            title,
+            styled_button(refresh_label, ButtonStyle::Secondary)
+                .on_press_maybe((!inventory_loading).then_some(Message::RefreshBinaryInfo)),
+        ]
+        .align_y(Alignment::Center)
+        .padding(Padding::from([0, 20])),
+    )
+    .width(Length::Fill)
+    .height(64)
+    .style(|_| container::Style {
+        background: Some(BAR.into()),
+        ..Default::default()
+    });
+
+    let binaries = container(column![
+        binary_row(app, BinaryKind::BitcoinCore),
+        horizontal_rule(),
+        binary_row(app, BinaryKind::Electrs),
+    ])
+    .width(Length::Fill)
+    .style(|_| container::Style {
+        background: Some(PANEL.into()),
+        border: iced::Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..Default::default()
+    });
+
+    let mut sections: Vec<Element<Message>> = vec![
+        column![
+            text("Installed binaries")
+                .size(17)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::default()
+                })
+                .color(Color::BLACK),
+            text("BitEngine checks the binaries in your configured Binaries folder and compares them with stable upstream releases.")
+                .size(11)
+                .color(TEXT_SEC)
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        ]
+        .spacing(5)
+        .into(),
+        binaries.into(),
+    ];
+
+    if binary_build_status_is_visible(app) {
+        sections.push(view_binary_build_status(app));
+    }
+    sections.push(view_binary_advanced(app));
+
+    let page_content = container(column(sections).spacing(20))
+        .width(Length::Fill)
+        .max_width(1100)
+        .padding(Padding::from([28, 32]));
+    let body = scrollable(
+        container(page_content)
+            .width(Length::Fill)
+            .align_x(Alignment::Center),
+    )
+    .height(Length::Fill)
+    .width(Length::Fill);
+
+    column![header, horizontal_rule(), body]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn binary_row(app: &App, kind: BinaryKind) -> Element<'_, Message> {
+    let presentation = binary_row_presentation(app, kind);
+    let BinaryRowPresentation {
+        installed,
+        latest,
+        action_label,
+        action,
+        status_label,
+        status_color,
+    } = presentation;
+    let heading = column![
+        text(kind.label())
+            .size(17)
+            .font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::default()
+            })
+            .color(Color::BLACK),
+        text(match kind {
+            BinaryKind::BitcoinCore => "Full Bitcoin node",
+            BinaryKind::Electrs => "Electrum server index",
+        })
+        .size(10)
+        .color(TEXT_TER),
+    ]
+    .spacing(2)
+    .width(Length::FillPortion(3));
+    let versions = row![
+        version_value("INSTALLED", installed),
+        Space::new().width(28),
+        version_value("LATEST", latest),
+    ]
+    .width(Length::FillPortion(3));
+    let action_button = styled_button(action_label, ButtonStyle::Primary).on_press_maybe(action);
+
+    container(
+        row![
+            container(Space::new().width(4).height(50)).style(move |_| container::Style {
+                background: Some(
+                    match kind {
+                        BinaryKind::BitcoinCore => BTC_ACC,
+                        BinaryKind::Electrs => ELS_ACC,
+                    }
+                    .into()
+                ),
+                border: iced::Border {
+                    radius: 2.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            Space::new().width(12),
+            heading,
+            versions,
+            status_pill(status_label, status_color),
+            Space::new().width(14),
+            action_button,
+        ]
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([18, 20]))
+    .into()
+}
+
+struct BinaryRowPresentation {
+    installed: String,
+    latest: String,
+    action_label: &'static str,
+    action: Option<Message>,
+    status_label: &'static str,
+    status_color: Color,
+}
+
+fn binary_row_presentation(app: &App, kind: BinaryKind) -> BinaryRowPresentation {
+    let (installed_result, releases_result, selected) = match kind {
+        BinaryKind::BitcoinCore => (
+            app.binary_page
+                .installed_versions
+                .as_ref()
+                .map(|versions| &versions.bitcoin),
+            app.binary_page
+                .available_versions
+                .as_ref()
+                .map(|versions| &versions.bitcoin),
+            app.binary_page.selected_bitcoin.as_ref(),
+        ),
+        BinaryKind::Electrs => (
+            app.binary_page
+                .installed_versions
+                .as_ref()
+                .map(|versions| &versions.electrs),
+            app.binary_page
+                .available_versions
+                .as_ref()
+                .map(|versions| &versions.electrs),
+            app.binary_page.selected_electrs.as_ref(),
+        ),
+    };
+    let installed =
+        installed_result.and_then(|result| result.as_ref().ok().and_then(Option::as_ref));
+    let latest = releases_result.and_then(|result| result.as_ref().ok()?.first());
+    let installed_text = match installed_result {
+        None if app.binary_page.installed_load.is_loading() => "Checking…".to_owned(),
+        None => "Not checked".to_owned(),
+        Some(Ok(Some(version))) => version.to_string(),
+        Some(Ok(None)) => "Not installed".to_owned(),
+        Some(Err(_)) => "Unavailable".to_owned(),
+    };
+    let latest_text = match releases_result {
+        None if app.binary_page.available_load.is_loading() => "Checking…".to_owned(),
+        None => "Not checked".to_owned(),
+        Some(Ok(versions)) => versions
+            .first()
+            .map_or_else(|| "Unavailable".to_owned(), ToString::to_string),
+        Some(Err(_)) => "Unavailable".to_owned(),
+    };
+    let current = installed
+        .zip(latest)
+        .is_some_and(|(installed, latest)| installed >= latest);
+    let active = app.binary_page.active_kind;
+    let selected_is_installed = installed
+        .zip(selected)
+        .is_some_and(|(left, right)| left == right);
+    let selected_is_latest = latest
+        .zip(selected)
+        .is_some_and(|(left, right)| left == right);
+    let version_error =
+        installed_result.is_some_and(Result::is_err) || releases_result.is_some_and(Result::is_err);
+    let (action_label, action) = if active == Some(kind) {
+        ("Building…", None)
+    } else if active.is_some() {
+        ("Build / Update", None)
+    } else if selected.is_none() {
+        ("Unavailable", None)
+    } else if selected_is_installed || (current && selected_is_latest) {
+        (if current { "Up to date" } else { "Installed" }, None)
+    } else {
+        ("Build / Update", Some(Message::StartBuild(kind)))
+    };
+    let (status_label, status_color) = if version_error {
+        ("Status unavailable", MAC_RED)
+    } else if current {
+        ("Up to date", GREEN)
+    } else if installed.is_none() {
+        ("Not installed", MAC_ORG)
+    } else if latest.is_some() {
+        ("Update available", MAC_BLUE)
+    } else {
+        ("Status unknown", TEXT_TER)
+    };
+
+    BinaryRowPresentation {
+        installed: installed_text,
+        latest: latest_text,
+        action_label,
+        action,
+        status_label,
+        status_color,
+    }
+}
+
+fn version_value(label: &'static str, value: String) -> Element<'static, Message> {
+    column![
+        text(label).size(9).color(TEXT_TER),
+        text(value)
+            .size(14)
+            .font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::default()
+            })
+            .color(Color::BLACK),
+    ]
+    .spacing(3)
+    .into()
+}
+
+fn status_pill(label: &str, color: Color) -> Element<'_, Message> {
+    container(text(label).size(10).color(color))
+        .padding(Padding::from([5, 10]))
+        .style(move |_| container::Style {
+            background: Some(
+                Color {
+                    r: color.r,
+                    g: color.g,
+                    b: color.b,
+                    a: 0.10,
+                }
+                .into(),
+            ),
+            border: iced::Border {
+                color,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn binary_build_status_is_visible(app: &App) -> bool {
+    app.binary_page.active_kind.is_some()
+        || app.binary_page.error.is_some()
+        || app.binary_page.success.is_some()
+        || !app.binary_page.log_lines.is_empty()
+}
+
+fn view_binary_build_status(app: &App) -> Element<'_, Message> {
+    let stage_label = if app.binary_page.cancellation_requested {
+        "Cancelling safely…"
+    } else {
+        app.binary_page.stage.map_or("Waiting", BuildStage::label)
+    };
+    let target = app
+        .binary_page
+        .active_kind
+        .map_or("Recent build", BinaryKind::label);
+    let heading = row![
+        column![
+            text(target)
+                .size(16)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::default()
+                })
+                .color(Color::BLACK),
+            text(stage_label).size(11).color(TEXT_SEC),
+        ]
+        .spacing(3)
+        .width(Length::Fill),
+        if app.binary_page.active_kind.is_some() {
+            styled_button("Cancel", ButtonStyle::Destructive).on_press_maybe(
+                (!app.binary_page.cancellation_requested).then_some(Message::CancelBuild),
+            )
+        } else {
+            styled_button("Refresh", ButtonStyle::Secondary).on_press(Message::RefreshBinaryInfo)
+        },
+    ]
+    .align_y(Alignment::Center);
+
+    let progress = progress_bar(0.0..=1.0, app.binary_page.progress)
+        .girth(8)
+        .style(|_| iced::widget::progress_bar::Style {
+            background: DISABLED_BG.into(),
+            bar: MAC_BLUE.into(),
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..Default::default()
+            },
+        });
+
+    let mut content: Vec<Element<Message>> = vec![
+        heading.into(),
+        progress.into(),
+        build_stage_track(app.binary_page.stage),
+    ];
+    if let Some(success) = app.binary_page.success.as_deref() {
+        content.push(build_notice(success, GREEN));
+    }
+    if let Some(error) = app.binary_page.error.as_deref() {
+        content.push(build_notice(error, MAC_RED));
+    }
+
+    let details_label = if app.binary_page.disclosures.build_details {
+        "Hide Build Details"
+    } else {
+        "Build Details"
+    };
+    if !app.binary_page.log_lines.is_empty() || app.binary_page.last_log_path.is_some() {
+        content.push(
+            row![
+                styled_button(details_label, ButtonStyle::Secondary)
+                    .on_press(Message::ToggleBuildDetails),
+                Space::new().width(Length::Fill),
+                text(format!("{} log lines", app.binary_page.log_lines.len()))
+                    .size(9)
+                    .color(TEXT_TER),
+            ]
+            .align_y(Alignment::Center)
+            .into(),
+        );
+    }
+    if app.binary_page.disclosures.build_details {
+        content.push(build_details(app));
+    }
+
+    container(column(content).spacing(14))
+        .width(Length::Fill)
+        .padding(20)
+        .style(|_| container::Style {
+            background: Some(PANEL.into()),
+            border: iced::Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn build_stage_track(stage: Option<BuildStage>) -> Element<'static, Message> {
+    let stages = [
+        BuildStage::DownloadingSource,
+        BuildStage::VerifyingSource,
+        BuildStage::PreparingBuild,
+        BuildStage::Compiling,
+        BuildStage::VerifyingBinary,
+        BuildStage::Installing,
+        BuildStage::Complete,
+    ];
+    let current_rank = stage.map_or(0, build_stage_rank);
+    let mut items = Vec::with_capacity(stages.len() * 2 - 1);
+    for (index, item) in stages.into_iter().enumerate() {
+        if index > 0 {
+            items.push(text("→").size(10).color(TEXT_TER).into());
+        }
+        let complete = current_rank >= build_stage_rank(item);
+        items.push(
+            text(item.label())
+                .size(9)
+                .color(if complete { MAC_BLUE } else { TEXT_TER })
+                .into(),
+        );
+    }
+    row(items)
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
+}
+
+const fn build_stage_rank(stage: BuildStage) -> usize {
+    match stage {
+        BuildStage::CheckingRequirements => 0,
+        BuildStage::DownloadingSource => 1,
+        BuildStage::VerifyingSource => 2,
+        BuildStage::PreparingBuild => 3,
+        BuildStage::Compiling => 4,
+        BuildStage::VerifyingBinary => 5,
+        BuildStage::Installing => 6,
+        BuildStage::Complete => 7,
+    }
+}
+
+fn build_notice(message: &str, color: Color) -> Element<'_, Message> {
+    container(
+        text(message)
+            .size(11)
+            .color(TEXT_SEC)
+            .width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([10, 12]))
+    .style(move |_| container::Style {
+        background: Some(
+            Color {
+                r: color.r,
+                g: color.g,
+                b: color.b,
+                a: 0.08,
+            }
+            .into(),
+        ),
+        border: iced::Border {
+            color,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+fn build_details(app: &App) -> Element<'_, Message> {
+    let terminal_content: Element<Message> = if app.binary_page.log_lines.is_empty() {
+        text(app.binary_page.last_log_path.as_ref().map_or_else(
+            || "No build output yet.".to_owned(),
+            |path| format!("Detailed log: {}", path.display()),
+        ))
+        .size(10)
+        .font(Font::MONOSPACE)
+        .color(TERM_DIM)
+        .into()
+    } else {
+        column(
+            app.binary_page
+                .log_lines
+                .iter()
+                .map(|line| terminal_line_element(line)),
+        )
+        .spacing(0)
+        .into()
+    };
+    let details = scrollable(container(terminal_content).padding(12).width(Length::Fill))
+        .id(build_scroll_id())
+        .direction(Direction::Vertical(Scrollbar::default()))
+        .height(260)
+        .width(Length::Fill);
+    container(details)
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(TERM_BG.into()),
+            border: iced::Border {
+                color: TERM_BORDER,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn view_binary_advanced(app: &App) -> Element<'_, Message> {
+    let label = if app.binary_page.disclosures.advanced {
+        "Hide Advanced"
+    } else {
+        "Advanced"
+    };
+    let header = row![
+        column![
+            text("Advanced")
+                .size(13)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::default()
+                })
+                .color(Color::BLACK),
+            text("Choose a specific stable release or inspect build settings.")
+                .size(10)
+                .color(TEXT_TER),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        styled_button(label, ButtonStyle::Secondary).on_press(Message::ToggleBuildAdvanced),
+    ]
+    .align_y(Alignment::Center);
+
+    let mut content: Vec<Element<Message>> = vec![header.into()];
+    if app.binary_page.disclosures.advanced {
+        content.push(horizontal_rule());
+        content.push(
+            row![
+                release_picker(app, BinaryKind::BitcoinCore),
+                Space::new().width(24),
+                release_picker(app, BinaryKind::Electrs),
+            ]
+            .into(),
+        );
+        content.push(
+            column![
+                text("BUILD WORKSPACE").size(9).color(TEXT_TER),
+                text(binaries_workspace_text(app))
+                    .size(10)
+                    .font(Font::MONOSPACE)
+                    .color(TEXT_SEC)
+                    .width(Length::Fill)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                text(format!(
+                    "BitEngine uses {} compiler workers. Node-only Bitcoin flags, source checks, and transactional installation are always enabled.",
+                    super::build_worker_count()
+                ))
+                .size(10)
+                .color(TEXT_TER)
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+            ]
+            .spacing(5)
+            .into(),
+        );
+    }
+
+    container(column(content).spacing(14))
+        .width(Length::Fill)
+        .padding(18)
+        .style(|_| container::Style {
+            background: Some(PANEL.into()),
+            border: iced::Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn release_picker(app: &App, kind: BinaryKind) -> Element<'_, Message> {
+    let (label, options, selected) = match kind {
+        BinaryKind::BitcoinCore => (
+            "BITCOIN CORE RELEASE",
+            app.binary_page
+                .available_versions
+                .as_ref()
+                .and_then(|versions| versions.bitcoin.as_ref().ok()),
+            app.binary_page.selected_bitcoin.as_ref(),
+        ),
+        BinaryKind::Electrs => (
+            "ELECTRS RELEASE",
+            app.binary_page
+                .available_versions
+                .as_ref()
+                .and_then(|versions| versions.electrs.as_ref().ok()),
+            app.binary_page.selected_electrs.as_ref(),
+        ),
+    };
+    let picker: Element<Message> = options.map_or_else(
+        || {
+            text("Release list unavailable")
+                .size(11)
+                .color(TEXT_TER)
+                .into()
+        },
+        |versions| match kind {
+            BinaryKind::BitcoinCore => {
+                pick_list(versions.as_slice(), selected, Message::SelectBitcoinVersion)
+                    .width(180)
+                    .text_size(11)
+                    .into()
+            }
+            BinaryKind::Electrs => {
+                pick_list(versions.as_slice(), selected, Message::SelectElectrsVersion)
+                    .width(180)
+                    .text_size(11)
+                    .into()
+            }
+        },
+    );
+    column![text(label).size(9).color(TEXT_TER), picker]
+        .spacing(6)
+        .width(Length::FillPortion(1))
+        .into()
+}
+
+fn binaries_workspace_text(app: &App) -> String {
+    crate::binaries::workspace_for(&app.config.binaries_path)
+        .display()
+        .to_string()
 }
 
 fn view_toolbar(app: &App) -> Element<'_, Message> {
@@ -207,7 +864,7 @@ fn view_toolbar(app: &App) -> Element<'_, Message> {
     .width(Length::Shrink);
 
     let update_btn =
-        styled_button("Update Binaries", ButtonStyle::Secondary).on_press(Message::UpdateBinaries);
+        styled_button("Update Binaries", ButtonStyle::Secondary).on_press(Message::OpenBinaries);
 
     let toolbar_row = row![
         title_block,
@@ -607,20 +1264,7 @@ fn view_bottom_bar(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-fn view_overlay(message: &str, bitforge_path: Option<PathBuf>) -> Element<'_, Message> {
-    let mut buttons: Vec<Element<Message>> = vec![styled_button("OK", ButtonStyle::Primary)
-        .on_press(Message::DismissOverlay)
-        .into()];
-
-    if let Some(path) = bitforge_path {
-        buttons.insert(
-            0,
-            styled_button("Open BitForge", ButtonStyle::Confirm)
-                .on_press(Message::OpenBitForge(path))
-                .into(),
-        );
-    }
-
+fn view_overlay(message: &str) -> Element<'_, Message> {
     let dialog = container(
         column![
             text(message)
@@ -632,7 +1276,7 @@ fn view_overlay(message: &str, bitforge_path: Option<PathBuf>) -> Element<'_, Me
             Space::new().height(20),
             row![
                 Space::new().width(Length::Fill),
-                row(buttons).spacing(8).align_y(Alignment::Center),
+                styled_button("OK", ButtonStyle::Primary).on_press(Message::DismissOverlay),
             ]
             .align_y(Alignment::Center),
         ]

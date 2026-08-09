@@ -81,6 +81,11 @@ impl Config {
         )
     }
 
+    /// Durable state for the most recent native binary build.
+    pub fn build_state_file_path() -> PathBuf {
+        Self::config_file_path().with_file_name("build-job.json")
+    }
+
     fn legacy_config_file_path() -> PathBuf {
         ProjectDirs::from("", "", LEGACY_APP_NAME).map_or_else(
             || dirs_fallback(LEGACY_APP_NAME).join(CONFIG_FILENAME),
@@ -98,7 +103,7 @@ impl Config {
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    fn defaults(ssd_root: &Path) -> Self {
+    pub(crate) fn defaults(ssd_root: &Path) -> Self {
         Self {
             binaries_path: ssd_root.join("Binaries"),
             bitcoin_data_path: ssd_root.join("BitcoinChain"),

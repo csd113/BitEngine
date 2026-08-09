@@ -26,7 +26,7 @@ BitEngine is a desktop application that lets you launch, monitor, and shut down 
 - Real-time block height display via JSON-RPC
 - Green/grey status indicators: **Running · Synced · Ready** for each node
 - One-click shutdown (Bitcoin RPC stop first, then platform fallback)
-- Binary updater: scans the platform Downloads `bitcoin_builds/` folder and atomically replaces binaries
+- Native Bitcoin Core and electrs source builds with version checks, progress, logs, and transactional installation
 - Fully configurable data paths, persisted across sessions
 - Single-binary distribution — no runtime, no WebView, no Electron
 
@@ -97,10 +97,10 @@ Three per node, updated automatically:
 ### Live block height
 Polls `getblockchaininfo` via JSON-RPC every 5 seconds and displays the current block height with comma formatting (e.g. `895,234`).
 
-### Binary updater
-Click **Update Binaries…** to scan the platform Downloads `bitcoin_builds/binaries/` folder for versioned folders (`bitcoin-27.0`, `electrs-0.10.5`), pick the highest semantic version, and atomically replace binaries in your configured `Binaries/` folder.
+### Binaries and updates
+Click **Update Binaries** to open BitEngine's native binaries page. Installed versions are detected directly from `bitcoind --version` and `electrs --version` while stable upstream releases load separately. Each row tells you whether the binary is missing, current, or has an update available.
 
-On macOS, if `bitcoin_builds` is not found, BitEngine checks for **BitForge.app** in `/Applications` and offers to open it. Linux users should place platform-specific Bitcoin Core and Electrs builds in the same Downloads layout.
+Builds run in the background with clear download, verification, preparation, compilation, binary verification, installation, and completion stages. Detailed Git/CMake/Cargo output is hidden behind **Build Details**. Advanced controls allow a specific stable release to be selected without cluttering the normal update flow.
 
 ### Graceful shutdown
 - **Electrs only**: graceful termination on Unix where available, then kill fallback
@@ -125,6 +125,7 @@ BitEngine derives default paths from the directory containing the executable. On
 │   ├── bitcoin-tx
 │   ├── bitcoin-util
 │   └── electrs
+├── BitEngineBuilds/           ← source cache, job workspaces, and build logs
 ├── BitcoinChain/
 │   └── bitcoin.conf         ← auto-created with sensible defaults if missing
 └── ElectrsDB/
@@ -252,23 +253,20 @@ Cookie-based RPC authentication (`.cookie` file) is used by default. BitEngine c
 
 ## Binary update system
 
-**Update Binaries…** (toolbar button) runs the following flow:
+**Update Binaries** routes to a dedicated BitEngine page and runs the following native flow:
 
-1. Check the platform Downloads `bitcoin_builds/binaries/` directory
-2. Scan for folders matching `bitcoin-X.Y.Z` and `electrs-X.Y.Z`
-3. Pick the highest semantic version for each (major.minor.patch tuple comparison)
-4. Copy binaries into the configured `Binaries/` folder:
-   - Written to a `.tmp` file first
-   - executable permissions applied on Unix platforms
-   - Atomically renamed to the final path — a running binary is never half-replaced
-5. Report what was updated in an overlay dialog
+1. Detect installed versions and fetch stable upstream releases
+2. Validate build tools and available disk space
+3. Clone the selected release into a private source cache, or reuse a clean verified cache
+4. Check the Git origin, selected tag/commit, and clean working tree
+5. Compile Bitcoin Core with the node-only CMake flags or electrs with Cargo `--locked`
+6. Run the built primary binary and confirm that it reports the requested version
+7. Stage the complete binary set inside the configured destination filesystem
+8. Rename existing files to transaction backups, activate the staged set, and roll back on failure
 
-If `bitcoin_builds` is not found:
+Only one build can run at a time. Builds can be cancelled; child processes are killed on cancellation or task drop. Job stage, result, and log location are persisted to `build-job.json` in BitEngine's config directory, so an interrupted job is reported safely on the next launch. Existing installed binaries are not touched until compilation and verification have succeeded.
 
-| Condition | Behaviour |
-|---|---|
-| macOS `/Applications/BitForge.app` exists | Offers to open BitForge |
-| BitForge not found or non-macOS platform | Shows instructions to place platform-specific builds in Downloads |
+See [Native binary build architecture](docs/binaries.md) for the module map, safety model, and former BitForge boundary.
 
 ---
 
@@ -283,7 +281,6 @@ src/
 │
 ├── platform.rs        Platform boundary
 │                      · Supported target detection
-│                      · Downloads/home fallbacks
 │                      · Unix executable permissions and termination signal
 │
 ├── config.rs          Persistent configuration
@@ -301,12 +298,16 @@ src/
 │                      · Two OS reader threads per process → Arc<Mutex<VecDeque>>
 │                      · Platform termination request → 10 s grace period → kill
 │
-├── updater.rs         Binary update system
-│                      · Semver folder scanning (tuple comparison, no regex)
-│                      · Atomic copy: temp file → executable bit on Unix → rename
-│                      · macOS BitForge.app detection and fallback instructions
+├── binaries/          Native binary build/update service
+│   ├── mod.rs         Versions, release discovery, installed detection, shared types
+│   ├── environment.rs PATH, pkg-config, Cargo, and LLVM environment setup
+│   ├── dependencies.rs Target-specific build requirement checks and guidance
+│   ├── process.rs     Cancellable process execution and streamed output
+│   ├── install.rs     Transactional multi-binary installation and rollback
+│   └── service.rs     Single-job orchestration, persistence, build pipelines
 │
-└── ui.rs              Iced 0.14 MVU application
+├── ui.rs              Iced 0.14 MVU state, routing, and task dispatch
+└── ui_render.rs       Dashboard and native binaries-page rendering
                        · App state struct
                        · Message enum (all events)
                        · update() — state transitions + Task dispatch
@@ -318,9 +319,16 @@ src/
 
 ```
 Main thread (Iced / tokio event loop)
-   ├─ OutputTick every 100 ms  → drains both output queues into terminal buffers
+   ├─ OutputTick every 100 ms  → drains node output and native build events
    └─ RpcTick every 5 s        → Task::perform(async getblockchaininfo)
                                       └─ reqwest HTTP → BlockchainInfoReceived
+
+Native build task (at most one)
+   ├─ release/version HTTP and local probes
+   ├─ git / cmake / cargo child processes
+   │    ├─ stdout reader task ─┐
+   │    └─ stderr reader task ─┴→ progress UI + durable build log
+   └─ verified staging → transactional install or rollback
 
 Per-process background threads (2 per running node)
    ├─ stdout reader  ─┐
@@ -377,6 +385,6 @@ MIT — see [LICENSE](LICENSE).
 
 ## Related projects
 
-- [BitForge](https://github.com/csd113/BitForge) — builds Bitcoin Core and Electrs binaries for use with BitEngine
+- [BitForge](https://github.com/csd113/BitForge) — frozen historical standalone implementation; active build/update code now lives in BitEngine
 - [Bitcoin Core](https://github.com/bitcoin/bitcoin)
 - [Electrs](https://github.com/romanz/electrs)

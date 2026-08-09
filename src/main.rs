@@ -10,13 +10,13 @@
     reason = "Iced, rfd, and their platform backends currently pull duplicate transitive crate versions"
 )]
 
+mod binaries;
 mod config;
 mod electrs_status;
 mod platform;
 mod process_manager;
 mod rpc;
 mod ui;
-mod updater;
 
 use std::{path::PathBuf, process};
 

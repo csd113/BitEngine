@@ -3,11 +3,10 @@
 use std::{
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::Child,
 };
 
 use anyhow::{Context as _, Result};
-use directories::UserDirs;
 
 pub const APP_NAME: &str = "BitEngine";
 
@@ -64,24 +63,8 @@ pub fn executable_name(base: &str) -> String {
 }
 
 #[must_use]
-pub fn bitcoin_binary_names() -> Vec<String> {
-    ["bitcoind", "bitcoin-cli", "bitcoin-tx", "bitcoin-util"]
-        .into_iter()
-        .map(executable_name)
-        .collect()
-}
-
-#[must_use]
 pub fn electrs_binary_name() -> String {
     executable_name("electrs")
-}
-
-#[must_use]
-pub fn downloads_bitcoin_builds_dir() -> PathBuf {
-    UserDirs::new()
-        .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
-        .unwrap_or_else(home_dir)
-        .join("bitcoin_builds")
 }
 
 #[must_use]
@@ -108,41 +91,6 @@ pub fn terminate_child(child: &Child) {
         // and `kill` only sends a signal to that operating-system process.
         let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
     }
-}
-
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn bitforge_app_path() -> Option<PathBuf> {
-    let path = PathBuf::from("/Applications/BitForge.app");
-    path.exists().then_some(path)
-}
-
-#[cfg(not(target_os = "macos"))]
-#[must_use]
-pub fn bitforge_app_path() -> Option<PathBuf> {
-    None
-}
-
-pub fn open_path(path: &Path) -> Result<()> {
-    open_path_impl(path)
-}
-
-#[cfg(target_os = "macos")]
-fn open_path_impl(path: &Path) -> Result<()> {
-    Command::new("open")
-        .arg(path)
-        .spawn()
-        .with_context(|| format!("open {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn open_path_impl(path: &Path) -> Result<()> {
-    Command::new("xdg-open")
-        .arg(path)
-        .spawn()
-        .with_context(|| format!("open {}", path.display()))?;
-    Ok(())
 }
 
 #[must_use]
