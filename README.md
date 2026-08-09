@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/bitengine-readme-banner.png" alt="BitEngine Bitcoin node network banner" width="100%">
+
 # ⚙️ BitEngine
 
 **A native cross-platform GUI for managing Bitcoin Core and Electrs nodes**
