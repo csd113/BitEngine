@@ -83,13 +83,9 @@ pub fn launch_bitcoind(
     data_dir: &Path,
     queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
-    let bitcoind = binaries_path.join(platform::executable_name("bitcoind"));
-    if !bitcoind.exists() {
-        bail!("bitcoind not found at {}", bitcoind.display());
-    }
-
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("create bitcoin data dir {}", data_dir.display()))?;
+    let bitcoind =
+        validated_managed_executable(binaries_path, &platform::executable_name("bitcoind"))?;
+    let data_dir = platform::prepare_real_directory(data_dir, "Bitcoin data directory", true)?;
 
     let args = [
         format!("-datadir={}", data_dir.display()),
@@ -121,13 +117,11 @@ pub fn launch_electrs(
     electrum_addr: &str,
     queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
-    let electrs = binaries_path.join(platform::electrs_binary_name());
-    if !electrs.exists() {
-        bail!("electrs not found at {}", electrs.display());
-    }
-
-    std::fs::create_dir_all(electrs_db_dir)
-        .with_context(|| format!("create electrs db dir {}", electrs_db_dir.display()))?;
+    let electrs = validated_managed_executable(binaries_path, &platform::electrs_binary_name())?;
+    let bitcoin_data_dir =
+        platform::prepare_real_directory(bitcoin_data_dir, "Bitcoin data directory", false)?;
+    let electrs_db_dir =
+        platform::prepare_real_directory(electrs_db_dir, "electrs database directory", true)?;
 
     let args = [
         "--network".into(),
@@ -153,6 +147,33 @@ pub fn launch_electrs(
         .with_context(|| format!("spawn electrs {}", electrs.display()))?;
 
     spawn_reader_thread(child, queue)
+}
+
+fn validated_managed_executable(binaries_path: &Path, name: &str) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = platform::prepare_real_directory(binaries_path, "binaries directory", false)?;
+    let executable = root.join(name);
+    let metadata = std::fs::symlink_metadata(&executable)
+        .with_context(|| format!("inspect managed executable {}", executable.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        bail!(
+            "managed executable must be a real executable file: {}",
+            executable.display()
+        );
+    }
+    let canonical = std::fs::canonicalize(&executable)
+        .with_context(|| format!("canonicalize managed executable {}", executable.display()))?;
+    if canonical.parent() != Some(root.as_path()) {
+        bail!(
+            "managed executable escaped the binaries directory: {}",
+            executable.display()
+        );
+    }
+    Ok(canonical)
 }
 
 // ── Reader thread ─────────────────────────────────────────────────────────────
@@ -194,4 +215,44 @@ fn spawn_reader_thread(mut child: Child, queue: &OutputQueue) -> Result<ProcessH
     }
 
     Ok(ProcessHandle { child })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn node_launch_rejects_symlinked_executables_without_running_them() -> Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let temporary = tempfile::tempdir()?;
+        let binaries = temporary.path().join("Binaries");
+        let bitcoin_data = temporary.path().join("BitcoinChain");
+        let electrs_data = temporary.path().join("ElectrsDB");
+        let marker = temporary.path().join("executed");
+        let helper = temporary.path().join("helper");
+        std::fs::create_dir(&binaries)?;
+        std::fs::create_dir(&bitcoin_data)?;
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )?;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))?;
+        symlink(&helper, binaries.join("bitcoind"))?;
+        symlink(&helper, binaries.join("electrs"))?;
+        let queue = new_queue();
+
+        assert!(launch_bitcoind(&binaries, &bitcoin_data, &queue).is_err());
+        assert!(launch_electrs(
+            &binaries,
+            &bitcoin_data,
+            &electrs_data,
+            "127.0.0.1:50001",
+            &queue
+        )
+        .is_err());
+        assert!(!marker.exists());
+        Ok(())
+    }
 }

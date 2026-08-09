@@ -8,7 +8,7 @@ Built with Rust · Iced · Native desktop rendering
 
 Current release: `0.1.2`
 
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%2Farm64-blue)](#supported-platforms)
 [![Architecture](https://img.shields.io/badge/macos-Apple%20Silicon%20only-lightgrey)](#supported-platforms)
@@ -100,7 +100,7 @@ Polls `getblockchaininfo` via JSON-RPC every 5 seconds and displays the current 
 ### Binaries and updates
 Click **Update Binaries** to open BitEngine's native binaries page. Installed versions are detected directly from `bitcoind --version` and `electrs --version` while stable upstream releases load separately. Each row tells you whether the binary is missing, current, or has an update available.
 
-Builds run in the background with clear download, verification, preparation, compilation, binary verification, installation, and completion stages. Detailed Git/CMake/Cargo output is hidden behind **Build Details**. Advanced controls allow a specific stable release to be selected without cluttering the normal update flow.
+Builds run in the background with clear download, source-authentication, preparation, compilation, binary-verification, installation, and completion stages. Detailed Git/CMake/Cargo output is hidden behind **Build Details** and each durable build log is capped at 64 MiB. Advanced controls allow a specific stable release to be selected without cluttering the normal update flow.
 
 ### Graceful shutdown
 - **Electrs only**: graceful termination on Unix where available, then kill fallback
@@ -122,16 +122,20 @@ BitEngine derives default paths from the directory containing the executable. On
 ├── Binaries/
 │   ├── bitcoind
 │   ├── bitcoin-cli
+│   ├── bitcoin
 │   ├── bitcoin-tx
 │   ├── bitcoin-util
+│   ├── bitcoin-wallet
 │   └── electrs
-├── BitEngineBuilds/           ← source cache, job workspaces, and build logs
+├── BitEngineBuilds/           ← private per-job sources/workspaces and bounded retained logs
 ├── BitcoinChain/
 │   └── bitcoin.conf         ← auto-created with sensible defaults if missing
 └── ElectrsDB/
 ```
 
 You can override this with the `BITENGINE_ROOT` environment variable; the legacy `BITCOIN_NODE_MANAGER_ROOT` name is still accepted for compatibility.
+
+The Bitcoin utility entries above are the complete managed filename family; the exact subset present depends on the selected upstream release and enabled build features.
 
 ---
 
@@ -150,7 +154,7 @@ rustup target add x86_64-unknown-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 ```
 
-> **Requires:** Rust 1.80+. macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
+> **Requires:** Rust 1.88+. macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
 
 ### Development build
 
@@ -256,15 +260,19 @@ Cookie-based RPC authentication (`.cookie` file) is used by default. BitEngine c
 **Update Binaries** routes to a dedicated BitEngine page and runs the following native flow:
 
 1. Detect installed versions and fetch stable upstream releases
-2. Validate build tools and available disk space
-3. Clone the selected release into a private source cache, or reuse a clean verified cache
-4. Check the Git origin, selected tag/commit, and clean working tree
+2. Validate build tools and available disk space using the filesystem's native free-space information
+3. Clone the selected release into a fresh private per-job source directory
+4. Check the Git origin, selected tag/commit, signed tag, and pristine working tree
 5. Compile Bitcoin Core with the node-only CMake flags or electrs with Cargo `--locked`
-6. Run the built primary binary and confirm that it reports the requested version
+6. Run every discovered managed output and confirm that it reports the requested version
 7. Stage the complete binary set inside the configured destination filesystem
-8. Rename existing files to transaction backups, activate the staged set, and roll back on failure
+8. Durably journal, back up, activate, and commit the complete managed set, rolling back on failure
 
-Only one build can run at a time. Builds can be cancelled; child processes are killed on cancellation or task drop. Job stage, result, and log location are persisted to `build-job.json` in BitEngine's config directory, so an interrupted job is reported safely on the next launch. Existing installed binaries are not touched until compilation and verification have succeeded.
+Bitcoin Core tags are accepted only when Git verifies them through GnuPG and the reported primary fingerprint is in BitEngine's pinned copy of Bitcoin Core's official trusted-key set. Older electrs tags use the maintainer's pinned OpenPGP fingerprint; electrs v0.11.1 uses the maintainer's pinned SSH signing key. A missing verifier, missing key, invalid signature, expired/revoked key, or unexpected signer fails closed before compilation. Maintainer keys must be obtained and their full fingerprints checked using the upstream projects' official verification guidance; BitEngine does not fetch keys or weaken authentication automatically. Unknown future electrs releases are withheld until a reviewed BitEngine signer-policy update covers them.
+
+In-process coordination and cross-process workspace and destination locks prevent overlapping mutation. Builds can be cancelled before installation; BitEngine terminates the complete build process group and escalates to a kill if it does not exit. Installation itself is a short, non-cancellable transaction. A durable `Prepared`/`Committed` journal lets startup recovery either restore the entire old managed set or validate and finish the new set before the destination can be used again. Outputs absent from the new Bitcoin release are transactionally removed from the managed `bitcoind`, `bitcoin-cli`, `bitcoin`, `bitcoin-tx`, `bitcoin-util`, and `bitcoin-wallet` family rather than leaving mixed-version tools behind.
+
+Job stage, result, and log location are persisted to `build-job.json` in BitEngine's config directory. Each log is capped at 64 MiB, only the eight newest job directories/logs are retained, and private source and work trees are removed after the job. Existing binaries are not touched until source, compilation, and every-artifact verification have succeeded.
 
 See [Native binary build architecture](docs/binaries.md) for the module map, safety model, and former BitForge boundary.
 

@@ -7,46 +7,83 @@ use std::{
 
 pub type BuildEnvironment = HashMap<String, String>;
 
+const PASSTHROUGH_VARIABLES: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
 #[must_use]
 pub fn build_environment() -> BuildEnvironment {
-    let mut environment = std::env::vars().collect::<BuildEnvironment>();
+    build_environment_from(|name| std::env::var(name).ok())
+}
+
+fn build_environment_from(mut variable: impl FnMut(&str) -> Option<String>) -> BuildEnvironment {
+    // Build inputs such as GIT_CONFIG_*, RUSTFLAGS, RUSTC_WRAPPER,
+    // CMAKE_TOOLCHAIN_FILE, and dynamic-loader injection variables must not be
+    // inherited from BitEngine's launcher. The small allowlist below preserves
+    // locale, temporary-directory, and proxy settings needed by normal builds.
+    let mut environment = PASSTHROUGH_VARIABLES
+        .iter()
+        .filter_map(|name| {
+            variable(name)
+                .filter(|value| !value.is_empty())
+                .map(|value| ((*name).to_owned(), value))
+        })
+        .collect::<BuildEnvironment>();
     let mut paths = Vec::with_capacity(24);
 
     if cfg!(target_os = "macos") {
-        push_path(&mut paths, "/opt/homebrew/bin");
+        push_existing_path(&mut paths, "/opt/homebrew/bin");
     }
 
     if let Some(home) = environment.get("HOME") {
         let cargo_bin = Path::new(home).join(".cargo").join("bin");
-        if cargo_bin.is_dir() {
-            push_path(&mut paths, cargo_bin);
-        }
+        push_existing_path(&mut paths, cargo_bin);
+        let nix_profile_bin = Path::new(home).join(".nix-profile").join("bin");
+        push_existing_path(&mut paths, nix_profile_bin);
     }
 
     let llvm_prefix = llvm_candidates()
         .into_iter()
         .find(|candidate| candidate.join("bin").is_dir());
     if let Some(prefix) = llvm_prefix.as_ref() {
-        push_path(&mut paths, prefix.join("bin"));
+        push_existing_path(&mut paths, prefix.join("bin"));
     }
 
-    if let Some(existing) = environment.get("PATH") {
-        paths.extend(
-            existing
-                .split(':')
-                .filter(|part| !part.is_empty())
-                .map(ToOwned::to_owned),
-        );
+    for path in [
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/nix/var/nix/profiles/default/bin",
+        "/run/current-system/sw/bin",
+        "/snap/bin",
+    ] {
+        push_existing_path(&mut paths, path);
     }
-    paths.extend(
-        ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-            .into_iter()
-            .map(ToOwned::to_owned),
-    );
 
     let mut seen = HashSet::with_capacity(paths.len());
     paths.retain(|path| !path.is_empty() && seen.insert(path.clone()));
     environment.insert("PATH".to_owned(), paths.join(":"));
+    environment.insert("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned());
+    environment.insert("GIT_CONFIG_GLOBAL".to_owned(), "/dev/null".to_owned());
+    environment.insert("GIT_CONFIG_COUNT".to_owned(), "0".to_owned());
+    environment.insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
 
     if let Some(prefix) = llvm_prefix {
         let library_path = prefix.join("lib").display().to_string();
@@ -107,6 +144,9 @@ pub fn cargo_environment(base: &BuildEnvironment, target_dir: &Path) -> BuildEnv
         "CARGO_TARGET_DIR".to_owned(),
         target_dir.display().to_string(),
     );
+    let cargo_home = target_dir.parent().unwrap_or(target_dir).join("cargo-home");
+    environment.insert("CARGO_HOME".to_owned(), cargo_home.display().to_string());
+    environment.insert("CARGO_INCREMENTAL".to_owned(), "0".to_owned());
     environment
 }
 
@@ -116,8 +156,31 @@ pub fn find_in_path(tool: &str, environment: &BuildEnvironment) -> Option<PathBu
         .get("PATH")?
         .split(':')
         .filter(|part| !part.is_empty())
-        .map(|directory| Path::new(directory).join(tool))
-        .find(|candidate| candidate.is_file())
+        .map(Path::new)
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(tool))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn set_plain_output(environment: &mut BuildEnvironment) {
@@ -126,8 +189,11 @@ fn set_plain_output(environment: &mut BuildEnvironment) {
     environment.insert("CLICOLOR_FORCE".to_owned(), "0".to_owned());
 }
 
-fn push_path(paths: &mut Vec<String>, path: impl AsRef<Path>) {
-    paths.push(path.as_ref().display().to_string());
+fn push_existing_path(paths: &mut Vec<String>, path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    if path.is_absolute() && path.is_dir() {
+        paths.push(path.display().to_string());
+    }
 }
 
 fn llvm_candidates() -> Vec<PathBuf> {
@@ -162,5 +228,80 @@ mod tests {
             .expect("pkg-config path should be set");
         assert!(path.contains("/custom/pkgconfig"));
         assert!(!environment.contains_key("TERM"));
+    }
+
+    #[test]
+    fn inherited_build_injection_variables_are_not_forwarded() {
+        let dangerous = [
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "url.file:///tmp/fake.insteadOf"),
+            (
+                "GIT_CONFIG_VALUE_0",
+                "https://github.com/bitcoin/bitcoin.git",
+            ),
+            ("RUSTC_WRAPPER", "/tmp/wrapper"),
+            ("RUSTFLAGS", "-C linker=/tmp/linker"),
+            ("CMAKE_TOOLCHAIN_FILE", "/tmp/toolchain"),
+            ("DYLD_INSERT_LIBRARIES", "/tmp/injected.dylib"),
+            ("PATH", "/tmp/injected-build-tools"),
+        ];
+        let environment = build_environment_from(|name| {
+            dangerous
+                .iter()
+                .find_map(|(candidate, value)| (*candidate == name).then(|| (*value).to_owned()))
+        });
+
+        assert_eq!(
+            environment.get("GIT_CONFIG_COUNT").map(String::as_str),
+            Some("0")
+        );
+        assert!(!environment
+            .get("PATH")
+            .is_some_and(|path| path.contains("injected-build-tools")));
+        for name in [
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "RUSTC_WRAPPER",
+            "RUSTFLAGS",
+            "CMAKE_TOOLCHAIN_FILE",
+            "DYLD_INSERT_LIBRARIES",
+        ] {
+            assert!(!environment.contains_key(name), "unexpected {name}");
+        }
+    }
+
+    #[test]
+    fn cargo_uses_a_job_local_home() {
+        let base = BuildEnvironment::new();
+        let environment = cargo_environment(&base, Path::new("/tmp/job/electrs-target"));
+        assert_eq!(
+            environment.get("CARGO_HOME").map(String::as_str),
+            Some("/tmp/job/cargo-home")
+        );
+        assert_eq!(
+            environment.get("CARGO_INCREMENTAL").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_lookup_ignores_relative_and_non_executable_entries() -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir()?;
+        let executable = temporary.path().join("tool");
+        std::fs::write(&executable, "#!/bin/sh\n")?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o644))?;
+        let mut environment = BuildEnvironment::new();
+        environment.insert(
+            "PATH".to_owned(),
+            format!("relative:{}", temporary.path().display()),
+        );
+        assert!(find_in_path("tool", &environment).is_none());
+
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        assert_eq!(find_in_path("tool", &environment), Some(executable));
+        Ok(())
     }
 }

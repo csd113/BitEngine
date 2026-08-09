@@ -1,11 +1,15 @@
 //! Persistent, single-job build orchestration.
 
 use std::{
-    fs,
-    path::{Path, PathBuf},
+    fs::{self, File, OpenOptions},
+    io::{Read as _, Write as _},
+    os::unix::{
+        fs::{OpenOptionsExt as _, PermissionsExt as _},
+        io::AsRawFd as _,
+    },
+    path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::Sender,
         Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -19,15 +23,48 @@ use super::{
     dependencies,
     environment::{self, BuildEnvironment},
     install::{self, InstallArtifact},
-    probe_installed_version, process, BinaryKind, BuildEvent, BuildStage, ReleaseVersion,
+    probe_binary_version, process, BinaryKind, BuildEvent, BuildOperationId, BuildStage,
+    ReleaseVersion,
 };
 
 const BITCOIN_BUILD_SPACE_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 const ELECTRS_BUILD_SPACE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+const MAX_BUILD_LOG_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BUILD_STATE_BYTES: u64 = 1024 * 1024;
+const RETAINED_JOB_LOGS: usize = 8;
+const WORKSPACE_LOCK_NAME: &str = ".bitengine-workspace.lock";
+const BITCOIN_MANAGED_BINARIES: &[&str] = &[
+    "bitcoind",
+    "bitcoin-cli",
+    "bitcoin",
+    "bitcoin-tx",
+    "bitcoin-util",
+    "bitcoin-wallet",
+];
+const ELECTRS_MANAGED_BINARIES: &[&str] = &["electrs"];
+const ELECTRS_SSH_SIGNER_PRINCIPAL: &str = "me@romanzey.de";
+// SSH key published for the electrs maintainer and used by the v0.11.1 tag.
+// Fingerprint: SHA256:GifMn7F2swVKyn6MewbQHrYCs4i/bPK7gnwxhuPz/YA.
+const ELECTRS_SSH_SIGNER_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAZVq/3fgkildjN/MqEnhrP5550sDpFzGxMwevr5q/9w";
+// Bitcoin Core's official v31.1 `contrib/verify-commits/trusted-keys` set.
+// Pinning authorization separately from GnuPG owner trust prevents an
+// unrelated fully trusted local key from authenticating a redirected source.
+const BITCOIN_OPENPGP_SIGNERS: &[&str] = &[
+    "E777299FC265DD04793070EB944D35F9AC3DB76A",
+    "D1DBF2C4B96F2DEBF4C16654410108112E7EA81F",
+    "152812300785C96444D3334D17565732E08E5E41",
+    "4D1B3D5ECBA1A7E05371EEBE46800E30FC748A66",
+    "A8FC55F3B04BA3146F3492E79303B33A305224CB",
+];
+// Primary fingerprint of the GPG key published by the electrs maintainer and
+// used for the pre-v0.11.1 signed tags.
+const ELECTRS_LEGACY_OPENPGP_SIGNERS: &[&str] = &["15C8C3574AE4F1E25F3F35C587CAE5FA46917CBB"];
 
 /// Immutable inputs for one source build and installation.
 #[derive(Debug, Clone)]
 pub struct BuildRequest {
+    pub operation_id: BuildOperationId,
     pub kind: BinaryKind,
     pub version: ReleaseVersion,
     pub binaries_dir: PathBuf,
@@ -63,8 +100,8 @@ pub enum PersistedBuildStatus {
 }
 
 /// Durable state for the most recent build. Active jobs are converted to
-/// `Interrupted` when `BitEngine` starts again, while installed binaries remain
-/// untouched.
+/// `Interrupted` when `BitEngine` starts again. A separate installation journal
+/// then restores an uncommitted old set or finalizes a committed new set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedBuild {
     pub id: String,
@@ -115,6 +152,14 @@ impl BuildService {
         self.recovered.as_ref().clone()
     }
 
+    /// Complete or roll back a durable binary transaction before inventory or
+    /// node launch. Callers must block use of the destination if this fails.
+    pub fn ensure_installation_recovered(destination: &Path) -> std::result::Result<(), String> {
+        recover_destination_installation(destination)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    }
+
     /// Request safe cancellation of the active child process.
     #[must_use]
     pub fn cancel_current(&self) -> bool {
@@ -131,26 +176,74 @@ impl BuildService {
 
     /// Start exactly one build. The coordinator rejects any overlapping
     /// Bitcoin Core/electrs request before it can mutate the workspace.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the build lifetime keeps preflight, durable status, cleanup, and terminal outcome ordering visible in one place"
+    )]
     pub async fn run(
         &self,
-        request: BuildRequest,
-        event_tx: Sender<BuildEvent>,
+        mut request: BuildRequest,
+        event_tx: mpsc::Sender<BuildEvent>,
     ) -> Result<BuildSummary, BuildFailure> {
         let (active, _permit) = self.acquire(request.kind)?;
-        let job_dir = request.workspace.join("jobs").join(&active.id);
-        let log_path = job_dir.join("build.log");
+        validate_request_paths(&request).map_err(|error| {
+            BuildFailure::failed(format!("Unsafe build path configuration: {error:#}"))
+        })?;
+        request.workspace = prepare_workspace(&request.workspace).map_err(|error| {
+            BuildFailure::failed(format!("Could not prepare the build workspace: {error:#}"))
+        })?;
+        let _workspace_lock = WorkspaceLock::acquire(&request.workspace).map_err(|error| {
+            BuildFailure::failed(format!("Could not reserve the build workspace: {error:#}"))
+        })?;
+        recover_destination_installation(&request.binaries_dir).map_err(|error| {
+            BuildFailure::failed(format!(
+                "Binary installation recovery is required before a new build can start: {error:#}"
+            ))
+        })?;
+        cleanup_legacy_sources(&request.workspace).map_err(|error| {
+            BuildFailure::failed(format!(
+                "Could not safely clean the legacy source cache: {error:#}"
+            ))
+        })?;
 
-        if let Err(error) = tokio::fs::create_dir_all(&job_dir).await {
+        let jobs_root = prepare_managed_directory(&request.workspace, "jobs").map_err(|error| {
+            BuildFailure::failed(format!("Could not prepare build job storage: {error:#}"))
+        })?;
+        prune_job_directories(&jobs_root).map_err(|error| {
+            BuildFailure::failed(format!("Could not safely clean old build jobs: {error:#}"))
+        })?;
+
+        let job_dir = jobs_root.join(&active.id);
+        let log_path = job_dir.join("build.log");
+        if let Err(error) = create_private_directory(&job_dir) {
             return Err(BuildFailure::failed(format!(
                 "Could not create the build workspace: {error}"
             )));
         }
 
+        let log_file = match open_build_log(&log_path) {
+            Ok(file) => tokio::fs::File::from_std(file),
+            Err(error) => {
+                return Err(BuildFailure::failed(format!(
+                    "Could not create the bounded build log: {error:#}"
+                )));
+            }
+        };
         let (log_tx, log_rx) = mpsc::channel::<String>(256);
-        let log_writer = tokio::spawn(write_build_log(log_path.clone(), log_rx));
+        let log_failed = Arc::new(AtomicBool::new(false));
+        let writer_failed = Arc::clone(&log_failed);
+        let log_writer = tokio::spawn(async move {
+            let result = write_build_log(log_file, log_rx).await;
+            if result.is_err() {
+                writer_failed.store(true, Ordering::Release);
+            }
+            result
+        });
         let reporter = Reporter {
+            operation_id: request.operation_id,
             event_tx,
             log_tx,
+            log_failed,
             state_path: Arc::clone(&self.state_path),
         };
         let now = unix_timestamp();
@@ -185,13 +278,21 @@ impl BuildService {
             Err(error) => Err(error),
         };
 
+        cleanup_current_job(&job_dir, &reporter).await;
+
         let outcome = match pipeline {
             Ok(installed) => {
                 persisted.status = PersistedBuildStatus::Complete;
                 persisted.stage = BuildStage::Complete;
                 persisted.updated_at = unix_timestamp();
                 persisted.installed.clone_from(&installed);
-                let _ = reporter.persist(&persisted).await;
+                if let Err(error) = reporter.persist(&persisted).await {
+                    reporter
+                        .log(format!(
+                            "Warning: the successful build state could not be persisted: {error:#}\n"
+                        ))
+                        .await;
+                }
                 reporter
                     .log(format!(
                         "\n{} {} is installed and ready.\n",
@@ -199,11 +300,7 @@ impl BuildService {
                         request.version
                     ))
                     .await;
-                let _ = reporter.event_tx.send(BuildEvent::Stage {
-                    kind: request.kind,
-                    stage: BuildStage::Complete,
-                });
-                let _ = reporter.event_tx.send(BuildEvent::Progress(1.0));
+                reporter.complete(request.kind).await;
                 Ok(BuildSummary {
                     kind: request.kind,
                     version: request.version,
@@ -212,7 +309,12 @@ impl BuildService {
                 })
             }
             Err(error) => {
-                let cancelled = active.cancelled.load(Ordering::Acquire);
+                // Cancellation is no longer actionable once the persisted
+                // stage reaches the installation commit boundary. A queued UI
+                // cancel from just before that stage must not relabel an
+                // installation/recovery error as an unchanged cancellation.
+                let cancelled = active.cancelled.load(Ordering::Acquire)
+                    && persisted.stage != BuildStage::Installing;
                 persisted.status = if cancelled {
                     PersistedBuildStatus::Cancelled
                 } else {
@@ -221,11 +323,19 @@ impl BuildService {
                 persisted.updated_at = unix_timestamp();
                 let message = if cancelled {
                     "Build cancelled. The installed binaries were not changed.".to_owned()
+                } else if persisted.stage == BuildStage::Installing {
+                    format!("Build failed during installation: {error:#}")
                 } else {
                     format!("Build failed: {error:#}. The installed binaries were not changed.")
                 };
                 persisted.error = Some(message.clone());
-                let _ = reporter.persist(&persisted).await;
+                if let Err(error) = reporter.persist(&persisted).await {
+                    reporter
+                        .log(format!(
+                            "Warning: the failed build state could not be persisted: {error:#}\n"
+                        ))
+                        .await;
+                }
                 reporter.log(format!("\n{message}\n")).await;
                 Err(BuildFailure {
                     message,
@@ -236,7 +346,12 @@ impl BuildService {
         };
 
         drop(reporter);
-        let _ = log_writer.await;
+        if let Ok(Err(error)) = log_writer.await {
+            // Installation is already complete or definitively failed at this
+            // point, so do not misreport it as rolled back. The next run will
+            // expose the retained state and bounded log path.
+            eprintln!("BitEngine build log could not be finalized: {error:#}");
+        }
         outcome
     }
 
@@ -297,43 +412,139 @@ impl Drop for ActivePermit {
     }
 }
 
+#[derive(Debug)]
+struct WorkspaceLock {
+    file: File,
+}
+
+impl WorkspaceLock {
+    fn acquire(workspace: &Path) -> Result<Self> {
+        let path = workspace.join(WORKSPACE_LOCK_NAME);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("open workspace lock {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("inspect workspace lock {}", path.display()))?;
+        if !metadata.is_file() {
+            bail!("workspace lock is not a regular file: {}", path.display());
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure workspace lock {}", path.display()))?;
+        // SAFETY: `file` owns a valid descriptor for the lifetime of the lock,
+        // and `flock` neither takes ownership nor retains the pointer.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error
+                .raw_os_error()
+                .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+            {
+                bail!(
+                    "another BitEngine process is already using build workspace {}",
+                    workspace.display()
+                );
+            }
+            return Err(error)
+                .with_context(|| format!("lock build workspace {}", workspace.display()));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor remains valid until `self.file` is dropped
+        // immediately after this method returns.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 struct Reporter {
-    event_tx: Sender<BuildEvent>,
+    operation_id: BuildOperationId,
+    event_tx: mpsc::Sender<BuildEvent>,
     log_tx: mpsc::Sender<String>,
+    log_failed: Arc<AtomicBool>,
     state_path: Arc<PathBuf>,
 }
 
 impl Reporter {
+    async fn complete(&self, kind: BinaryKind) {
+        let _ = self
+            .event_tx
+            .send(BuildEvent::Stage {
+                operation_id: self.operation_id,
+                kind,
+                stage: BuildStage::Complete,
+            })
+            .await;
+        let _ = self
+            .event_tx
+            .send(BuildEvent::Progress {
+                operation_id: self.operation_id,
+                progress: 1.0,
+            })
+            .await;
+    }
+
     async fn stage(&self, job: &mut PersistedBuild, next_stage: BuildStage) -> Result<()> {
+        self.ensure_log_available()?;
         job.stage = next_stage;
         job.updated_at = unix_timestamp();
         self.persist(job).await?;
-        let _ = self.event_tx.send(BuildEvent::Stage {
-            kind: job.kind,
-            stage: next_stage,
-        });
         let _ = self
             .event_tx
-            .send(BuildEvent::Progress(next_stage.progress()));
+            .send(BuildEvent::Stage {
+                operation_id: self.operation_id,
+                kind: job.kind,
+                stage: next_stage,
+            })
+            .await;
+        let _ = self
+            .event_tx
+            .send(BuildEvent::Progress {
+                operation_id: self.operation_id,
+                progress: next_stage.progress(),
+            })
+            .await;
         self.log(format!("\n── {} ──\n", next_stage.label())).await;
         Ok(())
     }
 
     fn progress(&self, progress: f32) {
-        let _ = self
-            .event_tx
-            .send(BuildEvent::Progress(progress.clamp(0.0, 1.0)));
+        let _ = self.event_tx.try_send(BuildEvent::Progress {
+            operation_id: self.operation_id,
+            progress: progress.clamp(0.0, 1.0),
+        });
     }
 
     async fn log(&self, message: String) {
-        process::emit_log(&self.event_tx, &self.log_tx, message).await;
+        if !process::emit_log(self.operation_id, &self.event_tx, &self.log_tx, message).await {
+            self.log_failed.store(true, Ordering::Release);
+        }
     }
 
     async fn persist(&self, state: &PersistedBuild) -> Result<()> {
         persist_state_async(&self.state_path, state).await
     }
+
+    fn ensure_log_available(&self) -> Result<()> {
+        if self.log_failed.load(Ordering::Acquire) {
+            bail!("the durable build log is no longer writable");
+        }
+        Ok(())
+    }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the security-sensitive stage order and final transaction boundary are intentionally linear"
+)]
 async fn run_pipeline(
     request: &BuildRequest,
     job_dir: &Path,
@@ -347,14 +558,18 @@ async fn run_pipeline(
     reporter
         .stage(persisted, BuildStage::DownloadingSource)
         .await?;
-    let source = prepare_source(request, job_id, &base_environment, cancelled, reporter).await?;
+    let source = prepare_source(request, job_dir, &base_environment, cancelled, reporter).await?;
 
     reporter
         .stage(persisted, BuildStage::VerifyingSource)
         .await?;
-    verify_source(request.kind, &request.version, &source, &base_environment).await?;
+    let source_commit =
+        verify_source(request.kind, &request.version, &source, &base_environment).await?;
     reporter
-        .log("Source tag, commit, origin, and clean working tree verified.\n".to_owned())
+        .log(format!(
+            "Verified signed upstream tag {}, commit {source_commit}, origin, and pristine working tree.\n",
+            request.version.tag()
+        ))
         .await;
     ensure_not_cancelled(cancelled)?;
 
@@ -396,43 +611,117 @@ async fn run_pipeline(
     reporter
         .stage(persisted, BuildStage::VerifyingBinary)
         .await?;
-    let primary = artifacts
-        .iter()
-        .find(|artifact| artifact.name == request.kind.primary_binary())
-        .with_context(|| {
-            format!(
-                "build produced no {} executable",
-                request.kind.primary_binary()
-            )
-        })?;
-    let reported_version = probe_installed_version(&primary.source)
-        .await?
-        .context("built binary did not report a version")?;
-    if reported_version != request.version {
-        bail!(
-            "built binary reported version {}, expected {}",
-            reported_version,
-            request.version
-        );
-    }
-    reporter
-        .log(format!(
-            "Verified {} reports version {}.\n",
-            request.kind.primary_binary(),
-            reported_version
-        ))
-        .await;
+    verify_artifacts(request, &artifacts, reporter).await?;
     ensure_not_cancelled(cancelled)?;
 
     reporter.stage(persisted, BuildStage::Installing).await?;
+    reporter.ensure_log_available()?;
+    ensure_not_cancelled(cancelled)?;
     let destination = request.binaries_dir.clone();
+    let recovery_destination = destination.clone();
     let install_id = job_id.to_owned();
-    let installed = tokio::task::spawn_blocking(move || {
-        install::install_transaction(&artifacts, &destination, &install_id)
+    let installed_names = artifacts
+        .iter()
+        .map(|artifact| artifact.name.clone())
+        .collect::<Vec<_>>();
+    let managed = match request.kind {
+        BinaryKind::BitcoinCore => BITCOIN_MANAGED_BINARIES,
+        BinaryKind::Electrs => ELECTRS_MANAGED_BINARIES,
+    };
+    let installation = tokio::task::spawn_blocking(move || {
+        install::install_transaction_managed(&artifacts, managed, &destination, &install_id)
     })
     .await
-    .context("binary installation task stopped unexpectedly")??;
+    .context("binary installation task stopped unexpectedly")?;
+    let installed = match installation {
+        Ok(installed) => installed,
+        Err(error) => {
+            let recovery = tokio::task::spawn_blocking(move || {
+                install::recover_pending_install(&recovery_destination)
+            })
+            .await
+            .context("installation recovery task stopped unexpectedly")?;
+            match recovery {
+                Ok(install::InstallRecovery::Finalized) => {
+                    reporter
+                        .log(format!(
+                            "Installation commit succeeded; finalized retained transaction metadata after cleanup error: {error:#}\n"
+                        ))
+                        .await;
+                    installed_names
+                }
+                Ok(install::InstallRecovery::RolledBack) => {
+                    bail!(
+                        "installation failed and the complete previous binary set was restored: {error:#}"
+                    );
+                }
+                Ok(install::InstallRecovery::None) => {
+                    bail!(
+                        "installation failed before commit; the existing binary set was not changed: {error:#}"
+                    );
+                }
+                Err(recovery_error) => {
+                    bail!(
+                        "installation recovery is required before these binaries can be used: {error:#}; automatic recovery failed: {recovery_error:#}"
+                    );
+                }
+            }
+        }
+    };
     Ok(installed)
+}
+
+async fn verify_artifacts(
+    request: &BuildRequest,
+    artifacts: &[InstallArtifact],
+    reporter: &Reporter,
+) -> Result<()> {
+    for required in match request.kind {
+        BinaryKind::BitcoinCore => &["bitcoind", "bitcoin-cli"][..],
+        BinaryKind::Electrs => &["electrs"][..],
+    } {
+        if !artifacts.iter().any(|artifact| artifact.name == *required) {
+            bail!("build produced no required {required} executable");
+        }
+    }
+
+    for artifact in artifacts {
+        let metadata = fs::symlink_metadata(&artifact.source)
+            .with_context(|| format!("inspect built artifact {}", artifact.source.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "built artifact is not a regular file: {}",
+                artifact.source.display()
+            );
+        }
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!(
+                "built artifact is not executable: {}",
+                artifact.source.display()
+            );
+        }
+        if artifact.source.file_name().and_then(|name| name.to_str()) != Some(&artifact.name) {
+            bail!("built artifact name does not match its source filename");
+        }
+        let reported_version = probe_binary_version(request.kind, &artifact.source)
+            .await?
+            .with_context(|| format!("{} did not report a version", artifact.name))?;
+        if reported_version != request.version {
+            bail!(
+                "{} reported version {}, expected {}",
+                artifact.name,
+                reported_version,
+                request.version
+            );
+        }
+        reporter
+            .log(format!(
+                "Verified {} reports version {}.\n",
+                artifact.name, reported_version
+            ))
+            .await;
+    }
+    Ok(())
 }
 
 async fn check_requirements(
@@ -442,7 +731,8 @@ async fn check_requirements(
 ) -> Result<BuildEnvironment> {
     ensure_supported_platform()?;
     let base_environment = environment::build_environment();
-    let dependency_report = dependencies::check(request.kind, &base_environment).await;
+    let dependency_report =
+        dependencies::check(request.kind, &request.version, &base_environment).await;
     for dependency in &dependency_report.found {
         reporter.log(format!("Found {dependency}\n")).await;
     }
@@ -455,75 +745,29 @@ async fn check_requirements(
     }
     ensure_not_cancelled(cancelled)?;
 
-    tokio::fs::create_dir_all(&request.workspace)
-        .await
-        .with_context(|| format!("create build workspace {}", request.workspace.display()))?;
-    let workspace_metadata = tokio::fs::symlink_metadata(&request.workspace)
-        .await
-        .with_context(|| format!("inspect build workspace {}", request.workspace.display()))?;
-    if workspace_metadata.file_type().is_symlink() || !workspace_metadata.is_dir() {
-        bail!(
-            "build workspace must be a regular directory, not a symbolic link: {}",
-            request.workspace.display()
-        );
-    }
     check_build_space(request.kind, &request.workspace)?;
     Ok(base_environment)
 }
 
 async fn prepare_source(
     request: &BuildRequest,
-    job_id: &str,
+    job_dir: &Path,
     environment: &BuildEnvironment,
     cancelled: &Arc<AtomicBool>,
     reporter: &Reporter,
 ) -> Result<PathBuf> {
-    let sources = request.workspace.join("sources");
-    tokio::fs::create_dir_all(&sources)
-        .await
-        .with_context(|| format!("create source cache {}", sources.display()))?;
-    cleanup_partial_sources(&sources, request.kind, &request.version).await?;
-    let source = sources.join(format!(
-        "{}-{}",
-        request.kind.slug(),
-        request.version.display()
-    ));
-
-    if let Ok(metadata) = tokio::fs::symlink_metadata(&source).await {
-        if metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && verify_source(request.kind, &request.version, &source, environment)
-                .await
-                .is_ok()
-        {
-            reporter
-                .log(format!(
-                    "Reusing verified source at {}.\n",
-                    source.display()
-                ))
-                .await;
-            return Ok(source);
-        }
-        reporter
-            .log("Cached source did not pass verification; downloading a clean copy.\n".to_owned())
-            .await;
-        remove_workspace_entry(&source).await?;
-    }
-
-    let partial = sources.join(format!(
-        ".{}-{}-{job_id}.partial",
-        request.kind.slug(),
-        request.version.display()
-    ));
-    if tokio::fs::symlink_metadata(&partial).await.is_ok() {
-        remove_workspace_entry(&partial).await?;
-    }
+    let source = job_dir.join("source");
+    let partial = job_dir.join("source.partial");
 
     let arguments = vec![
         "clone".to_owned(),
         "--progress".to_owned(),
         "--depth".to_owned(),
         "1".to_owned(),
+        "--config".to_owned(),
+        "core.hooksPath=/dev/null".to_owned(),
+        "--config".to_owned(),
+        "core.fsmonitor=false".to_owned(),
         "--branch".to_owned(),
         request.version.tag().to_owned(),
         "--".to_owned(),
@@ -531,9 +775,10 @@ async fn prepare_source(
         partial.display().to_string(),
     ];
     let result = process::run(
+        request.operation_id,
         "git",
         &arguments,
-        Some(&sources),
+        Some(job_dir),
         environment,
         &reporter.event_tx,
         &reporter.log_tx,
@@ -541,41 +786,16 @@ async fn prepare_source(
     )
     .await;
     if let Err(error) = result {
-        let _ = remove_workspace_entry(&partial).await;
+        let _ = remove_job_entry(job_dir, &partial).await;
         return Err(error.into());
     }
 
-    if let Err(error) = verify_source(request.kind, &request.version, &partial, environment).await {
-        let _ = remove_workspace_entry(&partial).await;
-        return Err(error);
-    }
     if let Err(error) = tokio::fs::rename(&partial, &source).await {
-        let _ = remove_workspace_entry(&partial).await;
+        let _ = remove_job_entry(job_dir, &partial).await;
         return Err(error)
-            .with_context(|| format!("activate verified source cache {}", source.display()));
+            .with_context(|| format!("activate verified source tree {}", source.display()));
     }
     Ok(source)
-}
-
-async fn cleanup_partial_sources(
-    sources: &Path,
-    kind: BinaryKind,
-    version: &ReleaseVersion,
-) -> Result<()> {
-    let prefix = format!(".{}-{}-", kind.slug(), version.display());
-    let mut entries = tokio::fs::read_dir(sources)
-        .await
-        .with_context(|| format!("inspect source cache {}", sources.display()))?;
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with(&prefix) && name.ends_with(".partial") {
-            remove_workspace_entry(&entry.path()).await?;
-        }
-    }
-    Ok(())
 }
 
 async fn verify_source(
@@ -583,59 +803,254 @@ async fn verify_source(
     version: &ReleaseVersion,
     source: &Path,
     environment: &BuildEnvironment,
-) -> Result<()> {
+) -> Result<String> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("inspect source tree {}", source.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "source tree is not a regular directory: {}",
+            source.display()
+        );
+    }
+
     let source_text = source.to_string_lossy();
-    let origin = process::probe(
-        "git",
-        &["-C", &source_text, "remote", "get-url", "origin"],
-        None,
-        environment,
-    )
-    .await
-    .context("source has no Git origin")?;
+    let origin = git_probe(&source_text, &["remote", "get-url", "origin"], environment)
+        .await
+        .context("source has no Git origin")?;
     if origin.trim_end_matches('/') != kind.repository().trim_end_matches('/') {
         bail!("source origin does not match the expected upstream repository");
     }
 
-    let head = process::probe(
-        "git",
-        &["-C", &source_text, "rev-parse", "HEAD"],
-        None,
+    let head = git_probe(
+        &source_text,
+        &["rev-parse", "--verify", "HEAD"],
         environment,
     )
     .await
     .context("source has no checked-out commit")?;
     let tag_ref = format!("refs/tags/{}", version.tag());
-    let tag_commit = process::probe(
-        "git",
-        &["-C", &source_text, "rev-list", "-n", "1", &tag_ref],
-        None,
+    let tag_type = git_probe(&source_text, &["cat-file", "-t", &tag_ref], environment)
+        .await
+        .context("selected release tag is absent from source")?;
+    if tag_type != "tag" {
+        bail!("selected release reference is not an annotated signed tag");
+    }
+    let peeled_tag = format!("{tag_ref}^{{commit}}");
+    let tag_commit = git_probe(
+        &source_text,
+        &["rev-parse", "--verify", &peeled_tag],
         environment,
     )
     .await
-    .context("selected release tag is absent from source")?;
+    .context("selected release tag does not identify a commit")?;
     if head != tag_commit {
         bail!("checked-out source does not match the selected release tag");
     }
 
-    let status = process::probe(
-        "git",
+    verify_release_tag(kind, version, source, environment).await?;
+    verify_pristine_source(&source_text, environment).await?;
+    Ok(head)
+}
+
+async fn verify_pristine_source(source: &str, environment: &BuildEnvironment) -> Result<()> {
+    let status = git_probe(
+        source,
         &[
-            "-C",
-            &source_text,
             "status",
-            "--porcelain",
-            "--untracked-files=no",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
         ],
-        None,
         environment,
     )
     .await
     .context("could not inspect source working tree")?;
     if !status.is_empty() {
-        bail!("source working tree contains uncommitted changes");
+        bail!("source working tree contains modified, ignored, or untracked build inputs");
     }
     Ok(())
+}
+
+async fn git_probe(
+    source: &str,
+    arguments: &[&str],
+    environment: &BuildEnvironment,
+) -> Option<String> {
+    let mut command = vec![
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-C",
+        source,
+    ];
+    command.extend_from_slice(arguments);
+    process::probe("git", &command, None, environment).await
+}
+
+async fn verify_release_tag(
+    kind: BinaryKind,
+    version: &ReleaseVersion,
+    source: &Path,
+    environment: &BuildEnvironment,
+) -> Result<()> {
+    let source_text = source.to_string_lossy();
+    let tag = version.tag();
+    let git = environment::find_in_path("git", environment).context("Git is unavailable")?;
+    let git_text = git.to_string_lossy();
+
+    if kind == BinaryKind::Electrs && version.is_at_least([0, 11, 1]) {
+        if !version.is_exactly([0, 11, 1]) {
+            bail!("electrs tag {tag} has no reviewed signer policy in this BitEngine release");
+        }
+        let verifier = environment::find_in_path("ssh-keygen", environment)
+            .context("ssh-keygen is unavailable for electrs tag verification")?;
+        let verifier_config = format!("gpg.ssh.program={}", verifier.display());
+        let allowed_signers = write_electrs_allowed_signers(
+            source
+                .parent()
+                .context("electrs source has no private job directory")?,
+        )?;
+        let allowed_config = format!("gpg.ssh.allowedSignersFile={}", allowed_signers.display());
+        process::probe(
+            &git_text,
+            &[
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                "gpg.minTrustLevel=fully",
+                "-c",
+                &verifier_config,
+                "-c",
+                &allowed_config,
+                "-C",
+                &source_text,
+                "verify-tag",
+                "--",
+                tag,
+            ],
+            None,
+            environment,
+        )
+        .await
+        .with_context(|| {
+            format!("electrs tag {tag} was not signed by the pinned upstream SSH key")
+        })?;
+        return Ok(());
+    }
+
+    let verifier = ["gpg", "gpg2"]
+        .into_iter()
+        .find_map(|name| environment::find_in_path(name, environment))
+        .with_context(|| format!("GnuPG is unavailable for {} tag verification", kind.label()))?;
+    let verifier_config = format!("gpg.openpgp.program={}", verifier.display());
+    let verification = process::probe_stderr(
+        &git_text,
+        &[
+            "-c",
+            "gpg.format=openpgp",
+            "-c",
+            "gpg.minTrustLevel=undefined",
+            "-c",
+            &verifier_config,
+            "-C",
+            &source_text,
+            "verify-tag",
+            "--raw",
+            "--",
+            tag,
+        ],
+        None,
+        environment,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "{} tag {tag} does not have a valid OpenPGP signature from an imported key",
+            kind.label()
+        )
+    })?;
+    let signature = parse_openpgp_signature(&verification).with_context(|| {
+        format!(
+            "{} tag {tag} verification did not report exactly one OpenPGP signer",
+            kind.label()
+        )
+    })?;
+    let authorized = match kind {
+        BinaryKind::BitcoinCore => BITCOIN_OPENPGP_SIGNERS,
+        BinaryKind::Electrs => ELECTRS_LEGACY_OPENPGP_SIGNERS,
+    };
+    if !authorized.contains(&signature.primary) {
+        bail!(
+            "{} tag {tag} was signed by an unapproved OpenPGP key ({})",
+            kind.label(),
+            signature.primary
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenPgpSignature<'a> {
+    signing: &'a str,
+    primary: &'a str,
+}
+
+fn parse_openpgp_signature(output: &str) -> Option<OpenPgpSignature<'_>> {
+    const FAILURE_RECORDS: &[&str] = &[
+        "BADSIG",
+        "ERRSIG",
+        "EXPKEYSIG",
+        "EXPSIG",
+        "NO_PUBKEY",
+        "REVKEYSIG",
+    ];
+    if output.lines().any(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        fields.next() == Some("[GNUPG:]")
+            && fields
+                .next()
+                .is_some_and(|record| FAILURE_RECORDS.contains(&record))
+    }) {
+        return None;
+    }
+
+    let mut signatures = output.lines().filter_map(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        if fields.next() != Some("[GNUPG:]") || fields.next() != Some("VALIDSIG") {
+            return None;
+        }
+        let signing = fields.next()?;
+        let primary = fields.last()?;
+        (valid_openpgp_fingerprint(signing) && valid_openpgp_fingerprint(primary))
+            .then_some(OpenPgpSignature { signing, primary })
+    });
+    let signature = signatures.next()?;
+    signatures.next().is_none().then_some(signature)
+}
+
+fn valid_openpgp_fingerprint(fingerprint: &str) -> bool {
+    fingerprint.len() == 40
+        && fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+}
+
+fn write_electrs_allowed_signers(job_dir: &Path) -> Result<PathBuf> {
+    let path = job_dir.join("electrs-allowed-signers");
+    let contents = format!("{ELECTRS_SSH_SIGNER_PRINCIPAL} {ELECTRS_SSH_SIGNER_KEY}\n");
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("create pinned electrs signer file {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("write pinned electrs signer file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync pinned electrs signer file {}", path.display()))?;
+    Ok(path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -650,7 +1065,7 @@ async fn build_bitcoin(
 ) -> Result<Vec<InstallArtifact>> {
     let build_dir = job_dir.join("bitcoin");
     let environment = environment::bitcoin_environment(base_environment);
-    let configure = vec![
+    let mut configure = vec![
         "-S".to_owned(),
         source.display().to_string(),
         "-B".to_owned(),
@@ -660,11 +1075,22 @@ async fn build_bitcoin(
         "-DBUILD_TESTS=OFF".to_owned(),
         "-DBUILD_BENCH=OFF".to_owned(),
         "-DBUILD_GUI=OFF".to_owned(),
-        "-DWITH_MINIUPNPC=OFF".to_owned(),
-        "-DWITH_NATPMP=OFF".to_owned(),
         "-DWITH_ZMQ=OFF".to_owned(),
+        "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=FALSE".to_owned(),
+        "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=FALSE".to_owned(),
+        "-DCMAKE_EXPORT_NO_PACKAGE_REGISTRY=TRUE".to_owned(),
     ];
+    // These optional-network-library switches existed through the v29/v30
+    // CMake interface and were removed in v31. Keep old releases node-only
+    // without feeding unknown cache entries to newer CMake versions.
+    if !request.version.is_at_least([31, 0, 0]) {
+        configure.extend([
+            "-DWITH_MINIUPNPC=OFF".to_owned(),
+            "-DWITH_NATPMP=OFF".to_owned(),
+        ]);
+    }
     process::run(
+        request.operation_id,
         "cmake",
         &configure,
         None,
@@ -685,6 +1111,7 @@ async fn build_bitcoin(
         request.cores.clamp(1, 64).to_string(),
     ];
     process::run(
+        request.operation_id,
         "cmake",
         &build,
         None,
@@ -699,17 +1126,14 @@ async fn build_bitcoin(
 
     let binary_dir = build_dir.join("bin");
     let mut artifacts = Vec::new();
-    for name in ["bitcoind", "bitcoin-cli", "bitcoin-tx", "bitcoin-util"] {
+    for name in BITCOIN_MANAGED_BINARIES {
         let path = binary_dir.join(name);
         if path.is_file() {
             artifacts.push(InstallArtifact {
                 source: path,
-                name: name.to_owned(),
+                name: (*name).to_owned(),
             });
         }
-    }
-    if !artifacts.iter().any(|artifact| artifact.name == "bitcoind") {
-        bail!("Bitcoin Core compilation finished without producing bitcoind");
     }
     Ok(artifacts)
 }
@@ -735,6 +1159,7 @@ async fn build_electrs(
         "--locked".to_owned(),
     ];
     process::run(
+        request.operation_id,
         "cargo",
         &arguments,
         Some(source),
@@ -794,36 +1219,300 @@ fn ensure_not_cancelled(cancelled: &Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
-async fn remove_workspace_entry(path: &Path) -> Result<()> {
-    let metadata = tokio::fs::symlink_metadata(path)
-        .await
-        .with_context(|| format!("inspect workspace entry {}", path.display()))?;
-    if metadata.file_type().is_symlink() || metadata.is_file() {
-        tokio::fs::remove_file(path)
-            .await
-            .with_context(|| format!("remove workspace file {}", path.display()))
-    } else if metadata.is_dir() {
-        tokio::fs::remove_dir_all(path)
-            .await
-            .with_context(|| format!("remove workspace directory {}", path.display()))
-    } else {
-        bail!("unsupported workspace entry at {}", path.display())
+fn validate_request_paths(request: &BuildRequest) -> Result<()> {
+    validate_absolute_path("binary destination", &request.binaries_dir)?;
+    validate_absolute_path("build workspace", &request.workspace)?;
+    if request.workspace.starts_with(&request.binaries_dir)
+        || request.binaries_dir.starts_with(&request.workspace)
+    {
+        bail!(
+            "binary destination and build workspace must not overlap ({} and {})",
+            request.binaries_dir.display(),
+            request.workspace.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_absolute_path(label: &str, path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("{label} must be absolute: {}", path.display());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        bail!("{label} must not contain . or ..: {}", path.display());
+    }
+    if path.parent().is_none() {
+        bail!("{label} must not be a filesystem root");
+    }
+    Ok(())
+}
+
+fn prepare_workspace(path: &Path) -> Result<PathBuf> {
+    validate_absolute_path("build workspace", path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "build workspace must be a regular directory, not a symbolic link: {}",
+                path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .with_context(|| format!("create build workspace {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect build workspace {}", path.display()));
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reinspect build workspace {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "build workspace changed during validation: {}",
+            path.display()
+        );
+    }
+    fs::canonicalize(path)
+        .with_context(|| format!("canonicalize build workspace {}", path.display()))
+}
+
+fn prepare_managed_directory(workspace: &Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        bail!("invalid managed workspace directory name");
+    }
+    let path = workspace.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "managed workspace entry is not a regular directory: {}",
+                path.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            create_private_directory(&path)?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspect managed workspace directory {}", path.display())
+            });
+        }
+    }
+    let canonical = fs::canonicalize(&path).with_context(|| {
+        format!(
+            "canonicalize managed workspace directory {}",
+            path.display()
+        )
+    })?;
+    if canonical.parent() != Some(workspace) {
+        bail!(
+            "managed workspace directory escaped its root: {}",
+            path.display()
+        );
+    }
+    Ok(canonical)
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir(path).with_context(|| format!("create private directory {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure private directory {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .with_context(|| format!("open parent directory {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("sync parent directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn recover_destination_installation(destination: &Path) -> Result<install::InstallRecovery> {
+    validate_absolute_path("binary destination", destination)?;
+    install::recover_pending_install(destination)
+}
+
+fn prune_job_directories(jobs_dir: &Path) -> Result<()> {
+    let mut jobs = Vec::new();
+    for entry in fs::read_dir(jobs_dir)
+        .with_context(|| format!("inspect build jobs {}", jobs_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_managed_job_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect old build job {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "old build job is not a regular directory: {}",
+                path.display()
+            );
+        }
+        for child in [
+            "work",
+            "source",
+            "source.partial",
+            "electrs-allowed-signers",
+        ] {
+            remove_confined_entry_if_present(&path, &path.join(child))?;
+        }
+        jobs.push((metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH), path));
+    }
+    jobs.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, path) in jobs.into_iter().skip(RETAINED_JOB_LOGS.saturating_sub(1)) {
+        remove_confined_entry(jobs_dir, &path)?;
+    }
+    Ok(())
+}
+
+fn cleanup_legacy_sources(workspace: &Path) -> Result<()> {
+    let sources = workspace.join("sources");
+    match fs::symlink_metadata(&sources) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => bail!(
+            "legacy source cache is not a regular directory: {}",
+            sources.display()
+        ),
+        Ok(_) => remove_confined_entry(workspace, &sources),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect legacy source cache {}", sources.display()))
+        }
     }
 }
 
-async fn write_build_log(path: PathBuf, mut receiver: mpsc::Receiver<String>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+fn is_managed_job_name(name: &str) -> bool {
+    let Some((timestamp, kind)) = name.split_once('-') else {
+        return false;
+    };
+    !timestamp.is_empty()
+        && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(kind, "bitcoin" | "electrs")
+}
+
+async fn cleanup_current_job(job_dir: &Path, reporter: &Reporter) {
+    for child in [
+        "work",
+        "source",
+        "source.partial",
+        "electrs-allowed-signers",
+    ] {
+        let root = job_dir.to_path_buf();
+        let path = root.join(child);
+        let result =
+            tokio::task::spawn_blocking(move || remove_confined_entry_if_present(&root, &path))
+                .await;
+        let error = match result {
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => format!("{error:#}"),
+            Err(error) => error.to_string(),
+        };
+        reporter
+            .log(format!(
+                "Warning: could not clean {child} from this build job: {error}\n"
+            ))
+            .await;
     }
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&path)
+}
+
+async fn remove_job_entry(job_dir: &Path, path: &Path) -> Result<()> {
+    let root = job_dir.to_path_buf();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || remove_confined_entry_if_present(&root, &path))
         .await
-        .with_context(|| format!("open build log {}", path.display()))?;
+        .context("workspace cleanup task stopped unexpectedly")?
+}
+
+fn remove_confined_entry_if_present(root: &Path, path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => remove_confined_entry(root, path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect workspace entry {}", path.display()))
+        }
+    }
+}
+
+fn remove_confined_entry(root: &Path, path: &Path) -> Result<()> {
+    if path.parent() != Some(root) {
+        bail!("refusing to remove a workspace entry outside its direct parent");
+    }
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("canonicalize cleanup root {}", root.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect workspace entry {}", path.display()))?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return fs::remove_file(path)
+            .with_context(|| format!("remove workspace file {}", path.display()));
+    }
+    if !metadata.is_dir() {
+        bail!("unsupported workspace entry at {}", path.display());
+    }
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("canonicalize workspace entry {}", path.display()))?;
+    if canonical.parent() != Some(root.as_path()) {
+        bail!(
+            "workspace directory escaped its cleanup root: {}",
+            path.display()
+        );
+    }
+    fs::remove_dir_all(&canonical)
+        .with_context(|| format!("remove workspace directory {}", canonical.display()))
+}
+
+fn open_build_log(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("create build log {}", path.display()))
+}
+
+async fn write_build_log(file: tokio::fs::File, receiver: mpsc::Receiver<String>) -> Result<()> {
+    write_build_log_with_limit(file, receiver, MAX_BUILD_LOG_BYTES).await
+}
+
+async fn write_build_log_with_limit(
+    mut file: tokio::fs::File,
+    mut receiver: mpsc::Receiver<String>,
+    limit: u64,
+) -> Result<()> {
+    const MARKER: &[u8] =
+        b"\n[BitEngine build log reached its 64 MiB limit; further output was discarded.]\n";
+    let marker_length = u64::try_from(MARKER.len()).context("build log marker is too large")?;
+    let data_limit = limit
+        .checked_sub(marker_length)
+        .context("build log limit is smaller than its truncation marker")?;
+    let mut written = 0_u64;
+    let mut capped = false;
     while let Some(message) = receiver.recv().await {
-        file.write_all(message.as_bytes()).await?;
+        if capped {
+            continue;
+        }
+        let bytes = message.as_bytes();
+        let remaining = data_limit.saturating_sub(written);
+        let accepted = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        if accepted > 0 {
+            file.write_all(&bytes[..accepted]).await?;
+            written = written.saturating_add(accepted as u64);
+        }
+        if accepted < bytes.len() || written == data_limit {
+            file.write_all(MARKER).await?;
+            capped = true;
+        }
     }
     file.flush().await?;
     file.sync_all().await?;
@@ -831,40 +1520,116 @@ async fn write_build_log(path: PathBuf, mut receiver: mpsc::Receiver<String>) ->
 }
 
 async fn persist_state_async(path: &Path, state: &PersistedBuild) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("create build state directory {}", parent.display()))?;
+    let path = path.to_path_buf();
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || persist_state(&path, &state))
+        .await
+        .context("build state persistence task stopped unexpectedly")?
+}
+
+fn persist_state(path: &Path, state: &PersistedBuild) -> Result<()> {
+    validate_state_id(&state.id)?;
+    let parent = path
+        .parent()
+        .context("build state path has no parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create build state directory {}", parent.display()))?;
+    let metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("inspect build state directory {}", parent.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("build state directory is not a regular directory");
     }
     let json = serde_json::to_vec_pretty(state).context("serialize build state")?;
-    let temporary = path.with_extension("json.tmp");
-    tokio::fs::write(&temporary, json)
-        .await
+    let temporary = parent.join(format!(".build-job-{}.tmp", state.id));
+    remove_safe_stale_file(&temporary)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&temporary)
+        .with_context(|| format!("create temporary build state {}", temporary.display()))?;
+    file.write_all(&json)
         .with_context(|| format!("write temporary build state {}", temporary.display()))?;
-    tokio::fs::rename(&temporary, path)
-        .await
+    file.sync_all()
+        .with_context(|| format!("sync temporary build state {}", temporary.display()))?;
+    drop(file);
+    fs::rename(&temporary, path)
         .with_context(|| format!("activate build state {}", path.display()))?;
+    File::open(parent)
+        .with_context(|| format!("open build state directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync build state directory {}", parent.display()))?;
     Ok(())
 }
 
+fn validate_state_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("invalid build state identifier");
+    }
+    Ok(())
+}
+
+fn remove_safe_stale_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(path)
+                .with_context(|| format!("remove stale build state {}", path.display()))
+        }
+        Ok(_) => bail!("unsafe stale build state entry: {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect stale build state {}", path.display()))
+        }
+    }
+}
+
 fn recover_interrupted_job(path: &Path) -> Option<PersistedBuild> {
-    let bytes = fs::read(path).ok()?;
+    let bytes = read_bounded_state(path)?;
     let mut state = serde_json::from_slice::<PersistedBuild>(&bytes).ok()?;
+    validate_state_id(&state.id).ok()?;
     if state.status == PersistedBuildStatus::Running {
         state.status = PersistedBuildStatus::Interrupted;
         state.updated_at = unix_timestamp();
-        state.error = Some(
-            "BitEngine closed before the build finished. Existing binaries were left unchanged."
-                .to_owned(),
-        );
-        if let Ok(json) = serde_json::to_vec_pretty(&state) {
-            let temporary = path.with_extension("json.tmp");
-            if fs::write(&temporary, json).is_ok() {
-                let _ = fs::rename(temporary, path);
-            }
-        }
+        state.error = Some(if state.stage == BuildStage::Installing {
+            "BitEngine closed during installation. Its durable transaction must be recovered before the binaries are inspected, launched, or replaced."
+                .to_owned()
+        } else {
+            "BitEngine closed before installation began. The existing binaries were left unchanged."
+                .to_owned()
+        });
+        let _ = persist_state(path, &state);
     }
     Some(state)
+}
+
+fn read_bounded_state(path: &Path) -> Option<Vec<u8>> {
+    let initial = fs::symlink_metadata(path).ok()?;
+    if initial.file_type().is_symlink()
+        || !initial.is_file()
+        || initial.len() > MAX_BUILD_STATE_BYTES
+    {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_BUILD_STATE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+    file.take(MAX_BUILD_STATE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (u64::try_from(bytes.len()).ok()? <= MAX_BUILD_STATE_BYTES).then_some(bytes)
 }
 
 fn unix_timestamp() -> u64 {
@@ -927,20 +1692,248 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn stale_partial_downloads_are_removed_before_a_retry() -> Result<()> {
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_jobs_directory_is_rejected_without_touching_target() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
         let temporary = tempfile::tempdir()?;
-        let sources = temporary.path().join("sources");
-        tokio::fs::create_dir_all(sources.join(".bitcoin-30.0-old.partial")).await?;
-        tokio::fs::create_dir_all(sources.join("bitcoin-29.0")).await?;
-        let version = "v30.0"
-            .parse::<ReleaseVersion>()
-            .map_err(anyhow::Error::msg)?;
+        let workspace = temporary.path().join("workspace");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(&workspace)?;
+        fs::create_dir_all(&outside)?;
+        fs::write(outside.join("victim"), b"preserve")?;
+        symlink(&outside, workspace.join("jobs"))?;
+        symlink(&outside, workspace.join("sources"))?;
 
-        cleanup_partial_sources(&sources, BinaryKind::BitcoinCore, &version).await?;
+        let workspace = prepare_workspace(&workspace)?;
+        assert!(prepare_managed_directory(&workspace, "jobs").is_err());
+        assert!(cleanup_legacy_sources(&workspace).is_err());
+        assert_eq!(fs::read(outside.join("victim"))?, b"preserve");
+        Ok(())
+    }
 
-        assert!(!sources.join(".bitcoin-30.0-old.partial").exists());
-        assert!(sources.join("bitcoin-29.0").exists());
+    #[tokio::test]
+    async fn durable_build_log_is_bounded() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("build.log");
+        let file = tokio::fs::File::from_std(open_build_log(&path)?);
+        let (sender, receiver) = mpsc::channel(4);
+        let writer = tokio::spawn(write_build_log_with_limit(file, receiver, 256));
+        sender.send("x".repeat(1024)).await?;
+        sender.send("ignored".repeat(100)).await?;
+        drop(sender);
+        writer.await??;
+
+        let bytes = fs::read(&path)?;
+        assert!(bytes.len() <= 256);
+        assert!(String::from_utf8_lossy(&bytes).contains("further output was discarded"));
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ignored_source_inputs_are_not_treated_as_clean() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let source = temporary.path().join("source");
+        fs::create_dir(&source)?;
+        let environment = environment::build_environment();
+        let git = environment::find_in_path("git", &environment).context("test Git")?;
+        let run_git = |arguments: &[&str]| -> Result<()> {
+            let status = std::process::Command::new(&git)
+                .args(arguments)
+                .current_dir(&source)
+                .env_clear()
+                .envs(&environment)
+                .status()?;
+            if !status.success() {
+                bail!("test Git command failed");
+            }
+            Ok(())
+        };
+        run_git(&["init", "--quiet"])?;
+        run_git(&["config", "user.email", "fixture@example.invalid"])?;
+        run_git(&["config", "user.name", "BitEngine fixture"])?;
+        fs::write(source.join(".gitignore"), "*.poison\n")?;
+        run_git(&["add", ".gitignore"])?;
+        run_git(&[
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ])?;
+        fs::write(source.join("compiler.poison"), "unexpected build input")?;
+
+        assert!(
+            verify_pristine_source(&source.to_string_lossy(), &environment)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openpgp_tag_signer_is_explicitly_authorized() {
+        let approved = "[GNUPG:] NEWSIG\n[GNUPG:] VALIDSIG CFB16E21C950F67FA95E558F2EEB9F5CC09526C1 2026-01-01 0 4 0 1 10 00 E777299FC265DD04793070EB944D35F9AC3DB76A\n";
+        let signature = parse_openpgp_signature(approved)
+            .expect("one valid primary fingerprint should be reported");
+        assert_eq!(
+            signature.signing,
+            "CFB16E21C950F67FA95E558F2EEB9F5CC09526C1"
+        );
+        assert!(BITCOIN_OPENPGP_SIGNERS.contains(&signature.primary));
+
+        let unrelated = "[GNUPG:] VALIDSIG 0000000000000000000000000000000000000000 2026-01-01 0 4 0 1 10 00 1111111111111111111111111111111111111111";
+        let signature = parse_openpgp_signature(unrelated)
+            .expect("the unrelated fingerprint is syntactically valid");
+        assert!(!BITCOIN_OPENPGP_SIGNERS.contains(&signature.primary));
+        assert!(parse_openpgp_signature(&format!("{approved}{unrelated}\n")).is_none());
+        assert!(
+            parse_openpgp_signature(&format!("[GNUPG:] EXPKEYSIG deadbeef\n{approved}")).is_none()
+        );
+    }
+
+    #[test]
+    fn installing_job_recovery_does_not_claim_binaries_were_unchanged() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("state.json");
+        let state = PersistedBuild {
+            id: "123-bitcoin".to_owned(),
+            kind: BinaryKind::BitcoinCore,
+            version: "v31.1".parse().map_err(anyhow::Error::msg)?,
+            stage: BuildStage::Installing,
+            status: PersistedBuildStatus::Running,
+            started_at: 1,
+            updated_at: 1,
+            log_path: temporary.path().join("build.log"),
+            error: None,
+            installed: Vec::new(),
+        };
+        fs::write(&path, serde_json::to_vec(&state)?)?;
+
+        let recovered = recover_interrupted_job(&path).context("recovered state")?;
+        let message = recovered.error.context("recovery message")?;
+        assert!(message.contains("transaction must be recovered"));
+        assert!(!message.contains("left unchanged"));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_state_identifier_cannot_escape_state_directory() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let state = PersistedBuild {
+            id: "../escape".to_owned(),
+            kind: BinaryKind::Electrs,
+            version: "v0.11.1".parse().map_err(anyhow::Error::msg)?,
+            stage: BuildStage::Compiling,
+            status: PersistedBuildStatus::Running,
+            started_at: 1,
+            updated_at: 1,
+            log_path: PathBuf::from("build.log"),
+            error: None,
+            installed: Vec::new(),
+        };
+        let state_path = temporary.path().join("state.json");
+        assert!(persist_state(&state_path, &state).is_err());
+        assert!(!state_path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_state_reader_is_bounded_and_does_not_follow_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let target = temporary.path().join("target.json");
+        let alias = temporary.path().join("build-job.json");
+        fs::write(&target, b"{}")?;
+        symlink(&target, &alias)?;
+        assert!(recover_interrupted_job(&alias).is_none());
+        assert_eq!(fs::read(&target)?, b"{}");
+
+        let oversized = temporary.path().join("oversized.json");
+        fs::write(
+            &oversized,
+            vec![b' '; usize::try_from(MAX_BUILD_STATE_BYTES)? + 1],
+        )?;
+        assert!(recover_interrupted_job(&oversized).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_bitcoin_authenticator_fails_before_touching_existing_binaries() -> Result<()> {
+        let environment = environment::build_environment();
+        if ["gpg", "gpg2"]
+            .into_iter()
+            .any(|name| environment::find_in_path(name, &environment).is_some())
+        {
+            return Ok(());
+        }
+
+        let temporary = tempfile::tempdir()?;
+        let destination = temporary.path().join("binaries");
+        fs::create_dir(&destination)?;
+        fs::write(destination.join("bitcoind"), b"working daemon")?;
+        fs::write(destination.join("bitcoin-cli"), b"working client")?;
+        let service = BuildService::new(temporary.path().join("state.json"));
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let event_drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let request = BuildRequest {
+            operation_id: BuildOperationId(91),
+            kind: BinaryKind::BitcoinCore,
+            version: "v31.1".parse().map_err(anyhow::Error::msg)?,
+            binaries_dir: destination.clone(),
+            workspace: temporary.path().join("workspace"),
+            cores: 1,
+        };
+
+        let failure = service
+            .run(request, event_tx)
+            .await
+            .expect_err("Bitcoin authentication must fail closed without GnuPG");
+        event_drain.await?;
+        assert!(failure.message.contains("GnuPG"));
+        assert_eq!(fs::read(destination.join("bitcoind"))?, b"working daemon");
+        assert_eq!(
+            fs::read(destination.join("bitcoin-cli"))?,
+            b"working client"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads, authenticates, and compiles the official electrs release"]
+    async fn real_electrs_release_builds_and_installs_transactionally() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let destination = temporary.path().join("binaries");
+        let workspace = temporary.path().join("workspace");
+        let service = BuildService::new(temporary.path().join("state.json"));
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let event_drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let request = BuildRequest {
+            operation_id: BuildOperationId(1),
+            kind: BinaryKind::Electrs,
+            version: "v0.11.1".parse().map_err(anyhow::Error::msg)?,
+            binaries_dir: destination.clone(),
+            workspace,
+            cores: 8,
+        };
+
+        let summary = service
+            .run(request, event_tx)
+            .await
+            .map_err(|failure| anyhow::anyhow!(failure.message))?;
+        event_drain.await?;
+
+        assert_eq!(summary.installed, vec!["electrs"]);
+        let version = probe_binary_version(BinaryKind::Electrs, &destination.join("electrs"))
+            .await?
+            .context("installed electrs version")?;
+        assert_eq!(version.display(), "0.11.1");
+        assert!(summary.log_path.metadata()?.len() <= MAX_BUILD_LOG_BYTES);
         Ok(())
     }
 }
