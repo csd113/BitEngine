@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 1.0.0 - 2026-08-09
+
+- Bumped the crate and release version to `1.0.0`
 - Integrated Bitcoin Core and electrs source builds as a native BitEngine binaries page
 - Added installed/latest version detection, stable release selection, staged progress, cancellation, and expandable build logs
 - Added dependency and native disk-space checks, fresh private source trees, authorized-signer-pinned tag authentication, and all-artifact version validation

@@ -8,7 +8,7 @@
 
 Built with Rust · Iced · Native desktop rendering
 
-Current release: `0.1.2`
+Current release: `1.0.0`
 
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
@@ -32,10 +32,10 @@ BitEngine is a desktop application that lets you launch, monitor, and shut down 
 - Fully configurable data paths, persisted across sessions
 - Single-binary distribution — no runtime, no WebView, no Electron
 
-Recent release work in `0.1.2`:
-- Renamed the app, config namespace, and built binary to `BitEngine`
-- Bumped the crate and release version to `0.1.2`
-- Added first-class release artifacts for macOS Apple Silicon, Linux x86_64, and Linux ARM64
+Recent release work in `1.0.0`:
+- Integrated native Bitcoin Core and electrs source builds with authenticated release selection
+- Added transactional binary installation, rollback, and recovery
+- Added protocol-level Bitcoin/Electrs readiness and managed endpoint validation
 
 ---
 

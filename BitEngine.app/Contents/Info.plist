@@ -12,10 +12,10 @@
     <string>com.yourname.bitengine</string>
 
     <key>CFBundleVersion</key>
-    <string>0.1.2</string>
+    <string>1.0.0</string>
 
     <key>CFBundleShortVersionString</key>
-    <string>0.1.2</string>
+    <string>1.0.0</string>
 
     <key>CFBundleExecutable</key>
     <string>BitEngine</string>

@@ -1,6 +1,6 @@
 [package]
 name = "bitengine"
-version = "0.1.2"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.88"
 description = "BitEngine GUI for Bitcoin Core and Electrs"
