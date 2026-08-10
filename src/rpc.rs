@@ -8,7 +8,7 @@ use std::{
     io::{Read as _, Write as _},
     net::SocketAddr,
     os::unix::fs::OpenOptionsExt as _,
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -16,8 +16,10 @@ use anyhow::{bail, Context as _, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 
 const MAX_COOKIE_BYTES: u64 = 4096;
+const RPC_IN_WARMUP: i64 = -28;
 
 /// Lazily-built HTTP client (one per poll cycle is fine; keep it cheap).
 fn http_client() -> Result<Client> {
@@ -40,7 +42,61 @@ struct RpcRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
     result: Option<Value>,
-    error: Option<Value>,
+    error: Option<RpcResponseError>,
+}
+
+#[derive(Debug, Deserialize, Error)]
+#[error("RPC error {code}: {message}")]
+struct RpcResponseError {
+    code: i64,
+    message: String,
+}
+
+#[derive(Debug, Error)]
+enum ManagedCookieError {
+    #[error("managed Bitcoin RPC cookie is not available at {}", path.display())]
+    Unavailable { path: PathBuf },
+    #[error("managed Bitcoin RPC cookie is not a safe regular file at {}", path.display())]
+    UnsafeFile { path: PathBuf },
+    #[error("could not read managed Bitcoin RPC cookie at {}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("managed Bitcoin RPC cookie is malformed")]
+    Malformed,
+}
+
+#[derive(Debug, Error)]
+#[error("RPC HTTP request: {source}")]
+struct RpcTransportError {
+    #[source]
+    source: reqwest::Error,
+}
+
+#[derive(Debug, Error)]
+#[error("RPC authentication failed (401). Check bitcoin.conf credentials or .cookie file.")]
+struct RpcAuthenticationError;
+
+/// Return Bitcoin Core's startup status when an RPC call failed with
+/// `RPC_IN_WARMUP` (`-28`).
+pub fn rpc_warmup_message(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<RpcResponseError>()
+        .filter(|response| response.code == RPC_IN_WARMUP)
+        .map(|response| response.message.as_str())
+}
+
+/// Return whether an RPC failure is expected while the managed service and its
+/// cookie are first becoming reachable. Protocol, authentication, and response
+/// validation errors are deliberately excluded.
+pub fn is_transient_startup_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RpcTransportError>().is_some()
+        || matches!(
+            error.downcast_ref::<ManagedCookieError>(),
+            Some(ManagedCookieError::Unavailable { .. })
+        )
 }
 
 /// Parsed result of `getblockchaininfo`.
@@ -73,18 +129,13 @@ pub struct RpcAuth {
 impl RpcAuth {
     /// Load the exact cookie and socket owned by the current managed launch.
     pub fn from_managed_cookie(cookie_file: &Path, endpoint: SocketAddr) -> Result<Self> {
-        let contents = read_bounded_regular(cookie_file, MAX_COOKIE_BYTES).with_context(|| {
-            format!(
-                "managed Bitcoin RPC cookie is not available at {}",
-                cookie_file.display()
-            )
-        })?;
+        let contents = read_bounded_regular(cookie_file, MAX_COOKIE_BYTES)?;
         let (user, password) = contents
             .trim()
             .split_once(':')
-            .context("managed Bitcoin RPC cookie is malformed")?;
+            .ok_or(ManagedCookieError::Malformed)?;
         if user.is_empty() || password.is_empty() {
-            bail!("managed Bitcoin RPC cookie is malformed");
+            return Err(ManagedCookieError::Malformed.into());
         }
         Ok(Self {
             user: user.to_owned(),
@@ -94,28 +145,53 @@ impl RpcAuth {
     }
 }
 
-fn read_bounded_regular(path: &Path, limit: u64) -> Option<String> {
-    let initial = std::fs::symlink_metadata(path).ok()?;
+fn read_bounded_regular(
+    path: &Path,
+    limit: u64,
+) -> std::result::Result<String, ManagedCookieError> {
+    let unavailable = || ManagedCookieError::Unavailable {
+        path: path.to_path_buf(),
+    };
+    let unsafe_file = || ManagedCookieError::UnsafeFile {
+        path: path.to_path_buf(),
+    };
+    let read_error = |source| ManagedCookieError::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+
+    let initial = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(unavailable()),
+        Err(error) => return Err(read_error(error)),
+    };
     if initial.file_type().is_symlink() || !initial.is_file() || initial.len() > limit {
-        return None;
+        return Err(unsafe_file());
     }
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .ok()?;
-    let metadata = file.metadata().ok()?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                unavailable()
+            } else {
+                read_error(error)
+            }
+        })?;
+    let metadata = file.metadata().map_err(read_error)?;
     if !metadata.is_file() || metadata.len() > limit {
-        return None;
+        return Err(unsafe_file());
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).ok()?);
+    let capacity = usize::try_from(metadata.len()).map_err(|_| unsafe_file())?;
+    let mut bytes = Vec::with_capacity(capacity);
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
-        .ok()?;
-    if u64::try_from(bytes.len()).ok()? > limit {
-        return None;
+        .map_err(read_error)?;
+    if u64::try_from(bytes.len()).map_or(true, |length| length > limit) {
+        return Err(unsafe_file());
     }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(bytes).map_err(|_| ManagedCookieError::Malformed)
 }
 
 // ── RPC call ─────────────────────────────────────────────────────────────────
@@ -138,17 +214,17 @@ pub async fn call(auth: &RpcAuth, method: &str, params: Value) -> Result<Value> 
         .json(&req)
         .send()
         .await
-        .context("RPC HTTP request")?;
+        .map_err(|source| RpcTransportError { source })?;
 
     let status = resp.status();
     if status == 401 {
-        bail!("RPC authentication failed (401). Check bitcoin.conf credentials or .cookie file.");
+        return Err(RpcAuthenticationError.into());
     }
 
     let rpc_resp: RpcResponse = resp.json().await.context("parse RPC response")?;
 
     if let Some(err) = rpc_resp.error {
-        bail!("RPC error: {err}");
+        return Err(err.into());
     }
 
     rpc_resp.result.context("RPC result was null")
@@ -312,6 +388,11 @@ mod tests {
         std::fs::write(&stale_cookie, b"stale-user:stale-password\n")?;
         let endpoint: SocketAddr = "[::1]:18443".parse()?;
 
+        let missing_error =
+            RpcAuth::from_managed_cookie(&temporary.path().join("not-created.cookie"), endpoint)
+                .unwrap_err();
+        assert!(is_transient_startup_error(&missing_error));
+
         let auth = RpcAuth::from_managed_cookie(&managed_cookie, endpoint)?;
 
         assert_eq!(auth.user, "managed-user");
@@ -322,14 +403,20 @@ mod tests {
         let alias = temporary.path().join("alias-cookie");
         std::fs::write(&target, b"outside:secret\n")?;
         symlink(&target, &alias)?;
-        assert!(RpcAuth::from_managed_cookie(&alias, endpoint).is_err());
+        let symlink_error = RpcAuth::from_managed_cookie(&alias, endpoint).unwrap_err();
+        assert!(!is_transient_startup_error(&symlink_error));
 
         let oversized = temporary.path().join("oversized");
         std::fs::write(
             &oversized,
             vec![b'x'; usize::try_from(MAX_COOKIE_BYTES)? + 1],
         )?;
-        assert!(RpcAuth::from_managed_cookie(&oversized, endpoint).is_err());
+        let oversized_error = RpcAuth::from_managed_cookie(&oversized, endpoint).unwrap_err();
+        assert!(!is_transient_startup_error(&oversized_error));
+        let malformed = temporary.path().join("malformed");
+        std::fs::write(&malformed, b"missing-separator")?;
+        let malformed_error = RpcAuth::from_managed_cookie(&malformed, endpoint).unwrap_err();
+        assert!(!is_transient_startup_error(&malformed_error));
         assert_eq!(std::fs::read(&target)?, b"outside:secret\n");
         Ok(())
     }

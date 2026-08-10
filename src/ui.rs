@@ -29,7 +29,7 @@ use std::{
         Arc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[path = "ui_render.rs"]
@@ -59,6 +59,8 @@ use crate::{
 
 const BUILD_EVENT_QUEUE_CAPACITY: usize = 256;
 const MAX_BUILD_EVENTS_PER_TICK: usize = 256;
+const BITCOIN_RPC_STARTUP_TIMEOUT: Duration = Duration::from_mins(5);
+const BITCOIN_RPC_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 // ── Message ───────────────────────────────────────────────────────────────────
 
@@ -117,7 +119,7 @@ pub enum Message {
     ToggleBuildAdvanced,
 
     // ── Async results ─────────────────────────────────────────────────────────
-    StatusPollReceived(StatusPollResult),
+    StatusPollReceived(Box<StatusPollResult>),
 
     // ── Modal / overlay ───────────────────────────────────────────────────────
     /// Dismiss the info/error overlay.
@@ -304,6 +306,23 @@ struct StatusPollIdentity {
     lifecycle_generation: u64,
 }
 
+#[derive(Debug)]
+struct BitcoinRpcStartup {
+    deadline: Instant,
+    last_status: Option<String>,
+    last_diagnostic: Option<String>,
+}
+
+impl BitcoinRpcStartup {
+    fn new() -> Self {
+        Self {
+            deadline: Instant::now() + BITCOIN_RPC_STARTUP_TIMEOUT,
+            last_status: None,
+            last_diagnostic: None,
+        }
+    }
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "UI process, synchronization, and independent RPC/P2P readiness facts must remain separately observable"
@@ -340,6 +359,8 @@ pub struct App {
     bitcoin_rpc_reachable: bool,
     bitcoin_p2p_reachable: bool,
     bitcoin_rpc_error: Option<String>,
+    bitcoin_rpc_startup: Option<BitcoinRpcStartup>,
+    bitcoin_rpc_startup_status: Option<String>,
     bitcoin_p2p_error: Option<String>,
     bitcoin_compatibility_error: Option<String>,
     electrs_status: ElectrsStatus,
@@ -376,7 +397,16 @@ struct BitcoinProbeResult {
     blockchain_info: Result<BlockchainInfo, String>,
     network_info: Result<NetworkInfo, String>,
     rpc_addr: Option<SocketAddr>,
+    rpc_readiness: ManagedRpcReadiness,
     p2p_result: Result<SocketAddr, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedRpcReadiness {
+    Ready,
+    Warmup { status: String, diagnostic: String },
+    Unavailable { diagnostic: String },
+    Fatal { diagnostic: String },
 }
 
 impl App {
@@ -470,6 +500,8 @@ impl App {
             bitcoin_rpc_reachable: false,
             bitcoin_p2p_reachable: false,
             bitcoin_rpc_error: None,
+            bitcoin_rpc_startup: None,
+            bitcoin_rpc_startup_status: None,
             bitcoin_p2p_error: None,
             bitcoin_compatibility_error: None,
             electrs_status: ElectrsStatus::default(),
@@ -639,10 +671,7 @@ impl App {
                 self.binary_page.disclosures.advanced = !self.binary_page.disclosures.advanced;
                 Task::none()
             }
-            Message::StatusPollReceived(result) => {
-                self.apply_status_poll(result);
-                Task::none()
-            }
+            Message::StatusPollReceived(result) => self.apply_status_poll(*result),
             Message::DismissOverlay => {
                 self.overlay_message = None;
                 Task::none()
@@ -774,24 +803,25 @@ impl App {
                     electrs_status,
                 }
             },
-            Message::StatusPollReceived,
+            |result| Message::StatusPollReceived(Box::new(result)),
         )
     }
 
-    fn apply_status_poll(&mut self, result: StatusPollResult) {
+    fn apply_status_poll(&mut self, result: StatusPollResult) -> Task<Message> {
         self.reconcile_node_lifecycle();
         if self.active_status_poll != Some(result.identity)
             || self.lifecycle_generation != result.identity.lifecycle_generation
         {
-            return;
+            return Task::none();
         }
         self.active_status_poll = None;
 
-        if self.bitcoin_handle.is_some() && self.bitcoin_shutdown.is_none() {
-            self.apply_bitcoin_probe(result.bitcoin_probe);
+        let retry_rpc = if self.bitcoin_handle.is_some() && self.bitcoin_shutdown.is_none() {
+            self.apply_bitcoin_probe(result.bitcoin_probe)
         } else {
             self.reset_bitcoin_service_status();
-        }
+            false
+        };
 
         if self.electrs_handle.is_some() && self.electrs_shutdown.is_none() {
             let mut status = result.electrs_status;
@@ -809,27 +839,25 @@ impl App {
         } else {
             self.electrs_status = ElectrsStatus::default();
         }
+
+        if retry_rpc && self.bitcoin_handle.is_some() && self.bitcoin_shutdown.is_none() {
+            Task::perform(
+                async {
+                    tokio::time::sleep(BITCOIN_RPC_STARTUP_RETRY_INTERVAL).await;
+                },
+                |()| Message::RpcTick,
+            )
+        } else {
+            Task::none()
+        }
     }
 
-    fn apply_bitcoin_probe(&mut self, probe: BitcoinProbeResult) {
+    fn apply_bitcoin_probe(&mut self, probe: BitcoinProbeResult) -> bool {
         let previous_rpc_error = self.bitcoin_rpc_error.clone();
         let previous_p2p_error = self.bitcoin_p2p_error.clone();
         let previous_compatibility_error = self.bitcoin_compatibility_error.clone();
 
-        self.bitcoin_rpc_reachable = probe.blockchain_info.is_ok() && probe.network_info.is_ok();
-        self.bitcoin_rpc_error = match (&probe.blockchain_info, &probe.network_info) {
-            (Ok(_), Ok(_)) => None,
-            (Err(blockchain), Ok(_)) => Some(format!(
-                "getblockchaininfo failed at the managed RPC endpoint: {blockchain}"
-            )),
-            (Ok(_), Err(network)) => Some(format!(
-                "getnetworkinfo failed at the managed RPC endpoint: {network}"
-            )),
-            (Err(blockchain), Err(network)) if blockchain == network => Some(blockchain.clone()),
-            (Err(blockchain), Err(network)) => Some(format!(
-                "getblockchaininfo failed: {blockchain}; getnetworkinfo failed: {network}"
-            )),
-        };
+        let retry_rpc = self.apply_managed_rpc_readiness(&probe.rpc_readiness);
         if let Some(endpoint) = probe.rpc_addr {
             self.active_rpc_addr = Some(endpoint);
         }
@@ -906,6 +934,83 @@ impl App {
                 }
             }
         }
+        retry_rpc
+    }
+
+    fn apply_managed_rpc_readiness(&mut self, readiness: &ManagedRpcReadiness) -> bool {
+        match readiness {
+            ManagedRpcReadiness::Ready => {
+                let had_startup = self.bitcoin_rpc_startup.take().is_some();
+                let had_startup_status = self.bitcoin_rpc_startup_status.take().is_some();
+                self.bitcoin_rpc_reachable = true;
+                self.bitcoin_rpc_error = None;
+                if had_startup || had_startup_status {
+                    push_msg(&self.bitcoin_queue, "Bitcoin Core RPC is ready.");
+                }
+                false
+            }
+            ManagedRpcReadiness::Warmup { status, diagnostic } => {
+                self.bitcoin_rpc_reachable = false;
+                if self.bitcoin_rpc_startup.is_none() && self.bitcoin_rpc_error.is_some() {
+                    false
+                } else {
+                    self.apply_rpc_startup_wait(status, diagnostic)
+                }
+            }
+            ManagedRpcReadiness::Unavailable { diagnostic } => {
+                self.bitcoin_rpc_reachable = false;
+                if self.bitcoin_rpc_startup.is_some() {
+                    self.apply_rpc_startup_wait("Waiting for managed RPC service…", diagnostic)
+                } else {
+                    self.bitcoin_rpc_startup_status = None;
+                    self.bitcoin_rpc_error = Some(diagnostic.clone());
+                    false
+                }
+            }
+            ManagedRpcReadiness::Fatal { diagnostic } => {
+                self.bitcoin_rpc_reachable = false;
+                self.bitcoin_rpc_startup = None;
+                self.bitcoin_rpc_startup_status = None;
+                self.bitcoin_rpc_error = Some(diagnostic.clone());
+                false
+            }
+        }
+    }
+
+    fn apply_rpc_startup_wait(&mut self, status: &str, diagnostic: &str) -> bool {
+        if self.bitcoin_rpc_startup.is_none() {
+            self.bitcoin_rpc_startup = Some(BitcoinRpcStartup::new());
+        }
+
+        let timed_out = self
+            .bitcoin_rpc_startup
+            .as_ref()
+            .is_some_and(|startup| Instant::now() >= startup.deadline);
+        if timed_out {
+            let Some(startup) = self.bitcoin_rpc_startup.take() else {
+                return false;
+            };
+            let last_status = startup.last_status.as_deref().unwrap_or(status);
+            let last_diagnostic = startup.last_diagnostic.as_deref().unwrap_or(diagnostic);
+            self.bitcoin_rpc_startup_status = None;
+            self.bitcoin_rpc_error = Some(format!(
+                "timed out after {}s waiting for managed Bitcoin RPC readiness; last status: {last_status}; last probe: {last_diagnostic}",
+                BITCOIN_RPC_STARTUP_TIMEOUT.as_secs()
+            ));
+            return false;
+        }
+
+        let display = format!("Bitcoin Core is starting: {status}");
+        if self.bitcoin_rpc_startup_status.as_deref() != Some(display.as_str()) {
+            push_msg(&self.bitcoin_queue, &display);
+        }
+        self.bitcoin_rpc_startup_status = Some(display);
+        self.bitcoin_rpc_error = None;
+        if let Some(startup) = self.bitcoin_rpc_startup.as_mut() {
+            startup.last_status = Some(status.to_owned());
+            startup.last_diagnostic = Some(diagnostic.to_owned());
+        }
+        true
     }
 
     fn reset_bitcoin_service_status(&mut self) {
@@ -913,6 +1018,8 @@ impl App {
         self.bitcoin_rpc_reachable = false;
         self.bitcoin_p2p_reachable = false;
         self.bitcoin_rpc_error = None;
+        self.bitcoin_rpc_startup = None;
+        self.bitcoin_rpc_startup_status = None;
         self.bitcoin_p2p_error = None;
         self.bitcoin_compatibility_error = None;
         self.block_height = 0;
@@ -930,6 +1037,7 @@ impl App {
         self.bitcoin_compatibility_error
             .as_deref()
             .or(self.bitcoin_rpc_error.as_deref())
+            .or(self.bitcoin_rpc_startup_status.as_deref())
             .or(self.bitcoin_p2p_error.as_deref())
     }
 
@@ -997,12 +1105,24 @@ impl App {
             .as_mut()
             .is_some_and(|handle| !handle.is_running());
         if bitcoin_exited {
+            let startup_failure = self.bitcoin_rpc_startup.as_ref().map(|startup| {
+                startup.last_status.as_deref().map_or_else(
+                    || "before managed RPC readiness was confirmed".to_owned(),
+                    |status| format!("while RPC was starting: {status}"),
+                )
+            });
             self.bitcoin_handle = None;
             self.bitcoin_running = false;
             self.reset_bitcoin_service_status();
             self.invalidate_electrs_dependency(
                 "Bitcoin Core exited; stop Electrs before starting a new Bitcoin generation.",
             );
+            if let Some(failure) = startup_failure {
+                push_msg(
+                    &self.bitcoin_queue,
+                    &format!("Bitcoin RPC startup failed: Bitcoin Core exited {failure}."),
+                );
+            }
             push_msg(&self.bitcoin_queue, "bitcoind has stopped.");
             self.advance_lifecycle_generation();
         }
@@ -1250,6 +1370,7 @@ impl App {
                 self.active_p2p_addr = None;
                 self.bitcoin_running = true;
                 self.reset_bitcoin_service_status();
+                self.bitcoin_rpc_startup = Some(BitcoinRpcStartup::new());
                 self.advance_lifecycle_generation();
                 return Task::done(Message::RpcTick);
             }
@@ -1826,6 +1947,9 @@ async fn probe_managed_bitcoin(
             blockchain_info: Err(error.clone()),
             network_info: Err(error.clone()),
             rpc_addr: None,
+            rpc_readiness: ManagedRpcReadiness::Fatal {
+                diagnostic: error.clone(),
+            },
             p2p_result: Err(error),
         };
     };
@@ -1838,6 +1962,7 @@ async fn probe_managed_bitcoin(
         blockchain_info: rpc_probe.blockchain_info,
         network_info: rpc_probe.network_info,
         rpc_addr: rpc_probe.rpc_addr,
+        rpc_readiness: rpc_probe.readiness,
         p2p_result: p2p_result.map_err(|error| error.to_string()),
     }
 }
@@ -1846,20 +1971,63 @@ struct ManagedRpcProbe {
     blockchain_info: Result<BlockchainInfo, String>,
     network_info: Result<NetworkInfo, String>,
     rpc_addr: Option<SocketAddr>,
+    readiness: ManagedRpcReadiness,
+}
+
+impl ManagedRpcProbe {
+    fn without_results(readiness: ManagedRpcReadiness) -> Self {
+        let diagnostic = match &readiness {
+            ManagedRpcReadiness::Ready => {
+                "managed RPC readiness result was internally inconsistent"
+            }
+            ManagedRpcReadiness::Warmup { diagnostic, .. }
+            | ManagedRpcReadiness::Unavailable { diagnostic }
+            | ManagedRpcReadiness::Fatal { diagnostic } => diagnostic,
+        }
+        .to_owned();
+        Self {
+            blockchain_info: Err(diagnostic.clone()),
+            network_info: Err(diagnostic),
+            rpc_addr: None,
+            readiness,
+        }
+    }
+}
+
+enum RpcProbeFailure {
+    Warmup(String),
+    Unavailable,
+    Fatal,
+}
+
+fn classify_rpc_probe_failure(error: &anyhow::Error) -> RpcProbeFailure {
+    rpc::rpc_warmup_message(error).map_or_else(
+        || {
+            if rpc::is_transient_startup_error(error) {
+                RpcProbeFailure::Unavailable
+            } else {
+                RpcProbeFailure::Fatal
+            }
+        },
+        |message| RpcProbeFailure::Warmup(message.to_owned()),
+    )
 }
 
 async fn probe_managed_rpc(endpoints: &ManagedBitcoinEndpoints) -> ManagedRpcProbe {
     let mut failures = Vec::with_capacity(endpoints.rpc_candidates.len());
+    let mut warmup_messages = Vec::new();
+    let mut saw_fatal_failure = false;
     for &endpoint in &endpoints.rpc_candidates {
         let auth = match RpcAuth::from_managed_cookie(&endpoints.cookie_file, endpoint) {
             Ok(auth) => auth,
             Err(error) => {
-                let error = error.to_string();
-                return ManagedRpcProbe {
-                    blockchain_info: Err(error.clone()),
-                    network_info: Err(error),
-                    rpc_addr: None,
+                let diagnostic = error.to_string();
+                let readiness = if rpc::is_transient_startup_error(&error) {
+                    ManagedRpcReadiness::Unavailable { diagnostic }
+                } else {
+                    ManagedRpcReadiness::Fatal { diagnostic }
                 };
+                return ManagedRpcProbe::without_results(readiness);
             }
         };
         let (blockchain_info, network_info) = tokio::join!(
@@ -1871,7 +2039,23 @@ async fn probe_managed_rpc(endpoints: &ManagedBitcoinEndpoints) -> ManagedRpcPro
                 blockchain_info: blockchain_info.map_err(|error| error.to_string()),
                 network_info: network_info.map_err(|error| error.to_string()),
                 rpc_addr: Some(endpoint),
+                readiness: ManagedRpcReadiness::Ready,
             };
+        }
+
+        for error in [blockchain_info.as_ref().err(), network_info.as_ref().err()]
+            .into_iter()
+            .flatten()
+        {
+            match classify_rpc_probe_failure(error) {
+                RpcProbeFailure::Warmup(message) => {
+                    if !warmup_messages.contains(&message) {
+                        warmup_messages.push(message);
+                    }
+                }
+                RpcProbeFailure::Unavailable => {}
+                RpcProbeFailure::Fatal => saw_fatal_failure = true,
+            }
         }
         let blockchain_outcome = blockchain_info.as_ref().map_or_else(
             |error| format!("failed: {error}"),
@@ -1886,14 +2070,32 @@ async fn probe_managed_rpc(endpoints: &ManagedBitcoinEndpoints) -> ManagedRpcPro
         ));
     }
 
-    let error = format!(
-        "no managed Bitcoin RPC endpoint was usable ({})",
+    let details = if failures.is_empty() {
+        "no candidate endpoints were configured".to_owned()
+    } else {
         failures.join("; ")
-    );
-    ManagedRpcProbe {
-        blockchain_info: Err(error.clone()),
-        network_info: Err(error),
-        rpc_addr: None,
+    };
+    let readiness = if saw_fatal_failure {
+        ManagedRpcReadiness::Fatal {
+            diagnostic: format!("no managed Bitcoin RPC endpoint was usable ({details})"),
+        }
+    } else if warmup_messages.is_empty() {
+        ManagedRpcReadiness::Unavailable {
+            diagnostic: format!("no managed Bitcoin RPC endpoint was reachable ({details})"),
+        }
+    } else {
+        ManagedRpcReadiness::Warmup {
+            status: warmup_messages.join("; "),
+            diagnostic: format!("managed Bitcoin RPC is still warming up ({details})"),
+        }
+    };
+    ManagedRpcProbe::without_results(readiness)
+}
+
+#[cfg(test)]
+fn failed_managed_rpc_readiness(error: &str) -> ManagedRpcReadiness {
+    ManagedRpcReadiness::Fatal {
+        diagnostic: error.to_owned(),
     }
 }
 
@@ -1910,7 +2112,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[cfg(unix)]
-    use std::{os::unix::fs::PermissionsExt as _, sync::atomic::AtomicUsize, time::Instant};
+    use std::{os::unix::fs::PermissionsExt as _, sync::atomic::AtomicUsize};
 
     fn test_app(root: &Path) -> App {
         App::from_config(Config::defaults(root), None, root.join("build-state.json"))
@@ -1939,6 +2141,7 @@ mod tests {
                 network_active: true,
             }),
             rpc_addr: Some(SocketAddr::from(([127, 0, 0, 1], 8332))),
+            rpc_readiness: ManagedRpcReadiness::Ready,
             p2p_result: Ok(SocketAddr::from(([127, 0, 0, 1], 8333))),
         }
     }
@@ -1948,6 +2151,7 @@ mod tests {
             blockchain_info: Err(error.to_owned()),
             network_info: Err(error.to_owned()),
             rpc_addr: None,
+            rpc_readiness: failed_managed_rpc_readiness(error),
             p2p_result: Err(error.to_owned()),
         }
     }
@@ -1962,11 +2166,11 @@ mod tests {
             lifecycle_generation: app.lifecycle_generation,
         };
         app.active_status_poll = Some(identity);
-        app.apply_status_poll(StatusPollResult {
+        drop(app.apply_status_poll(StatusPollResult {
             identity,
             bitcoin_probe,
             electrs_status,
-        });
+        }));
     }
 
     fn ready_electrs_status() -> ElectrsStatus {
@@ -2100,6 +2304,135 @@ mod tests {
         Ok((endpoint, server))
     }
 
+    #[derive(Clone, Copy)]
+    enum TestRpcReply {
+        Success,
+        Warmup(&'static str),
+        Error { code: i64, message: &'static str },
+        Unauthorized,
+        Malformed,
+    }
+
+    fn test_rpc_response(method: &str, reply: TestRpcReply) -> anyhow::Result<String> {
+        let (status, body) = match reply {
+            TestRpcReply::Success => {
+                let result = match method {
+                    "getblockchaininfo" => serde_json::json!({
+                        "blocks": 100,
+                        "headers": 100,
+                        "verificationprogress": 1.0,
+                        "initialblockdownload": false,
+                        "pruned": false
+                    }),
+                    "getnetworkinfo" => serde_json::json!({
+                        "version": 300_000,
+                        "networkactive": true
+                    }),
+                    unexpected => anyhow::bail!("unexpected test RPC method {unexpected}"),
+                };
+                (
+                    "200 OK",
+                    serde_json::json!({"result": result, "error": null}).to_string(),
+                )
+            }
+            TestRpcReply::Warmup(message) => (
+                "500 Internal Server Error",
+                serde_json::json!({
+                    "result": null,
+                    "error": {"code": -28, "message": message}
+                })
+                .to_string(),
+            ),
+            TestRpcReply::Error { code, message } => (
+                "500 Internal Server Error",
+                serde_json::json!({
+                    "result": null,
+                    "error": {"code": code, "message": message}
+                })
+                .to_string(),
+            ),
+            TestRpcReply::Unauthorized => ("401 Unauthorized", String::new()),
+            TestRpcReply::Malformed => ("200 OK", "{not valid JSON".to_owned()),
+        };
+        Ok(format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+    }
+
+    async fn spawn_scripted_rpc_server(
+        bind: &str,
+        blockchain_replies: Vec<TestRpcReply>,
+        network_replies: Vec<TestRpcReply>,
+    ) -> anyhow::Result<(
+        SocketAddr,
+        tokio::task::JoinHandle<anyhow::Result<Vec<String>>>,
+    )> {
+        let listener = tokio::net::TcpListener::bind(bind).await?;
+        let endpoint = listener.local_addr()?;
+        let request_count = blockchain_replies.len() + network_replies.len();
+        let server = tokio::spawn(async move {
+            let mut methods = Vec::with_capacity(request_count);
+            let mut blockchain_index = 0;
+            let mut network_index = 0;
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().await?;
+                let request = read_test_rpc_request(&mut stream).await?;
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .context("test RPC request omitted method")?;
+                let reply = match method {
+                    "getblockchaininfo" => {
+                        let reply = blockchain_replies
+                            .get(blockchain_index)
+                            .copied()
+                            .context("unexpected extra getblockchaininfo request")?;
+                        blockchain_index += 1;
+                        reply
+                    }
+                    "getnetworkinfo" => {
+                        let reply = network_replies
+                            .get(network_index)
+                            .copied()
+                            .context("unexpected extra getnetworkinfo request")?;
+                        network_index += 1;
+                        reply
+                    }
+                    unexpected => anyhow::bail!("unexpected test RPC method {unexpected}"),
+                };
+                stream
+                    .write_all(test_rpc_response(method, reply)?.as_bytes())
+                    .await?;
+                methods.push(method.to_owned());
+            }
+            Ok(methods)
+        });
+        Ok((endpoint, server))
+    }
+
+    fn managed_rpc_endpoints(
+        cookie_file: PathBuf,
+        rpc_candidates: Vec<SocketAddr>,
+    ) -> ManagedBitcoinEndpoints {
+        ManagedBitcoinEndpoints {
+            rpc_port: rpc_candidates.first().map_or(8332, SocketAddr::port),
+            rpc_candidates,
+            p2p_candidates: Vec::new(),
+            cookie_file,
+        }
+    }
+
+    fn bitcoin_probe_from_rpc(probe: ManagedRpcProbe) -> BitcoinProbeResult {
+        BitcoinProbeResult {
+            blockchain_info: probe.blockchain_info,
+            network_info: probe.network_info,
+            rpc_addr: probe.rpc_addr,
+            rpc_readiness: probe.readiness,
+            p2p_result: Ok(SocketAddr::from(([127, 0, 0, 1], 8333))),
+        }
+    }
+
     #[tokio::test]
     async fn managed_rpc_probe_skips_a_partially_usable_candidate() -> anyhow::Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2126,6 +2459,341 @@ mod tests {
             methods.sort_unstable();
             assert_eq!(methods, ["getblockchaininfo", "getnetworkinfo"]);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blockchain_warmup_retries_until_managed_rpc_becomes_ready() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:password\n")?;
+        let (endpoint, server) = spawn_scripted_rpc_server(
+            "127.0.0.1:0",
+            vec![
+                TestRpcReply::Warmup("Loading block index…"),
+                TestRpcReply::Warmup("Loading block index…"),
+                TestRpcReply::Warmup("Loading block index…"),
+                TestRpcReply::Success,
+            ],
+            vec![TestRpcReply::Success; 4],
+        )
+        .await?;
+        let endpoints = managed_rpc_endpoints(cookie_file, vec![endpoint]);
+        let mut app = test_app(temporary.path());
+        app.bitcoin_rpc_startup = Some(BitcoinRpcStartup::new());
+
+        for _ in 0..3 {
+            let probe = probe_managed_rpc(&endpoints).await;
+            assert!(matches!(
+                &probe.readiness,
+                ManagedRpcReadiness::Warmup { status, .. }
+                    if status == "Loading block index…"
+            ));
+            assert!(app.apply_bitcoin_probe(bitcoin_probe_from_rpc(probe)));
+            assert!(app.bitcoin_rpc_error.is_none());
+            assert!(!app.bitcoin_rpc_reachable);
+        }
+
+        let ready = probe_managed_rpc(&endpoints).await;
+        assert_eq!(ready.readiness, ManagedRpcReadiness::Ready);
+        assert!(!app.apply_bitcoin_probe(bitcoin_probe_from_rpc(ready)));
+        assert!(app.bitcoin_rpc_reachable);
+        assert_eq!(app.active_rpc_addr, Some(endpoint));
+        assert!(app.bitcoin_rpc_startup.is_none());
+        assert!(app.bitcoin_queue.lock().is_ok_and(|lines| {
+            lines
+                .iter()
+                .filter(|line| line.as_str() == "Bitcoin Core is starting: Loading block index…")
+                .count()
+                == 1
+                && !lines
+                    .iter()
+                    .any(|line| line.contains("RPC readiness check failed"))
+        }));
+
+        let methods = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .context("scripted RPC server timed out")???;
+        assert_eq!(methods.len(), 8);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn network_warmup_retries_until_required_call_succeeds() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:password\n")?;
+        let (endpoint, server) = spawn_scripted_rpc_server(
+            "127.0.0.1:0",
+            vec![TestRpcReply::Success; 2],
+            vec![
+                TestRpcReply::Warmup("Loading P2P addresses…"),
+                TestRpcReply::Success,
+            ],
+        )
+        .await?;
+        let endpoints = managed_rpc_endpoints(cookie_file, vec![endpoint]);
+        let mut app = test_app(temporary.path());
+        app.bitcoin_rpc_startup = Some(BitcoinRpcStartup::new());
+
+        let warmup = probe_managed_rpc(&endpoints).await;
+        assert!(matches!(
+            &warmup.readiness,
+            ManagedRpcReadiness::Warmup { status, .. }
+                if status == "Loading P2P addresses…"
+        ));
+        assert!(app.apply_bitcoin_probe(bitcoin_probe_from_rpc(warmup)));
+
+        let ready = probe_managed_rpc(&endpoints).await;
+        assert_eq!(ready.readiness, ManagedRpcReadiness::Ready);
+        assert!(!app.apply_bitcoin_probe(bitcoin_probe_from_rpc(ready)));
+        assert!(app.bitcoin_rpc_reachable);
+
+        let methods = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .context("scripted RPC server timed out")???;
+        assert_eq!(methods.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipv4_and_ipv6_warmup_is_one_informational_startup_state() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:password\n")?;
+        let replies = vec![TestRpcReply::Warmup("Loading block index…")];
+        let (ipv4, ipv4_server) =
+            spawn_scripted_rpc_server("127.0.0.1:0", replies.clone(), replies.clone()).await?;
+        let (ipv6, ipv6_server) =
+            spawn_scripted_rpc_server("[::1]:0", replies.clone(), replies).await?;
+        let endpoints = managed_rpc_endpoints(cookie_file, vec![ipv4, ipv6]);
+        let mut app = test_app(temporary.path());
+        app.bitcoin_rpc_startup = Some(BitcoinRpcStartup::new());
+
+        let probe = probe_managed_rpc(&endpoints).await;
+        assert!(matches!(
+            &probe.readiness,
+            ManagedRpcReadiness::Warmup { status, .. }
+                if status == "Loading block index…"
+        ));
+        assert!(app.apply_bitcoin_probe(bitcoin_probe_from_rpc(probe)));
+        assert!(app.bitcoin_rpc_error.is_none());
+        assert!(app.bitcoin_queue.lock().is_ok_and(|lines| {
+            lines
+                .iter()
+                .filter(|line| line.as_str() == "Bitcoin Core is starting: Loading block index…")
+                .count()
+                == 1
+                && !lines
+                    .iter()
+                    .any(|line| line.contains("RPC readiness check failed"))
+        }));
+
+        for server in [ipv4_server, ipv6_server] {
+            let methods = tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .context("dual-stack RPC server timed out")???;
+            assert_eq!(methods.len(), 2);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn warmup_candidate_falls_through_to_ready_managed_endpoint() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:password\n")?;
+        let (warmup_endpoint, warmup_server) = spawn_scripted_rpc_server(
+            "127.0.0.1:0",
+            vec![TestRpcReply::Warmup("Loading block index…")],
+            vec![TestRpcReply::Warmup("Loading block index…")],
+        )
+        .await?;
+        let (ready_endpoint, ready_server) = spawn_scripted_rpc_server(
+            "127.0.0.1:0",
+            vec![TestRpcReply::Success],
+            vec![TestRpcReply::Success],
+        )
+        .await?;
+        let endpoints = managed_rpc_endpoints(cookie_file, vec![warmup_endpoint, ready_endpoint]);
+
+        let probe = probe_managed_rpc(&endpoints).await;
+
+        assert_eq!(probe.readiness, ManagedRpcReadiness::Ready);
+        assert_eq!(probe.rpc_addr, Some(ready_endpoint));
+        for server in [warmup_server, ready_server] {
+            let methods = tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .context("fallback RPC server timed out")???;
+            assert_eq!(methods.len(), 2);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persistent_warmup_reaches_clean_startup_timeout() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:password\n")?;
+        let (endpoint, server) = spawn_scripted_rpc_server(
+            "127.0.0.1:0",
+            vec![TestRpcReply::Warmup("Loading block index…"); 3],
+            vec![TestRpcReply::Warmup("Loading block index…"); 3],
+        )
+        .await?;
+        let endpoints = managed_rpc_endpoints(cookie_file, vec![endpoint]);
+        let mut app = test_app(temporary.path());
+        app.bitcoin_rpc_startup = Some(BitcoinRpcStartup::new());
+
+        for _ in 0..2 {
+            let probe = probe_managed_rpc(&endpoints).await;
+            assert!(app.apply_bitcoin_probe(bitcoin_probe_from_rpc(probe)));
+        }
+        app.bitcoin_rpc_startup
+            .as_mut()
+            .context("active RPC startup state")?
+            .deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .context("construct elapsed startup deadline")?;
+
+        let timed_out = probe_managed_rpc(&endpoints).await;
+        assert!(!app.apply_bitcoin_probe(bitcoin_probe_from_rpc(timed_out)));
+        assert!(!app.bitcoin_rpc_reachable);
+        assert!(app.bitcoin_rpc_startup.is_none());
+        assert!(app.bitcoin_rpc_error.as_deref().is_some_and(|error| {
+            error.contains("timed out after 300s")
+                && error.contains("Loading block index…")
+                && error.contains(&endpoint.to_string())
+                && error.contains("RPC error -28")
+        }));
+        assert!(app.bitcoin_queue.lock().is_ok_and(|lines| {
+            lines
+                .iter()
+                .filter(|line| line.as_str() == "Bitcoin Core is starting: Loading block index…")
+                .count()
+                == 1
+                && lines.iter().any(|line| {
+                    line.contains("RPC readiness check failed") && line.contains("timed out")
+                })
+        }));
+
+        let methods = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .context("persistent warmup RPC server timed out")???;
+        assert_eq!(methods.len(), 6);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authentication_error_remains_fatal_during_startup() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:wrong-password\n")?;
+        let (endpoint, server) = spawn_scripted_rpc_server(
+            "127.0.0.1:0",
+            vec![TestRpcReply::Unauthorized],
+            vec![TestRpcReply::Unauthorized],
+        )
+        .await?;
+        let endpoints = managed_rpc_endpoints(cookie_file, vec![endpoint]);
+
+        let probe = probe_managed_rpc(&endpoints).await;
+
+        assert!(matches!(
+            &probe.readiness,
+            ManagedRpcReadiness::Fatal { diagnostic }
+                if diagnostic.contains("RPC authentication failed (401)")
+        ));
+        let methods = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .context("authentication RPC server timed out")???;
+        assert_eq!(methods.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unrelated_rpc_error_remains_fatal_during_startup() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:password\n")?;
+        let (endpoint, server) = spawn_scripted_rpc_server(
+            "127.0.0.1:0",
+            vec![TestRpcReply::Error {
+                code: -1,
+                message: "unexpected failure",
+            }],
+            vec![TestRpcReply::Error {
+                code: -1,
+                message: "unexpected failure",
+            }],
+        )
+        .await?;
+        let endpoints = managed_rpc_endpoints(cookie_file, vec![endpoint]);
+
+        let probe = probe_managed_rpc(&endpoints).await;
+
+        assert!(matches!(
+            &probe.readiness,
+            ManagedRpcReadiness::Fatal { diagnostic }
+                if diagnostic.contains("RPC error -1: unexpected failure")
+        ));
+        let methods = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .context("fatal-error RPC server timed out")???;
+        assert_eq!(methods.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_rpc_response_remains_fatal_during_startup() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:password\n")?;
+        let (endpoint, server) = spawn_scripted_rpc_server(
+            "127.0.0.1:0",
+            vec![TestRpcReply::Malformed],
+            vec![TestRpcReply::Malformed],
+        )
+        .await?;
+        let endpoints = managed_rpc_endpoints(cookie_file, vec![endpoint]);
+
+        let probe = probe_managed_rpc(&endpoints).await;
+
+        assert!(matches!(
+            &probe.readiness,
+            ManagedRpcReadiness::Fatal { diagnostic }
+                if diagnostic.contains("parse RPC response")
+        ));
+        let methods = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .context("malformed RPC server timed out")???;
+        assert_eq!(methods.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_ready_managed_rpc_succeeds_without_startup_delay() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:password\n")?;
+        let (endpoint, server) = spawn_scripted_rpc_server(
+            "127.0.0.1:0",
+            vec![TestRpcReply::Success],
+            vec![TestRpcReply::Success],
+        )
+        .await?;
+        let endpoints = managed_rpc_endpoints(cookie_file, vec![endpoint]);
+
+        let probe = probe_managed_rpc(&endpoints).await;
+
+        assert_eq!(probe.readiness, ManagedRpcReadiness::Ready);
+        assert_eq!(probe.rpc_addr, Some(endpoint));
+        assert!(probe.blockchain_info.is_ok());
+        assert!(probe.network_info.is_ok());
+        let methods = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .context("ready RPC server timed out")???;
+        assert_eq!(methods.len(), 2);
         Ok(())
     }
 
@@ -2199,6 +2867,38 @@ mod tests {
             !process_exists(process_id),
             "node helper {process_id} was left running"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exit_ends_rpc_warmup_immediately() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let process_id = wait_for_pids(&bitcoin_pid_log, 1)?[0];
+        let warmup = ManagedRpcProbe::without_results(ManagedRpcReadiness::Warmup {
+            status: "Loading block index…".to_owned(),
+            diagnostic: "managed RPC returned RPC error -28".to_owned(),
+        });
+        assert!(app.apply_bitcoin_probe(bitcoin_probe_from_rpc(warmup)));
+
+        // SAFETY: the PID belongs to the helper process launched above.
+        assert_eq!(unsafe { libc::kill(process_id, libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.bitcoin_handle.is_some() && Instant::now() < deadline {
+            app.reconcile_node_lifecycle();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(app.bitcoin_handle.is_none());
+        assert!(!app.bitcoin_running);
+        assert!(app.bitcoin_queue.lock().is_ok_and(|lines| lines.iter().any(
+            |line| line
+                == "Bitcoin RPC startup failed: Bitcoin Core exited while RPC was starting: Loading block index…."
+        )));
+        Ok(())
     }
 
     #[test]
@@ -2763,7 +3463,7 @@ mod tests {
         let mut app = test_app(temporary.path());
         drop(app.launch_bitcoin());
         let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
-        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+        let _ = app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
             100, 100, false, true,
         )));
 
@@ -2784,12 +3484,12 @@ mod tests {
         let temporary = tempfile::tempdir()?;
         let mut app = test_app(temporary.path());
 
-        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+        let _ = app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
             100, 100, true, false,
         )));
         assert!(!app.bitcoin_synced, "IBD must remain unsynchronized");
 
-        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+        let _ = app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
             99, 100, false, false,
         )));
         assert!(
@@ -2797,13 +3497,13 @@ mod tests {
             "a one-block lag must remain unsynchronized"
         );
 
-        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+        let _ = app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
             100, 100, false, false,
         )));
         assert!(app.bitcoin_synced);
         assert!(app.bitcoin_compatibility_error.is_none());
 
-        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+        let _ = app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
             100, 100, false, true,
         )));
         assert!(app
@@ -2816,7 +3516,7 @@ mod tests {
             version: 300_000,
             network_active: false,
         });
-        app.apply_bitcoin_probe(inactive);
+        let _ = app.apply_bitcoin_probe(inactive);
         assert!(app
             .bitcoin_compatibility_error
             .as_deref()
@@ -2834,14 +3534,14 @@ mod tests {
             "no configured Bitcoin P2P endpoint completed a mainnet handshake: {endpoint} — TCP connection refused"
         ));
 
-        app.apply_bitcoin_probe(startup);
+        let _ = app.apply_bitcoin_probe(startup);
         assert!(!app.bitcoin_p2p_reachable);
         assert!(app
             .bitcoin_p2p_error
             .as_deref()
             .is_some_and(|error| error.contains("TCP connection refused")));
 
-        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+        let _ = app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
             100, 100, false, false,
         )));
         assert!(app.bitcoin_p2p_reachable);
@@ -2960,11 +3660,11 @@ mod tests {
             .as_deref()
             .is_some_and(|error| error.contains("stop Electrs")));
 
-        app.apply_status_poll(StatusPollResult {
+        drop(app.apply_status_poll(StatusPollResult {
             identity: stale_identity,
             bitcoin_probe: healthy_bitcoin_probe(blockchain_info(100, 100, false, false)),
             electrs_status: ready_electrs_status(),
-        });
+        }));
         assert!(!app.electrs_status.connected);
         assert!(!app.electrs_status.ready);
 
@@ -2997,11 +3697,11 @@ mod tests {
         drop(app.launch_electrs());
         let _ = wait_for_pids(&electrs_pid_log, 1)?;
 
-        app.apply_status_poll(StatusPollResult {
+        drop(app.apply_status_poll(StatusPollResult {
             identity: stale_identity,
             bitcoin_probe: failed_bitcoin_probe("stale poll"),
             electrs_status: ElectrsStatus::default(),
-        });
+        }));
 
         assert!(app.electrs_handle.is_some());
         assert!(app.electrs_status.running);
@@ -3095,11 +3795,11 @@ mod tests {
         };
         app.active_status_poll = Some(identity);
 
-        app.apply_status_poll(StatusPollResult {
+        drop(app.apply_status_poll(StatusPollResult {
             identity,
             bitcoin_probe: failed_bitcoin_probe("RPC timed out"),
             electrs_status: ElectrsStatus::default(),
-        });
+        }));
 
         assert!(!app.bitcoin_synced);
         assert_eq!(app.block_height, 0);
@@ -3117,7 +3817,7 @@ mod tests {
         };
         app.active_status_poll = Some(identity);
 
-        app.apply_status_poll(StatusPollResult {
+        drop(app.apply_status_poll(StatusPollResult {
             identity,
             bitcoin_probe: healthy_bitcoin_probe(blockchain_info(100, 100, false, false)),
             electrs_status: ElectrsStatus {
@@ -3126,7 +3826,7 @@ mod tests {
                 ready: true,
                 ..ElectrsStatus::default()
             },
-        });
+        }));
 
         assert!(!app.bitcoin_running);
         assert!(!app.bitcoin_synced);
