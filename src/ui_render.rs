@@ -1021,15 +1021,7 @@ fn view_paths_panel(app: &App) -> Element<'_, Message> {
             paths_editable,
         ),
         row![
-            text(if app.pending_path_save.is_some() {
-                "Saving and validating paths…"
-            } else if app.binary_page.active_operation.is_some() {
-                "Paths are locked for the active binary build."
-            } else {
-                "Changes take effect on the next node launch."
-            })
-            .size(10)
-            .color(TEXT_TER),
+            text(paths_status_text(app)).size(10).color(TEXT_TER),
             Space::new().width(Length::Fill),
             styled_button(
                 if app.pending_path_save.is_some() {
@@ -1063,13 +1055,28 @@ fn view_paths_panel(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+const fn paths_status_text(app: &App) -> &'static str {
+    if app.pending_path_save.is_some() {
+        "Saving and validating paths…"
+    } else if app.binary_page.active_operation.is_some() {
+        "Paths are locked for the active binary build."
+    } else if app.node_lifecycle_active() {
+        "Paths are locked while a node is running or shutting down."
+    } else {
+        "Changes take effect on the next node launch."
+    }
+}
+
 fn view_node_panels(app: &App) -> Element<'_, Message> {
     let bitcoin_panel = view_node_panel(NodePanelSpec {
         title: "Bitcoin",
         subtitle: "Bitcoin Core node",
         accent: BTC_ACC,
-        launch_action: (!app.bitcoin_running).then_some(Message::LaunchBitcoin),
-        launch_hint: if app.bitcoin_running {
+        launch_action: (app.bitcoin_handle.is_none() && app.bitcoin_shutdown.is_none())
+            .then_some(Message::LaunchBitcoin),
+        launch_hint: if app.bitcoin_shutdown.is_some() {
+            "Bitcoin is shutting down."
+        } else if app.bitcoin_handle.is_some() {
             "Bitcoin is already running."
         } else {
             "Starts bitcoind with the configured data directory."
@@ -1084,11 +1091,16 @@ fn view_node_panels(app: &App) -> Element<'_, Message> {
         title: "Electrs",
         subtitle: "Electrum server index",
         accent: ELS_ACC,
-        launch_action: (app.bitcoin_running && !app.electrs_status.running)
-            .then_some(Message::LaunchElectrs),
-        launch_hint: if app.electrs_status.running {
+        launch_action: (app.bitcoin_handle.is_some()
+            && app.bitcoin_shutdown.is_none()
+            && app.electrs_handle.is_none()
+            && app.electrs_shutdown.is_none())
+        .then_some(Message::LaunchElectrs),
+        launch_hint: if app.electrs_shutdown.is_some() {
+            "Electrs is shutting down."
+        } else if app.electrs_handle.is_some() {
             "Electrs is already running."
-        } else if !app.bitcoin_running {
+        } else if app.bitcoin_handle.is_none() || app.bitcoin_shutdown.is_some() {
             "Start Bitcoin before launching Electrs."
         } else {
             "Starts electrs against the configured Bitcoin data directory."
@@ -1316,12 +1328,16 @@ fn terminal_container(running: bool, lines: &[String], scroll_id: Id) -> Element
 fn view_bottom_bar(app: &App) -> Element<'_, Message> {
     let any_running = app.bitcoin_running || app.electrs_status.running;
     let electrs_running = app.electrs_status.running;
+    let shutdown_in_progress = app.bitcoin_shutdown.is_some() || app.electrs_shutdown.is_some();
 
     let shutdown_both = styled_button("Shutdown Bitcoin & Electrs", ButtonStyle::Destructive)
-        .on_press_maybe(any_running.then_some(Message::ShutdownBoth));
-    let shutdown_els = styled_button("Shutdown Electrs Only", ButtonStyle::Warning)
-        .on_press_maybe(electrs_running.then_some(Message::ShutdownElectrsOnly));
-    let help_text = if any_running {
+        .on_press_maybe((any_running && !shutdown_in_progress).then_some(Message::ShutdownBoth));
+    let shutdown_els = styled_button("Shutdown Electrs Only", ButtonStyle::Warning).on_press_maybe(
+        (electrs_running && app.electrs_shutdown.is_none()).then_some(Message::ShutdownElectrsOnly),
+    );
+    let help_text = if shutdown_in_progress {
+        "Shutdown is in progress; relaunch remains locked until cleanup completes."
+    } else if any_running {
         "Shutdown requests use graceful stop first, then terminate if needed."
     } else {
         "Start a service before shutdown controls become available."

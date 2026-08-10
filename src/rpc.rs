@@ -19,6 +19,7 @@ use serde_json::Value;
 
 const MAX_BITCOIN_CONF_BYTES: u64 = 1024 * 1024;
 const MAX_COOKIE_BYTES: u64 = 4096;
+const MAX_INCLUDED_CONF_FILES: usize = 32;
 
 /// Lazily-built HTTP client (one per poll cycle is fine; keep it cheap).
 fn http_client() -> Result<Client> {
@@ -96,6 +97,43 @@ struct BitcoinConf {
     cookie_credentials: Option<(String, String)>,
 }
 
+#[derive(Default)]
+struct RpcConfigValues {
+    port: Option<u16>,
+    port_seen: bool,
+    user: Option<String>,
+    user_seen: bool,
+    password: Option<String>,
+    password_seen: bool,
+}
+
+impl RpcConfigValues {
+    fn apply_first(&mut self, name: &str, value: &str) {
+        match name {
+            "rpcport" if !self.port_seen => {
+                self.port_seen = true;
+                self.port = value.parse().ok();
+            }
+            "rpcuser" if !self.user_seen => {
+                self.user_seen = true;
+                self.user = Some(value.to_owned());
+            }
+            "rpcpassword" if !self.password_seen => {
+                self.password_seen = true;
+                self.password = Some(value.to_owned());
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConfigScope {
+    Global,
+    Main,
+    Other,
+}
+
 impl BitcoinConf {
     fn load(data_dir: &Path) -> Self {
         let mut conf = Self {
@@ -105,24 +143,30 @@ impl BitcoinConf {
             cookie_credentials: None,
         };
 
-        let Some(text) =
+        let mut global = RpcConfigValues::default();
+        let mut mainnet = RpcConfigValues::default();
+        let mut included_paths = Vec::new();
+        if let Some(text) =
             read_bounded_regular(&data_dir.join("bitcoin.conf"), MAX_BITCOIN_CONF_BYTES)
-        else {
-            return conf;
-        };
-
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("rpcport=") {
-                conf.port = rest.trim().parse().ok();
-            }
-            if let Some(v) = line.strip_prefix("rpcuser=") {
-                conf.rpcuser = Some(v.trim().to_owned());
-            }
-            if let Some(v) = line.strip_prefix("rpcpassword=") {
-                conf.rpcpassword = Some(v.trim().to_owned());
+        {
+            parse_rpc_config(&text, &mut global, &mut mainnet, Some(&mut included_paths));
+        }
+        for included_path in included_paths {
+            let included_path = if included_path.is_absolute() {
+                included_path
+            } else {
+                data_dir.join(included_path)
+            };
+            if let Some(text) = read_bounded_regular(&included_path, MAX_BITCOIN_CONF_BYTES) {
+                // Bitcoin Core only honors includeconf in the primary file;
+                // nested include directives are intentionally ignored.
+                parse_rpc_config(&text, &mut global, &mut mainnet, None);
             }
         }
+
+        conf.port = mainnet.port.or(global.port);
+        conf.rpcuser = mainnet.user.or(global.user);
+        conf.rpcpassword = mainnet.password.or(global.password);
 
         for cookie_path in [
             data_dir.join(".cookie"),
@@ -138,6 +182,68 @@ impl BitcoinConf {
         }
 
         conf
+    }
+}
+
+fn parse_rpc_config(
+    text: &str,
+    global: &mut RpcConfigValues,
+    mainnet: &mut RpcConfigValues,
+    mut included_paths: Option<&mut Vec<std::path::PathBuf>>,
+) {
+    let mut scope = ConfigScope::Global;
+    for raw_line in text.lines() {
+        let line = raw_line
+            .split_once('#')
+            .map_or(raw_line, |(value, _)| value)
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(section) = line
+            .strip_prefix('[')
+            .and_then(|section| section.strip_suffix(']'))
+        {
+            // BitEngine launches both managed nodes on mainnet. Ignore
+            // settings from testnet, signet, regtest, and unknown sections.
+            scope = if section == "main" {
+                ConfigScope::Main
+            } else {
+                ConfigScope::Other
+            };
+            continue;
+        }
+
+        let Some((raw_name, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let raw_name = raw_name.trim();
+        let value = raw_value.trim();
+        let (target_scope, name) =
+            raw_name
+                .split_once('.')
+                .map_or((scope, raw_name), |(section, name)| {
+                    (
+                        if section == "main" {
+                            ConfigScope::Main
+                        } else {
+                            ConfigScope::Other
+                        },
+                        name.trim(),
+                    )
+                });
+        match target_scope {
+            ConfigScope::Global | ConfigScope::Main if name == "includeconf" => {
+                if let Some(paths) = included_paths.as_deref_mut() {
+                    if paths.len() < MAX_INCLUDED_CONF_FILES {
+                        paths.push(value.into());
+                    }
+                }
+            }
+            ConfigScope::Global => global.apply_first(name, value),
+            ConfigScope::Main => mainnet.apply_first(name, value),
+            ConfigScope::Other => {}
+        }
     }
 }
 
@@ -335,6 +441,114 @@ mod tests {
             std::fs::read(&target)?,
             b"rpcuser=outside\nrpcpassword=secret\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_auth_uses_only_global_and_mainnet_config_sections() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        std::fs::write(
+            temporary.path().join("bitcoin.conf"),
+            "rpcport=8334\n\
+             rpcuser=global-user\n\
+             [main]\n\
+             rpcport=8335\n\
+             rpcuser=main-user\n\
+             rpcpassword=main-password\n\
+             [test]\n\
+             rpcport=18333\n\
+             rpcuser=test-user\n\
+             rpcpassword=test-password\n",
+        )?;
+
+        let auth = RpcAuth::from_data_dir(temporary.path());
+
+        assert_eq!(auth.port, 8335);
+        assert_eq!(auth.user, "main-user");
+        assert_eq!(auth.password, "main-password");
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_auth_recognizes_mainnet_section_after_other_networks() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        std::fs::write(
+            temporary.path().join("bitcoin.conf"),
+            "[test]\n\
+             rpcport=18333\n\
+             [main]\n\
+             rpcport=8336\n",
+        )?;
+
+        assert_eq!(RpcAuth::from_data_dir(temporary.path()).port, 8336);
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_auth_handles_commented_sections_without_accepting_non_core_section_names() -> Result<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        std::fs::write(
+            temporary.path().join("bitcoin.conf"),
+            "rpcport=8337\n\
+             [test] # testnet settings\n\
+             rpcport=18333\n\
+             [MAIN]\n\
+             rpcport=19999\n",
+        )?;
+
+        assert_eq!(RpcAuth::from_data_dir(temporary.path()).port, 8337);
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_auth_supports_whitespace_and_first_mainnet_dotted_assignment() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        std::fs::write(
+            temporary.path().join("bitcoin.conf"),
+            "rpcport = 8338\n\
+             main.rpcport = 8339\n\
+             main.rpcport = 8340\n\
+             main.rpcuser = first-user\n\
+             main.rpcuser = second-user\n",
+        )?;
+
+        let auth = RpcAuth::from_data_dir(temporary.path());
+        assert_eq!(auth.port, 8339);
+        assert_eq!(auth.user, "first-user");
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_auth_reads_mainnet_values_from_bounded_primary_includes() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        std::fs::write(
+            temporary.path().join("bitcoin.conf"),
+            "[main]\n\
+             includeconf=rpc-port.conf\n\
+             main.includeconf=rpc-auth.conf\n",
+        )?;
+        std::fs::write(
+            temporary.path().join("rpc-port.conf"),
+            "includeconf=ignored-nested.conf\n\
+             [main]\n\
+             rpcport=8341\n",
+        )?;
+        std::fs::write(
+            temporary.path().join("rpc-auth.conf"),
+            "[main]\n\
+             rpcuser=included-user\n\
+             rpcpassword=included-password\n",
+        )?;
+        std::fs::write(
+            temporary.path().join("ignored-nested.conf"),
+            "[main]\nrpcport=19999\n",
+        )?;
+
+        let auth = RpcAuth::from_data_dir(temporary.path());
+        assert_eq!(auth.port, 8341);
+        assert_eq!(auth.user, "included-user");
+        assert_eq!(auth.password, "included-password");
         Ok(())
     }
 }

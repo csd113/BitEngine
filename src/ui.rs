@@ -23,7 +23,11 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
@@ -241,6 +245,62 @@ impl BinaryPageState {
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
+/// Owns a blocking node-shutdown worker until its process has been reaped.
+///
+/// Dropping the worker ends any extended graceful wait and joins the thread, so
+/// application exit cannot abandon a child inside a detached task.
+struct ShutdownWorker {
+    force: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ShutdownWorker {
+    fn spawn(
+        name: &str,
+        work: impl FnOnce(Arc<AtomicBool>) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let force = Arc::new(AtomicBool::new(false));
+        let worker_force = Arc::clone(&force);
+        let thread = thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || work(worker_force))?;
+        Ok(Self {
+            force,
+            thread: Some(thread),
+        })
+    }
+
+    fn request_force(&self) {
+        self.force.store(true, Ordering::Release);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn join_if_finished(&mut self) -> Option<thread::Result<()>> {
+        if !self.is_finished() {
+            return None;
+        }
+        self.thread.take().map(JoinHandle::join)
+    }
+}
+
+impl Drop for ShutdownWorker {
+    fn drop(&mut self) {
+        self.request_force();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusPollIdentity {
+    request_id: u64,
+    lifecycle_generation: u64,
+}
+
 pub struct App {
     // ── Config ───────────────────────────────────────────────────────────────
     config: Config,
@@ -253,6 +313,9 @@ pub struct App {
     // ── Process handles ───────────────────────────────────────────────────────
     bitcoin_handle: Option<ProcessHandle>,
     electrs_handle: Option<ProcessHandle>,
+    bitcoin_shutdown: Option<ShutdownWorker>,
+    electrs_shutdown: Option<ShutdownWorker>,
+    managed_rpc_port: Option<u16>,
 
     // ── Output queues (filled by background threads, drained by OutputTick) ──
     bitcoin_queue: OutputQueue,
@@ -279,6 +342,9 @@ pub struct App {
     next_path_save: u64,
     next_inventory_request: u64,
     next_build_operation: u64,
+    lifecycle_generation: u64,
+    next_status_poll: u64,
+    active_status_poll: Option<StatusPollIdentity>,
 
     /// Non-empty ⇒ display an overlay dialog with this message.
     overlay_message: Option<String>,
@@ -286,6 +352,7 @@ pub struct App {
 
 #[derive(Debug, Clone)]
 pub struct StatusPollResult {
+    identity: StatusPollIdentity,
     blockchain_info: Result<BlockchainInfo, String>,
     electrs_status: ElectrsStatus,
 }
@@ -367,6 +434,9 @@ impl App {
             electrs_data_path_edit: electrs_data_edit,
             bitcoin_handle: None,
             electrs_handle: None,
+            bitcoin_shutdown: None,
+            electrs_shutdown: None,
+            managed_rpc_port: None,
             bitcoin_queue,
             electrs_queue,
             bitcoin_lines: Vec::new(),
@@ -385,6 +455,9 @@ impl App {
             next_path_save: 1,
             next_inventory_request: 1,
             next_build_operation: 1,
+            lifecycle_generation: 1,
+            next_status_poll: 1,
+            active_status_poll: None,
             overlay_message: installation_recovery_error.map(|error| {
                 format!(
                     "BitEngine could not safely recover an interrupted binary installation. Node launch and binary inventory are blocked until this is resolved:\n\n{error}"
@@ -538,15 +611,7 @@ impl App {
                 Task::none()
             }
             Message::StatusPollReceived(result) => {
-                if let Ok(info) = result.blockchain_info {
-                    self.block_height = info.blocks;
-                    self.bitcoin_synced = info.headers > 0
-                        && info.blocks >= info.headers.saturating_sub(1)
-                        && info.verification_progress > 0.9999;
-                } else if !self.bitcoin_running {
-                    self.block_height = 0;
-                }
-                self.apply_electrs_status(result.electrs_status);
+                self.apply_status_poll(result);
                 Task::none()
             }
             Message::DismissOverlay => {
@@ -600,26 +665,7 @@ impl App {
             self.binary_page.log_lines.drain(..drain_to);
         }
 
-        if let Some(h) = &mut self.bitcoin_handle {
-            if !h.is_running() {
-                self.bitcoin_handle = None;
-                self.bitcoin_running = false;
-                self.bitcoin_synced = false;
-                self.block_height = 0;
-                self.electrs_status.synced = false;
-                push_msg(&self.bitcoin_queue, "bitcoind has stopped.");
-            }
-        }
-
-        if let Some(h) = &mut self.electrs_handle {
-            if !h.is_running() {
-                self.electrs_handle = None;
-                self.electrs_status.running = false;
-                self.electrs_status.synced = false;
-                self.electrs_status.ready = false;
-                push_msg(&self.electrs_queue, "electrs has stopped.");
-            }
-        }
+        self.reconcile_node_lifecycle();
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
         if btc_new {
@@ -660,23 +706,46 @@ impl App {
         }
     }
 
-    fn handle_rpc_tick(&self) -> Task<Message> {
-        let auth = RpcAuth::from_data_dir(&self.config.bitcoin_data_path);
+    fn handle_rpc_tick(&mut self) -> Task<Message> {
+        self.reconcile_node_lifecycle();
+        if self.active_status_poll.is_some() {
+            return Task::none();
+        }
+
+        let bitcoin_running = self.bitcoin_handle.is_some() && self.bitcoin_shutdown.is_none();
+        let electrs_running = self.electrs_handle.is_some() && self.electrs_shutdown.is_none();
+        if !bitcoin_running && !electrs_running {
+            return Task::none();
+        }
+
+        let identity = StatusPollIdentity {
+            request_id: self.next_status_poll,
+            lifecycle_generation: self.lifecycle_generation,
+        };
+        self.next_status_poll = self.next_status_poll.wrapping_add(1).max(1);
+        self.active_status_poll = Some(identity);
+
+        let auth = self.bitcoin_rpc_auth();
+        let rpc_port = auth.port;
         let config = self.config.clone();
-        let process_running = self.electrs_handle.is_some();
 
         Task::perform(
             async move {
                 let (blockchain_info, electrs_status) = tokio::join!(
                     async {
-                        rpc::get_blockchain_info(&auth)
-                            .await
-                            .map_err(|e| e.to_string())
+                        if bitcoin_running {
+                            rpc::get_blockchain_info(&auth)
+                                .await
+                                .map_err(|e| e.to_string())
+                        } else {
+                            Err("Bitcoin Core is not managed by this runner".to_owned())
+                        }
                     },
-                    electrs_status::probe(&config, process_running),
+                    electrs_status::probe(&config, electrs_running, rpc_port),
                 );
 
                 StatusPollResult {
+                    identity,
                     blockchain_info,
                     electrs_status,
                 }
@@ -685,8 +754,135 @@ impl App {
         )
     }
 
+    fn apply_status_poll(&mut self, result: StatusPollResult) {
+        self.reconcile_node_lifecycle();
+        if self.active_status_poll != Some(result.identity)
+            || self.lifecycle_generation != result.identity.lifecycle_generation
+        {
+            return;
+        }
+        self.active_status_poll = None;
+
+        if self.bitcoin_handle.is_some() && self.bitcoin_shutdown.is_none() {
+            if let Ok(info) = result.blockchain_info {
+                self.block_height = info.blocks;
+                self.bitcoin_synced = info.headers > 0
+                    && info.blocks >= info.headers.saturating_sub(1)
+                    && info.verification_progress > 0.9999;
+            } else {
+                // Readiness is a current health property. A timed-out or
+                // failed RPC check must not preserve an earlier Ready state.
+                self.bitcoin_synced = false;
+                self.block_height = 0;
+            }
+        } else {
+            self.bitcoin_synced = false;
+            self.block_height = 0;
+        }
+
+        if self.electrs_handle.is_some() && self.electrs_shutdown.is_none() {
+            let mut status = result.electrs_status;
+            // Managed running state comes from the owned child handle, never
+            // from a network probe that may observe another local service.
+            status.running = true;
+            self.apply_electrs_status(status);
+        } else {
+            self.electrs_status = ElectrsStatus::default();
+        }
+    }
+
+    fn reconcile_node_lifecycle(&mut self) {
+        let bitcoin_shutdown_finished = self
+            .bitcoin_shutdown
+            .as_mut()
+            .and_then(ShutdownWorker::join_if_finished);
+        if let Some(join_result) = bitcoin_shutdown_finished {
+            self.bitcoin_shutdown = None;
+            self.bitcoin_running = false;
+            self.bitcoin_synced = false;
+            self.block_height = 0;
+            if join_result.is_err() {
+                push_msg(
+                    &self.bitcoin_queue,
+                    "Bitcoin shutdown worker stopped unexpectedly.",
+                );
+            }
+            self.advance_lifecycle_generation();
+        }
+
+        let electrs_shutdown_finished = self
+            .electrs_shutdown
+            .as_mut()
+            .and_then(ShutdownWorker::join_if_finished);
+        if let Some(join_result) = electrs_shutdown_finished {
+            self.electrs_shutdown = None;
+            self.electrs_status = ElectrsStatus::default();
+            if join_result.is_err() {
+                push_msg(
+                    &self.electrs_queue,
+                    "Electrs shutdown worker stopped unexpectedly.",
+                );
+            }
+            self.advance_lifecycle_generation();
+        }
+
+        let bitcoin_exited = self
+            .bitcoin_handle
+            .as_mut()
+            .is_some_and(|handle| !handle.is_running());
+        if bitcoin_exited {
+            self.bitcoin_handle = None;
+            self.bitcoin_running = false;
+            self.bitcoin_synced = false;
+            self.block_height = 0;
+            self.electrs_status.synced = false;
+            self.electrs_status.bitcoin_blocks = None;
+            self.electrs_status.bitcoin_headers = None;
+            self.electrs_status.sync_percent = None;
+            push_msg(&self.bitcoin_queue, "bitcoind has stopped.");
+            self.advance_lifecycle_generation();
+        }
+
+        let electrs_exited = self
+            .electrs_handle
+            .as_mut()
+            .is_some_and(|handle| !handle.is_running());
+        if electrs_exited {
+            self.electrs_handle = None;
+            self.electrs_status = ElectrsStatus::default();
+            push_msg(&self.electrs_queue, "electrs has stopped.");
+            self.advance_lifecycle_generation();
+        }
+
+        if !self.node_lifecycle_active() {
+            self.managed_rpc_port = None;
+        }
+    }
+
+    fn advance_lifecycle_generation(&mut self) {
+        self.lifecycle_generation = self.lifecycle_generation.wrapping_add(1).max(1);
+        self.active_status_poll = None;
+    }
+
     const fn paths_are_editable(&self) -> bool {
-        self.binary_page.active_operation.is_none() && self.pending_path_save.is_none()
+        self.binary_page.active_operation.is_none()
+            && self.pending_path_save.is_none()
+            && !self.node_lifecycle_active()
+    }
+
+    const fn node_lifecycle_active(&self) -> bool {
+        self.bitcoin_handle.is_some()
+            || self.electrs_handle.is_some()
+            || self.bitcoin_shutdown.is_some()
+            || self.electrs_shutdown.is_some()
+    }
+
+    fn bitcoin_rpc_auth(&self) -> RpcAuth {
+        let mut auth = RpcAuth::from_data_dir(&self.config.bitcoin_data_path);
+        if let Some(rpc_port) = self.managed_rpc_port {
+            auth.port = rpc_port;
+        }
+        auth
     }
 
     fn invalidate_binary_inventory(&mut self) {
@@ -702,7 +898,8 @@ impl App {
     fn save_paths(&mut self) -> Task<Message> {
         if !self.paths_are_editable() {
             self.overlay_message = Some(
-                "Paths cannot be changed while a binary build or path save is active.".to_owned(),
+                "Paths cannot be changed while a node is running or a binary build or path save is active."
+                    .to_owned(),
             );
             return Task::none();
         }
@@ -762,7 +959,9 @@ impl App {
         self.pending_path_save = None;
 
         match result {
-            Ok(config) if self.binary_page.active_operation.is_none() => {
+            Ok(config)
+                if self.binary_page.active_operation.is_none() && !self.node_lifecycle_active() =>
+            {
                 self.config = config;
                 self.binaries_path_edit = self.config.binaries_path.to_string_lossy().into_owned();
                 self.bitcoin_data_path_edit =
@@ -796,7 +995,7 @@ impl App {
             }
             Ok(_) => {
                 self.overlay_message = Some(
-                    "Paths were saved but were not applied while a binary build is active."
+                    "Paths were saved but were not applied while a node or binary build is active."
                         .to_owned(),
                 );
                 Task::none()
@@ -809,33 +1008,48 @@ impl App {
     }
 
     fn launch_bitcoin(&mut self) -> Task<Message> {
+        self.reconcile_node_lifecycle();
         if self.binary_page.active_operation.is_some() {
             self.overlay_message = Some(
                 "Wait for the active binary update to finish before launching Bitcoin.".into(),
             );
             return Task::none();
         }
-        if !self.ensure_binary_installation_ready() {
+        if self.pending_path_save.is_some() {
+            self.overlay_message =
+                Some("Wait for the pending path save before launching Bitcoin.".to_owned());
             return Task::none();
         }
-        if self.bitcoin_running {
-            self.overlay_message = Some("Bitcoin is already running.".into());
+        if self.bitcoin_shutdown.is_some() {
+            self.overlay_message = Some("Bitcoin is still shutting down.".to_owned());
+            return Task::none();
+        }
+        if self.bitcoin_handle.is_some() {
+            self.overlay_message = Some("Bitcoin is already running.".to_owned());
+            return Task::none();
+        }
+        if !self.ensure_binary_installation_ready() {
             return Task::none();
         }
         if let Err(e) = rpc::ensure_bitcoin_conf(&self.config.bitcoin_data_path) {
             self.overlay_message = Some(format!("Failed to prepare Bitcoin config:\n{e}"));
             return Task::none();
         }
+        let rpc_port = self.bitcoin_rpc_auth().port;
 
         match process_manager::launch_bitcoind(
             &self.config.binaries_path,
             &self.config.bitcoin_data_path,
+            rpc_port,
             &self.bitcoin_queue,
         ) {
             Ok(handle) => {
                 self.bitcoin_handle = Some(handle);
+                self.managed_rpc_port = Some(rpc_port);
                 self.bitcoin_running = true;
                 self.bitcoin_synced = false;
+                self.block_height = 0;
+                self.advance_lifecycle_generation();
             }
             Err(e) => {
                 push_msg(&self.bitcoin_queue, &format!("Launch error: {e}"));
@@ -846,20 +1060,27 @@ impl App {
     }
 
     fn launch_electrs(&mut self) -> Task<Message> {
+        self.reconcile_node_lifecycle();
         if self.binary_page.active_operation.is_some() {
             self.overlay_message = Some(
                 "Wait for the active binary update to finish before launching electrs.".into(),
             );
             return Task::none();
         }
-        if !self.ensure_binary_installation_ready() {
+        if self.pending_path_save.is_some() {
+            self.overlay_message =
+                Some("Wait for the pending path save before launching electrs.".to_owned());
             return Task::none();
         }
-        if self.electrs_status.running {
-            self.overlay_message = Some("Electrs is already running.".into());
+        if self.electrs_shutdown.is_some() {
+            self.overlay_message = Some("Electrs is still shutting down.".to_owned());
             return Task::none();
         }
-        if !self.bitcoin_running {
+        if self.electrs_handle.is_some() {
+            self.overlay_message = Some("Electrs is already running.".to_owned());
+            return Task::none();
+        }
+        if self.bitcoin_handle.is_none() || self.bitcoin_shutdown.is_some() {
             self.overlay_message = Some(
                 "Bitcoin must be running before starting Electrs.\n\
                  Launch Bitcoin first and wait for the Running indicator."
@@ -867,12 +1088,23 @@ impl App {
             );
             return Task::none();
         }
+        if !self.ensure_binary_installation_ready() {
+            return Task::none();
+        }
+        let Some(rpc_port) = self.managed_rpc_port else {
+            self.overlay_message = Some(
+                "Bitcoin supervision state is incomplete; restart Bitcoin before launching electrs."
+                    .to_owned(),
+            );
+            return Task::none();
+        };
 
         match process_manager::launch_electrs(
             &self.config.binaries_path,
             &self.config.bitcoin_data_path,
             &self.config.electrs_data_path,
             Config::electrum_addr(),
+            rpc_port,
             &self.electrs_queue,
         ) {
             Ok(handle) => {
@@ -881,6 +1113,7 @@ impl App {
                     running: true,
                     ..ElectrsStatus::default()
                 };
+                self.advance_lifecycle_generation();
             }
             Err(e) => {
                 push_msg(&self.electrs_queue, &format!("Launch error: {e}"));
@@ -891,45 +1124,68 @@ impl App {
     }
 
     fn shutdown_both(&mut self) -> Task<Message> {
+        self.reconcile_node_lifecycle();
         self.terminate_electrs_internal();
 
-        if self.bitcoin_running {
-            let auth = RpcAuth::from_data_dir(&self.config.bitcoin_data_path);
+        if self.bitcoin_shutdown.is_none() {
+            let auth = self.bitcoin_rpc_auth();
             let btc_q = Arc::clone(&self.bitcoin_queue);
-            push_msg(&btc_q, "Sending stop via RPC…");
-
             if let Some(mut handle) = self.bitcoin_handle.take() {
-                self.bitcoin_running = false;
+                push_msg(&btc_q, "Sending stop via RPC…");
+                self.bitcoin_running = true;
                 self.bitcoin_synced = false;
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Handle::try_current();
-                    let stopped_via_rpc = rt.map_or_else(
-                        |_| {
-                            tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .is_ok_and(|r| r.block_on(rpc::stop_bitcoind(&auth)).is_ok())
-                        },
-                        |rt| rt.block_on(rpc::stop_bitcoind(&auth)).is_ok(),
-                    );
+                self.block_height = 0;
+                self.advance_lifecycle_generation();
+                match ShutdownWorker::spawn("bitengine-bitcoin-shutdown", move |force| {
+                    let stopped_via_rpc = if force.load(Ordering::Acquire) {
+                        false
+                    } else {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .is_ok_and(|runtime| {
+                                runtime.block_on(async {
+                                    tokio::select! {
+                                        result = rpc::stop_bitcoind(&auth) => result.is_ok(),
+                                        () = wait_for_shutdown_force(&force) => false,
+                                    }
+                                })
+                            })
+                    };
+
                     if stopped_via_rpc {
                         let deadline =
                             std::time::Instant::now() + std::time::Duration::from_secs(60);
-                        loop {
-                            if std::time::Instant::now() >= deadline {
-                                handle.terminate();
+                        while handle.is_running() {
+                            if force.load(Ordering::Acquire)
+                                || std::time::Instant::now() >= deadline
+                            {
+                                handle.force_terminate();
                                 break;
                             }
-                            if !handle.is_running() {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            std::thread::sleep(std::time::Duration::from_millis(200));
                         }
                     } else {
-                        handle.terminate();
+                        handle.terminate_interruptibly(&force);
                     }
                     push_msg(&btc_q, "bitcoind stopped.");
-                });
+                }) {
+                    Ok(worker) => self.bitcoin_shutdown = Some(worker),
+                    Err(error) => {
+                        self.bitcoin_running = false;
+                        self.bitcoin_synced = false;
+                        self.block_height = 0;
+                        push_msg(
+                            &self.bitcoin_queue,
+                            &format!("Could not start Bitcoin shutdown worker: {error}"),
+                        );
+                        self.advance_lifecycle_generation();
+                    }
+                }
+            } else {
+                self.bitcoin_running = false;
+                self.bitcoin_synced = false;
+                self.block_height = 0;
             }
         }
 
@@ -1158,15 +1414,34 @@ impl App {
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn terminate_electrs_internal(&mut self) {
+        if self.electrs_shutdown.is_some() {
+            return;
+        }
         if let Some(mut handle) = self.electrs_handle.take() {
             push_msg(&self.electrs_queue, "Terminating electrs…");
             let els_q = Arc::clone(&self.electrs_queue);
-            std::thread::spawn(move || {
-                handle.terminate();
+            self.electrs_status = ElectrsStatus {
+                running: true,
+                ..ElectrsStatus::default()
+            };
+            self.advance_lifecycle_generation();
+            match ShutdownWorker::spawn("bitengine-electrs-shutdown", move |force| {
+                handle.terminate_interruptibly(&force);
                 push_msg(&els_q, "electrs stopped.");
-            });
+            }) {
+                Ok(worker) => self.electrs_shutdown = Some(worker),
+                Err(error) => {
+                    self.electrs_status = ElectrsStatus::default();
+                    push_msg(
+                        &self.electrs_queue,
+                        &format!("Could not start Electrs shutdown worker: {error}"),
+                    );
+                    self.advance_lifecycle_generation();
+                }
+            }
+        } else {
+            self.electrs_status = ElectrsStatus::default();
         }
-        self.electrs_status = ElectrsStatus::default();
     }
 
     fn apply_electrs_status(&mut self, mut next_status: ElectrsStatus) {
@@ -1247,7 +1522,36 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // Wake both shutdown workers before waiting on any one resource so
+        // their graceful waits are shortened concurrently during app exit.
+        if let Some(worker) = &self.bitcoin_shutdown {
+            worker.request_force();
+        }
+        if let Some(worker) = &self.electrs_shutdown {
+            worker.request_force();
+        }
+
+        if let Some(mut handle) = self.electrs_handle.take() {
+            handle.force_terminate();
+        }
+        if let Some(mut handle) = self.bitcoin_handle.take() {
+            handle.force_terminate();
+        }
+
+        drop(self.electrs_shutdown.take());
+        drop(self.bitcoin_shutdown.take());
+    }
+}
+
 // ── Async helpers ─────────────────────────────────────────────────────────────
+
+async fn wait_for_shutdown_force(force: &AtomicBool) {
+    while !force.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
 
 async fn browse_folder(title: &str) -> Option<String> {
     rfd::AsyncFileDialog::new()
@@ -1291,6 +1595,9 @@ mod tests {
     use super::*;
     use anyhow::Context as _;
 
+    #[cfg(unix)]
+    use std::{os::unix::fs::PermissionsExt as _, sync::atomic::AtomicUsize, time::Instant};
+
     fn test_app(root: &Path) -> App {
         App::from_config(Config::defaults(root), None, root.join("build-state.json"))
     }
@@ -1308,6 +1615,78 @@ mod tests {
             bitcoin_data_path: root.join("BitcoinChain"),
             electrs_data_path: root.join("ElectrsDB"),
         }
+    }
+
+    #[cfg(unix)]
+    fn install_node_helper(root: &Path, name: &str, pid_log: &Path) -> anyhow::Result<()> {
+        let binaries = root.join("Binaries");
+        std::fs::create_dir_all(&binaries)?;
+        let quoted_log = format!("'{}'", pid_log.to_string_lossy().replace('\'', "'\"'\"'"));
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {quoted_log}\n\
+             trap 'exit 0' TERM INT\n\
+             while :; do sleep 1; done\n"
+        );
+        let executable = binaries.join(name);
+        std::fs::write(&executable, script)?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn install_stubborn_node_helper(root: &Path, name: &str, pid_log: &Path) -> anyhow::Result<()> {
+        let binaries = root.join("Binaries");
+        std::fs::create_dir_all(&binaries)?;
+        let quoted_log = format!("'{}'", pid_log.to_string_lossy().replace('\'', "'\"'\"'"));
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> {quoted_log}\n\
+             trap '' TERM INT\n\
+             while :; do sleep 1; done\n"
+        );
+        let executable = binaries.join(name);
+        std::fs::write(&executable, script)?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pids(pid_log: &Path, count: usize) -> anyhow::Result<Vec<i32>> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(pid_log) {
+                let pids = contents
+                    .lines()
+                    .filter_map(|line| line.parse::<i32>().ok())
+                    .collect::<Vec<_>>();
+                if pids.len() >= count {
+                    return Ok(pids);
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("node helper did not report {count} process IDs");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_exists(process_id: i32) -> bool {
+        // SAFETY: signal zero only queries a PID emitted by a helper process
+        // created and owned by this test.
+        let result = unsafe { libc::kill(process_id, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(unix)]
+    fn assert_process_exits(process_id: i32) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_exists(process_id) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_exists(process_id),
+            "node helper {process_id} was left running"
+        );
     }
 
     #[test]
@@ -1496,6 +1875,23 @@ mod tests {
         assert!(app
             .binary_page
             .error
+            .as_deref()
+            .is_some_and(|message| message.contains("pending path save")));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_path_save_blocks_node_launch() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        app.pending_path_save = Some(4);
+
+        drop(app.launch_bitcoin());
+
+        assert!(app.bitcoin_handle.is_none());
+        assert!(!app.bitcoin_running);
+        assert!(app
+            .overlay_message
             .as_deref()
             .is_some_and(|message| message.contains("pending path save")));
         Ok(())
@@ -1791,6 +2187,315 @@ mod tests {
             }),
             Err(mpsc::error::TrySendError::Full(_))
         ));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_prelaunch_poll_cannot_clear_a_new_electrs_generation() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+
+        let stale_identity = StatusPollIdentity {
+            request_id: 17,
+            lifecycle_generation: app.lifecycle_generation,
+        };
+        app.active_status_poll = Some(stale_identity);
+        drop(app.launch_electrs());
+        let _ = wait_for_pids(&electrs_pid_log, 1)?;
+
+        app.apply_status_poll(StatusPollResult {
+            identity: stale_identity,
+            blockchain_info: Err("stale poll".to_owned()),
+            electrs_status: ElectrsStatus::default(),
+        });
+
+        assert!(app.electrs_handle.is_some());
+        assert!(app.electrs_status.running);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn occupied_electrs_handle_blocks_duplicate_launch_despite_stale_status() -> anyhow::Result<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        drop(app.launch_electrs());
+        let pids = wait_for_pids(&electrs_pid_log, 1)?;
+
+        app.electrs_status = ElectrsStatus::default();
+        drop(app.launch_electrs());
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(wait_for_pids(&electrs_pid_log, 1)?.len(), 1);
+        assert_eq!(pids.len(), 1);
+        assert!(app
+            .overlay_message
+            .as_deref()
+            .is_some_and(|message| message.contains("already running")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unexpected_electrs_exit_resets_all_runtime_status() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        drop(app.launch_electrs());
+        let process_id = wait_for_pids(&electrs_pid_log, 1)?[0];
+        app.electrs_status = ElectrsStatus {
+            running: true,
+            synced: true,
+            ready: true,
+            electrs_height: Some(100),
+            bitcoin_blocks: Some(100),
+            bitcoin_headers: Some(100),
+            sync_percent: Some(100.0),
+            metrics_error: Some("stale metrics".to_owned()),
+            bitcoin_error: Some("stale Bitcoin".to_owned()),
+            connect_error: Some("stale connection".to_owned()),
+        };
+
+        // SAFETY: the PID belongs to the helper process launched above.
+        assert_eq!(unsafe { libc::kill(process_id, libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.electrs_handle.is_some() && Instant::now() < deadline {
+            app.reconcile_node_lifecycle();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(app.electrs_handle.is_none());
+        assert_eq!(app.electrs_status, ElectrsStatus::default());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_failure_clears_readiness_for_the_current_bitcoin_process() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        app.bitcoin_synced = true;
+        app.block_height = 100;
+        let identity = StatusPollIdentity {
+            request_id: 23,
+            lifecycle_generation: app.lifecycle_generation,
+        };
+        app.active_status_poll = Some(identity);
+
+        app.apply_status_poll(StatusPollResult {
+            identity,
+            blockchain_info: Err("RPC timed out".to_owned()),
+            electrs_status: ElectrsStatus::default(),
+        });
+
+        assert!(!app.bitcoin_synced);
+        assert_eq!(app.block_height, 0);
+        assert!(app.bitcoin_running);
+        Ok(())
+    }
+
+    #[test]
+    fn successful_poll_without_an_owned_process_cannot_create_readiness() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        let identity = StatusPollIdentity {
+            request_id: 29,
+            lifecycle_generation: app.lifecycle_generation,
+        };
+        app.active_status_poll = Some(identity);
+
+        app.apply_status_poll(StatusPollResult {
+            identity,
+            blockchain_info: Ok(BlockchainInfo {
+                blocks: 100,
+                headers: 100,
+                verification_progress: 1.0,
+            }),
+            electrs_status: ElectrsStatus {
+                running: true,
+                ready: true,
+                ..ElectrsStatus::default()
+            },
+        });
+
+        assert!(!app.bitcoin_running);
+        assert!(!app.bitcoin_synced);
+        assert_eq!(app.block_height, 0);
+        assert_eq!(app.electrs_status, ElectrsStatus::default());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_node_locks_path_mutation_and_activation() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        let original_config = app.config.binaries_path.clone();
+
+        assert!(!app.paths_are_editable());
+        drop(app.save_paths());
+        assert!(app
+            .overlay_message
+            .as_deref()
+            .is_some_and(|message| message.contains("node is running")));
+
+        app.pending_path_save = Some(31);
+        drop(app.apply_paths_saved(31, Ok(alternate_config(temporary.path()))));
+        assert_eq!(app.config.binaries_path, original_config);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_lifecycle_retains_the_bitcoin_rpc_port_snapshot() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let bitcoin_data = temporary.path().join("BitcoinChain");
+        std::fs::create_dir(&bitcoin_data)?;
+        std::fs::write(bitcoin_data.join("bitcoin.conf"), "rpcport=18443\n")?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        assert_eq!(app.managed_rpc_port, Some(18_443));
+
+        std::fs::write(bitcoin_data.join("bitcoin.conf"), "rpcport=19999\n")?;
+
+        assert_eq!(app.bitcoin_rpc_auth().port, 18_443);
+        drop(app.launch_electrs());
+        let _ = wait_for_pids(&electrs_pid_log, 1)?;
+        assert!(app
+            .electrs_queue
+            .lock()
+            .is_ok_and(|lines| lines.iter().any(|line| line.contains("127.0.0.1:18443"))));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_app_terminates_its_managed_node() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let process_id = wait_for_pids(&bitcoin_pid_log, 1)?[0];
+
+        drop(app);
+
+        assert_process_exits(process_id);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_app_force_terminates_two_unresponsive_nodes_within_a_tight_bound(
+    ) -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_stubborn_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_stubborn_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let bitcoin_process_id = wait_for_pids(&bitcoin_pid_log, 1)?[0];
+        drop(app.launch_electrs());
+        let electrs_process_id = wait_for_pids(&electrs_pid_log, 1)?[0];
+        let started = Instant::now();
+
+        drop(app);
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_process_exits(bitcoin_process_id);
+        assert_process_exits(electrs_process_id);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_app_interrupts_shutdown_workers_and_clears_runtime_state() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_stubborn_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_stubborn_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let bitcoin_process_id = wait_for_pids(&bitcoin_pid_log, 1)?[0];
+        drop(app.launch_electrs());
+        let electrs_process_id = wait_for_pids(&electrs_pid_log, 1)?[0];
+        app.bitcoin_synced = true;
+        app.block_height = 123;
+
+        drop(app.shutdown_both());
+
+        assert!(app.bitcoin_shutdown.is_some());
+        assert!(app.electrs_shutdown.is_some());
+        assert!(!app.bitcoin_synced);
+        assert_eq!(app.block_height, 0);
+        let started = Instant::now();
+        drop(app);
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_process_exits(bitcoin_process_id);
+        assert_process_exits(electrs_process_id);
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_app_forces_and_joins_shutdown_workers() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let completed = Arc::new(AtomicUsize::new(0));
+        let worker_completed = Arc::clone(&completed);
+        let mut app = test_app(temporary.path());
+        app.bitcoin_shutdown = Some(ShutdownWorker::spawn(
+            "bitengine-test-shutdown",
+            move |force| {
+                while !force.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                worker_completed.store(1, Ordering::Release);
+            },
+        )?);
+
+        drop(app.launch_bitcoin());
+        assert!(app
+            .overlay_message
+            .as_deref()
+            .is_some_and(|message| message.contains("still shutting down")));
+
+        drop(app);
+
+        assert_eq!(completed.load(Ordering::Acquire), 1);
         Ok(())
     }
 }

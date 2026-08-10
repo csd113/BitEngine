@@ -23,12 +23,17 @@ pub struct ElectrsStatus {
     pub connect_error: Option<String>,
 }
 
-pub async fn probe(config: &Config, process_running: bool) -> ElectrsStatus {
+pub async fn probe(
+    config: &Config,
+    process_running: bool,
+    managed_bitcoin_rpc_port: u16,
+) -> ElectrsStatus {
     if !process_running {
         return ElectrsStatus::default();
     }
 
-    let auth = RpcAuth::from_data_dir(&config.bitcoin_data_path);
+    let mut auth = RpcAuth::from_data_dir(&config.bitcoin_data_path);
+    auth.port = managed_bitcoin_rpc_port;
     let metrics_url = Config::electrs_metrics_url();
     let electrum_addr = Config::electrum_addr().to_owned();
 
@@ -334,7 +339,7 @@ electrs_index_height{type=\"tip\"} 856201\n";
             electrs_data_path: PathBuf::from("/missing/electrs"),
         };
 
-        let status = probe(&config, false).await;
+        let status = probe(&config, false, 8332).await;
 
         assert_eq!(status, ElectrsStatus::default());
     }
