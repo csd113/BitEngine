@@ -802,6 +802,8 @@ impl App {
                 status.connected = false;
                 status.synced = false;
                 status.ready = false;
+                status.bitcoin_error = Some(self.electrs_blocked_error());
+                status.connect_error = None;
             }
             self.apply_electrs_status(status);
         } else {
@@ -929,6 +931,28 @@ impl App {
             .as_deref()
             .or(self.bitcoin_rpc_error.as_deref())
             .or(self.bitcoin_p2p_error.as_deref())
+    }
+
+    fn electrs_blocked_error(&self) -> String {
+        let (readiness, error) = self
+            .bitcoin_compatibility_error
+            .as_deref()
+            .map(|error| ("compatibility readiness", error))
+            .or_else(|| {
+                self.bitcoin_rpc_error
+                    .as_deref()
+                    .map(|error| ("RPC readiness", error))
+            })
+            .or_else(|| {
+                self.bitcoin_p2p_error
+                    .as_deref()
+                    .map(|error| ("P2P readiness", error))
+            })
+            .unwrap_or((
+                "RPC/P2P readiness",
+                "readiness has not yet been confirmed for this managed generation",
+            ));
+        format!("Electrs is blocked by Bitcoin {readiness}: {error}")
     }
 
     fn reconcile_node_lifecycle(&mut self) {
@@ -1354,7 +1378,7 @@ impl App {
 
                     if stopped_via_rpc {
                         let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(60);
+                            std::time::Instant::now() + std::time::Duration::from_mins(1);
                         while handle.is_running() {
                             if force.load(Ordering::Acquire)
                                 || std::time::Instant::now() >= deadline
@@ -2800,6 +2824,37 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn transient_p2p_startup_failure_recovers_on_a_later_status_poll() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        let endpoint = SocketAddr::from(([127, 0, 0, 1], 8333));
+        let mut startup = healthy_bitcoin_probe(blockchain_info(100, 100, false, false));
+        startup.p2p_result = Err(format!(
+            "no configured Bitcoin P2P endpoint completed a mainnet handshake: {endpoint} — TCP connection refused"
+        ));
+
+        app.apply_bitcoin_probe(startup);
+        assert!(!app.bitcoin_p2p_reachable);
+        assert!(app
+            .bitcoin_p2p_error
+            .as_deref()
+            .is_some_and(|error| error.contains("TCP connection refused")));
+
+        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+            100, 100, false, false,
+        )));
+        assert!(app.bitcoin_p2p_reachable);
+        assert!(app.bitcoin_p2p_error.is_none());
+        assert_eq!(app.active_p2p_addr, Some(endpoint));
+        assert!(app.bitcoin_queue.lock().is_ok_and(|lines| {
+            lines
+                .iter()
+                .any(|line| line.contains("P2P readiness check recovered"))
+        }));
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn dependency_failure_is_reported_and_a_current_generation_recovery_clears_it(
@@ -2831,8 +2886,12 @@ mod tests {
         assert!(!app.bitcoin_ready());
         assert!(!app.electrs_status.connected);
         assert!(!app.electrs_status.ready);
-        assert!(app.electrs_status.bitcoin_error.is_some());
-        assert!(app.electrs_status.connect_error.is_some());
+        assert!(app
+            .electrs_status
+            .bitcoin_error
+            .as_deref()
+            .is_some_and(|error| error.contains("blocked by Bitcoin RPC readiness")));
+        assert!(app.electrs_status.connect_error.is_none());
         assert!(app.electrs_queue.lock().is_ok_and(|lines| {
             lines
                 .iter()
@@ -2853,7 +2912,7 @@ mod tests {
         assert!(app.electrs_queue.lock().is_ok_and(|lines| {
             lines
                 .iter()
-                .any(|line| line.contains("connectivity check recovered"))
+                .any(|line| line.contains("Bitcoin check recovered"))
                 && lines
                     .iter()
                     .any(|line| line.contains("ready to serve BitEngine clients"))

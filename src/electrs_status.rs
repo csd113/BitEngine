@@ -405,8 +405,9 @@ fn is_unavailable_index_error(error: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
+    use anyhow::Context as _;
     use serde_json::{json, Value};
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -816,5 +817,24 @@ electrs_index_height{type=\"tip\"} 856201\n";
         let status = probe(false, None).await;
 
         assert_eq!(status, ElectrsStatus::default());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires running managed Core/electrs and BITENGINE_LIVE_COOKIE_FILE"]
+    async fn live_managed_electrs_reports_protocol_and_sync_readiness() -> anyhow::Result<()> {
+        let cookie_file = std::env::var_os("BITENGINE_LIVE_COOKIE_FILE")
+            .map(PathBuf::from)
+            .context("set BITENGINE_LIVE_COOKIE_FILE to Core's cookie path")?;
+        let rpc_addr = SocketAddr::from(([127, 0, 0, 1], 8332));
+
+        let status = probe(true, Some((cookie_file, rpc_addr))).await;
+
+        assert!(status.running, "{status:?}");
+        assert!(status.connected, "{status:?}");
+        assert!(status.ready, "{status:?}");
+        assert!(status.synced, "{status:?}");
+        assert_eq!(status.electrs_height, status.bitcoin_blocks);
+        assert_eq!(status.bitcoin_blocks, status.bitcoin_headers);
+        Ok(())
     }
 }
