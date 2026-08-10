@@ -22,6 +22,7 @@
 //! This keeps the UI thread non-blocking at all times.
 
 use std::{
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -47,11 +48,13 @@ use crate::{
         BuildRequest, BuildService, BuildStage, BuildSummary, InstalledVersions, PersistedBuild,
         PersistedBuildStatus, ReleaseVersion,
     },
+    bitcoin_config::{resolve_managed_endpoints, ManagedBitcoinEndpoints},
+    bitcoin_status,
     config::Config,
     electrs_status::{self, ElectrsStatus},
     platform::{self, Platform},
-    process_manager::{self, new_queue, OutputQueue, ProcessHandle},
-    rpc::{self, BlockchainInfo, RpcAuth},
+    process_manager::{self, new_queue, ElectrsBitcoinConnection, OutputQueue, ProcessHandle},
+    rpc::{self, BlockchainInfo, NetworkInfo, RpcAuth},
 };
 
 const BUILD_EVENT_QUEUE_CAPACITY: usize = 256;
@@ -301,6 +304,10 @@ struct StatusPollIdentity {
     lifecycle_generation: u64,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "UI process, synchronization, and independent RPC/P2P readiness facts must remain separately observable"
+)]
 pub struct App {
     // ── Config ───────────────────────────────────────────────────────────────
     config: Config,
@@ -315,7 +322,9 @@ pub struct App {
     electrs_handle: Option<ProcessHandle>,
     bitcoin_shutdown: Option<ShutdownWorker>,
     electrs_shutdown: Option<ShutdownWorker>,
-    managed_rpc_port: Option<u16>,
+    managed_endpoints: Option<ManagedBitcoinEndpoints>,
+    active_rpc_addr: Option<SocketAddr>,
+    active_p2p_addr: Option<SocketAddr>,
 
     // ── Output queues (filled by background threads, drained by OutputTick) ──
     bitcoin_queue: OutputQueue,
@@ -328,6 +337,11 @@ pub struct App {
     // ── Node status ───────────────────────────────────────────────────────────
     bitcoin_running: bool,
     bitcoin_synced: bool,
+    bitcoin_rpc_reachable: bool,
+    bitcoin_p2p_reachable: bool,
+    bitcoin_rpc_error: Option<String>,
+    bitcoin_p2p_error: Option<String>,
+    bitcoin_compatibility_error: Option<String>,
     electrs_status: ElectrsStatus,
     block_height: u64,
 
@@ -353,8 +367,16 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub struct StatusPollResult {
     identity: StatusPollIdentity,
-    blockchain_info: Result<BlockchainInfo, String>,
+    bitcoin_probe: BitcoinProbeResult,
     electrs_status: ElectrsStatus,
+}
+
+#[derive(Debug, Clone)]
+struct BitcoinProbeResult {
+    blockchain_info: Result<BlockchainInfo, String>,
+    network_info: Result<NetworkInfo, String>,
+    rpc_addr: Option<SocketAddr>,
+    p2p_result: Result<SocketAddr, String>,
 }
 
 impl App {
@@ -436,13 +458,20 @@ impl App {
             electrs_handle: None,
             bitcoin_shutdown: None,
             electrs_shutdown: None,
-            managed_rpc_port: None,
+            managed_endpoints: None,
+            active_rpc_addr: None,
+            active_p2p_addr: None,
             bitcoin_queue,
             electrs_queue,
             bitcoin_lines: Vec::new(),
             electrs_lines: Vec::new(),
             bitcoin_running: false,
             bitcoin_synced: false,
+            bitcoin_rpc_reachable: false,
+            bitcoin_p2p_reachable: false,
+            bitcoin_rpc_error: None,
+            bitcoin_p2p_error: None,
+            bitcoin_compatibility_error: None,
             electrs_status: ElectrsStatus::default(),
             block_height: 0,
             page: Page::Dashboard,
@@ -725,28 +754,23 @@ impl App {
         self.next_status_poll = self.next_status_poll.wrapping_add(1).max(1);
         self.active_status_poll = Some(identity);
 
-        let auth = self.bitcoin_rpc_auth();
-        let rpc_port = auth.port;
-        let config = self.config.clone();
+        let endpoints = self.managed_endpoints.clone();
+        let managed_bitcoin_rpc = endpoints.as_ref().and_then(|snapshot| {
+            self.active_rpc_addr
+                .or_else(|| snapshot.rpc_candidates.first().copied())
+                .map(|endpoint| (snapshot.cookie_file.clone(), endpoint))
+        });
 
         Task::perform(
             async move {
-                let (blockchain_info, electrs_status) = tokio::join!(
-                    async {
-                        if bitcoin_running {
-                            rpc::get_blockchain_info(&auth)
-                                .await
-                                .map_err(|e| e.to_string())
-                        } else {
-                            Err("Bitcoin Core is not managed by this runner".to_owned())
-                        }
-                    },
-                    electrs_status::probe(&config, electrs_running, rpc_port),
+                let (bitcoin_probe, electrs_status) = tokio::join!(
+                    probe_managed_bitcoin(endpoints.as_ref(), bitcoin_running),
+                    electrs_status::probe(electrs_running, managed_bitcoin_rpc),
                 );
 
                 StatusPollResult {
                     identity,
-                    blockchain_info,
+                    bitcoin_probe,
                     electrs_status,
                 }
             },
@@ -764,20 +788,9 @@ impl App {
         self.active_status_poll = None;
 
         if self.bitcoin_handle.is_some() && self.bitcoin_shutdown.is_none() {
-            if let Ok(info) = result.blockchain_info {
-                self.block_height = info.blocks;
-                self.bitcoin_synced = info.headers > 0
-                    && info.blocks >= info.headers.saturating_sub(1)
-                    && info.verification_progress > 0.9999;
-            } else {
-                // Readiness is a current health property. A timed-out or
-                // failed RPC check must not preserve an earlier Ready state.
-                self.bitcoin_synced = false;
-                self.block_height = 0;
-            }
+            self.apply_bitcoin_probe(result.bitcoin_probe);
         } else {
-            self.bitcoin_synced = false;
-            self.block_height = 0;
+            self.reset_bitcoin_service_status();
         }
 
         if self.electrs_handle.is_some() && self.electrs_shutdown.is_none() {
@@ -785,10 +798,137 @@ impl App {
             // Managed running state comes from the owned child handle, never
             // from a network probe that may observe another local service.
             status.running = true;
+            if !self.bitcoin_ready() {
+                status.connected = false;
+                status.synced = false;
+                status.ready = false;
+            }
             self.apply_electrs_status(status);
         } else {
             self.electrs_status = ElectrsStatus::default();
         }
+    }
+
+    fn apply_bitcoin_probe(&mut self, probe: BitcoinProbeResult) {
+        let previous_rpc_error = self.bitcoin_rpc_error.clone();
+        let previous_p2p_error = self.bitcoin_p2p_error.clone();
+        let previous_compatibility_error = self.bitcoin_compatibility_error.clone();
+
+        self.bitcoin_rpc_reachable = probe.blockchain_info.is_ok() && probe.network_info.is_ok();
+        self.bitcoin_rpc_error = match (&probe.blockchain_info, &probe.network_info) {
+            (Ok(_), Ok(_)) => None,
+            (Err(blockchain), Ok(_)) => Some(format!(
+                "getblockchaininfo failed at the managed RPC endpoint: {blockchain}"
+            )),
+            (Ok(_), Err(network)) => Some(format!(
+                "getnetworkinfo failed at the managed RPC endpoint: {network}"
+            )),
+            (Err(blockchain), Err(network)) if blockchain == network => Some(blockchain.clone()),
+            (Err(blockchain), Err(network)) => Some(format!(
+                "getblockchaininfo failed: {blockchain}; getnetworkinfo failed: {network}"
+            )),
+        };
+        if let Some(endpoint) = probe.rpc_addr {
+            self.active_rpc_addr = Some(endpoint);
+        }
+
+        if let Ok(info) = probe.blockchain_info {
+            self.block_height = info.blocks;
+            self.bitcoin_synced = !info.initial_block_download && info.blocks >= info.headers;
+            self.bitcoin_compatibility_error = info.pruned.then(|| {
+                "Bitcoin Core pruning is enabled, but managed Electrs requires prune=0. Disable pruning and rebuild the full chain data before launching again."
+                    .to_owned()
+            });
+        } else {
+            self.bitcoin_synced = false;
+            self.block_height = 0;
+            self.bitcoin_compatibility_error = None;
+        }
+
+        if let Ok(network) = probe.network_info {
+            self.bitcoin_compatibility_error = self.bitcoin_compatibility_error.take().or_else(|| {
+                (!network.network_active).then(|| {
+                    "Bitcoin Core P2P networking is inactive. Remove networkactive=0 or call setnetworkactive true before launching Electrs."
+                        .to_owned()
+                })
+            }).or_else(|| {
+                (network.version < 210_000).then(|| {
+                    format!(
+                        "Bitcoin Core version {} is too old; managed Electrs requires Bitcoin Core 0.21 or newer.",
+                        network.version
+                    )
+                })
+            });
+        }
+
+        match probe.p2p_result {
+            Ok(endpoint) => {
+                self.bitcoin_p2p_reachable = true;
+                self.bitcoin_p2p_error = None;
+                self.active_p2p_addr = Some(endpoint);
+            }
+            Err(error) => {
+                self.bitcoin_p2p_reachable = false;
+                self.bitcoin_p2p_error = Some(error);
+            }
+        }
+
+        for (previous, current, label) in [
+            (
+                previous_rpc_error.as_deref(),
+                self.bitcoin_rpc_error.as_deref(),
+                "RPC readiness",
+            ),
+            (
+                previous_p2p_error.as_deref(),
+                self.bitcoin_p2p_error.as_deref(),
+                "P2P readiness",
+            ),
+            (
+                previous_compatibility_error.as_deref(),
+                self.bitcoin_compatibility_error.as_deref(),
+                "Electrs compatibility",
+            ),
+        ] {
+            if previous != current {
+                if let Some(error) = current {
+                    push_msg(
+                        &self.bitcoin_queue,
+                        &format!("Bitcoin {label} check failed: {error}"),
+                    );
+                } else if previous.is_some() {
+                    push_msg(
+                        &self.bitcoin_queue,
+                        &format!("Bitcoin {label} check recovered."),
+                    );
+                }
+            }
+        }
+    }
+
+    fn reset_bitcoin_service_status(&mut self) {
+        self.bitcoin_synced = false;
+        self.bitcoin_rpc_reachable = false;
+        self.bitcoin_p2p_reachable = false;
+        self.bitcoin_rpc_error = None;
+        self.bitcoin_p2p_error = None;
+        self.bitcoin_compatibility_error = None;
+        self.block_height = 0;
+    }
+
+    const fn bitcoin_ready(&self) -> bool {
+        self.bitcoin_handle.is_some()
+            && self.bitcoin_shutdown.is_none()
+            && self.bitcoin_rpc_reachable
+            && self.bitcoin_p2p_reachable
+            && self.bitcoin_compatibility_error.is_none()
+    }
+
+    fn bitcoin_dependency_error(&self) -> Option<&str> {
+        self.bitcoin_compatibility_error
+            .as_deref()
+            .or(self.bitcoin_rpc_error.as_deref())
+            .or(self.bitcoin_p2p_error.as_deref())
     }
 
     fn reconcile_node_lifecycle(&mut self) {
@@ -799,8 +939,10 @@ impl App {
         if let Some(join_result) = bitcoin_shutdown_finished {
             self.bitcoin_shutdown = None;
             self.bitcoin_running = false;
-            self.bitcoin_synced = false;
-            self.block_height = 0;
+            self.reset_bitcoin_service_status();
+            self.invalidate_electrs_dependency(
+                "Bitcoin Core stopped; Electrs is no longer connected to its managed dependency.",
+            );
             if join_result.is_err() {
                 push_msg(
                     &self.bitcoin_queue,
@@ -833,12 +975,10 @@ impl App {
         if bitcoin_exited {
             self.bitcoin_handle = None;
             self.bitcoin_running = false;
-            self.bitcoin_synced = false;
-            self.block_height = 0;
-            self.electrs_status.synced = false;
-            self.electrs_status.bitcoin_blocks = None;
-            self.electrs_status.bitcoin_headers = None;
-            self.electrs_status.sync_percent = None;
+            self.reset_bitcoin_service_status();
+            self.invalidate_electrs_dependency(
+                "Bitcoin Core exited; stop Electrs before starting a new Bitcoin generation.",
+            );
             push_msg(&self.bitcoin_queue, "bitcoind has stopped.");
             self.advance_lifecycle_generation();
         }
@@ -855,8 +995,24 @@ impl App {
         }
 
         if !self.node_lifecycle_active() {
-            self.managed_rpc_port = None;
+            self.managed_endpoints = None;
+            self.active_rpc_addr = None;
+            self.active_p2p_addr = None;
         }
+    }
+
+    fn invalidate_electrs_dependency(&mut self, error: &str) {
+        if self.electrs_handle.is_none() && self.electrs_shutdown.is_none() {
+            return;
+        }
+        self.electrs_status.synced = false;
+        self.electrs_status.connected = false;
+        self.electrs_status.ready = false;
+        self.electrs_status.bitcoin_blocks = None;
+        self.electrs_status.bitcoin_headers = None;
+        self.electrs_status.sync_percent = None;
+        self.electrs_status.bitcoin_error = Some(error.to_owned());
+        push_msg(&self.electrs_queue, error);
     }
 
     fn advance_lifecycle_generation(&mut self) {
@@ -877,12 +1033,17 @@ impl App {
             || self.electrs_shutdown.is_some()
     }
 
-    fn bitcoin_rpc_auth(&self) -> RpcAuth {
-        let mut auth = RpcAuth::from_data_dir(&self.config.bitcoin_data_path);
-        if let Some(rpc_port) = self.managed_rpc_port {
-            auth.port = rpc_port;
-        }
-        auth
+    fn bitcoin_rpc_auth(&self) -> Result<RpcAuth, String> {
+        let endpoints = self
+            .managed_endpoints
+            .as_ref()
+            .ok_or_else(|| "managed Bitcoin endpoint snapshot is missing".to_owned())?;
+        let endpoint = self
+            .active_rpc_addr
+            .or_else(|| endpoints.rpc_candidates.first().copied())
+            .ok_or_else(|| "managed Bitcoin RPC endpoint is missing".to_owned())?;
+        RpcAuth::from_managed_cookie(&endpoints.cookie_file, endpoint)
+            .map_err(|error| error.to_string())
     }
 
     fn invalidate_binary_inventory(&mut self) {
@@ -1028,6 +1189,13 @@ impl App {
             self.overlay_message = Some("Bitcoin is already running.".to_owned());
             return Task::none();
         }
+        if self.electrs_handle.is_some() || self.electrs_shutdown.is_some() {
+            self.overlay_message = Some(
+                "Electrs still belongs to the previous Bitcoin generation. Stop Electrs before launching Bitcoin again."
+                    .to_owned(),
+            );
+            return Task::none();
+        }
         if !self.ensure_binary_installation_ready() {
             return Task::none();
         }
@@ -1035,21 +1203,31 @@ impl App {
             self.overlay_message = Some(format!("Failed to prepare Bitcoin config:\n{e}"));
             return Task::none();
         }
-        let rpc_port = self.bitcoin_rpc_auth().port;
+        let endpoints = match resolve_managed_endpoints(&self.config.bitcoin_data_path) {
+            Ok(endpoints) => endpoints,
+            Err(error) => {
+                self.overlay_message = Some(format!(
+                    "Bitcoin networking configuration is incompatible with managed Electrs:\n{error:#}\n\nBitEngine did not change bitcoin.conf or settings.json. Correct the reported setting and launch again."
+                ));
+                return Task::none();
+            }
+        };
 
         match process_manager::launch_bitcoind(
             &self.config.binaries_path,
             &self.config.bitcoin_data_path,
-            rpc_port,
+            endpoints.rpc_port,
             &self.bitcoin_queue,
         ) {
             Ok(handle) => {
                 self.bitcoin_handle = Some(handle);
-                self.managed_rpc_port = Some(rpc_port);
+                self.managed_endpoints = Some(endpoints);
+                self.active_rpc_addr = None;
+                self.active_p2p_addr = None;
                 self.bitcoin_running = true;
-                self.bitcoin_synced = false;
-                self.block_height = 0;
+                self.reset_bitcoin_service_status();
                 self.advance_lifecycle_generation();
+                return Task::done(Message::RpcTick);
             }
             Err(e) => {
                 push_msg(&self.bitcoin_queue, &format!("Launch error: {e}"));
@@ -1083,17 +1261,33 @@ impl App {
         if self.bitcoin_handle.is_none() || self.bitcoin_shutdown.is_some() {
             self.overlay_message = Some(
                 "Bitcoin must be running before starting Electrs.\n\
-                 Launch Bitcoin first and wait for the Running indicator."
+                 Launch Bitcoin first and wait for its RPC and P2P services."
                     .into(),
             );
+            return Task::none();
+        }
+        if !self.bitcoin_ready() {
+            let reason = self.bitcoin_dependency_error().unwrap_or(
+                "Bitcoin RPC and P2P readiness have not yet been confirmed for this generation.",
+            );
+            self.overlay_message = Some(format!(
+                "Bitcoin is running but is not usable by managed Electrs:\n{reason}\n\nWait for recovery or correct the reported Bitcoin setting, then retry."
+            ));
             return Task::none();
         }
         if !self.ensure_binary_installation_ready() {
             return Task::none();
         }
-        let Some(rpc_port) = self.managed_rpc_port else {
+        let Some(endpoints) = self.managed_endpoints.as_ref() else {
             self.overlay_message = Some(
-                "Bitcoin supervision state is incomplete; restart Bitcoin before launching electrs."
+                "Bitcoin endpoint state is incomplete; restart Bitcoin before launching Electrs."
+                    .to_owned(),
+            );
+            return Task::none();
+        };
+        let (Some(rpc_addr), Some(p2p_addr)) = (self.active_rpc_addr, self.active_p2p_addr) else {
+            self.overlay_message = Some(
+                "Bitcoin endpoint readiness is incomplete; wait for the next status check before launching Electrs."
                     .to_owned(),
             );
             return Task::none();
@@ -1104,7 +1298,11 @@ impl App {
             &self.config.bitcoin_data_path,
             &self.config.electrs_data_path,
             Config::electrum_addr(),
-            rpc_port,
+            ElectrsBitcoinConnection {
+                rpc_addr,
+                p2p_addr,
+                cookie_file: &endpoints.cookie_file,
+            },
             &self.electrs_queue,
         ) {
             Ok(handle) => {
@@ -1128,18 +1326,17 @@ impl App {
         self.terminate_electrs_internal();
 
         if self.bitcoin_shutdown.is_none() {
-            let auth = self.bitcoin_rpc_auth();
+            let auth = self.bitcoin_rpc_auth().ok();
             let btc_q = Arc::clone(&self.bitcoin_queue);
             if let Some(mut handle) = self.bitcoin_handle.take() {
                 push_msg(&btc_q, "Sending stop via RPC…");
                 self.bitcoin_running = true;
-                self.bitcoin_synced = false;
-                self.block_height = 0;
+                self.reset_bitcoin_service_status();
                 self.advance_lifecycle_generation();
                 match ShutdownWorker::spawn("bitengine-bitcoin-shutdown", move |force| {
                     let stopped_via_rpc = if force.load(Ordering::Acquire) {
                         false
-                    } else {
+                    } else if let Some(auth) = auth {
                         tokio::runtime::Builder::new_current_thread()
                             .enable_all()
                             .build()
@@ -1151,6 +1348,8 @@ impl App {
                                     }
                                 })
                             })
+                    } else {
+                        false
                     };
 
                     if stopped_via_rpc {
@@ -1173,8 +1372,7 @@ impl App {
                     Ok(worker) => self.bitcoin_shutdown = Some(worker),
                     Err(error) => {
                         self.bitcoin_running = false;
-                        self.bitcoin_synced = false;
-                        self.block_height = 0;
+                        self.reset_bitcoin_service_status();
                         push_msg(
                             &self.bitcoin_queue,
                             &format!("Could not start Bitcoin shutdown worker: {error}"),
@@ -1184,8 +1382,7 @@ impl App {
                 }
             } else {
                 self.bitcoin_running = false;
-                self.bitcoin_synced = false;
-                self.block_height = 0;
+                self.reset_bitcoin_service_status();
             }
         }
 
@@ -1444,43 +1641,53 @@ impl App {
         }
     }
 
-    fn apply_electrs_status(&mut self, mut next_status: ElectrsStatus) {
+    fn apply_electrs_status(&mut self, next_status: ElectrsStatus) {
         let previous = self.electrs_status.clone();
-        let warnings_ready = self.bitcoin_running && self.bitcoin_synced && next_status.running;
 
-        if !warnings_ready {
-            next_status.metrics_error = None;
-            next_status.bitcoin_error = None;
-            next_status.connect_error = None;
+        if previous.metrics_error != next_status.metrics_error {
+            if let Some(error) = next_status.metrics_error.as_deref() {
+                push_msg(
+                    &self.electrs_queue,
+                    &format!("Electrs metrics check failed: {error}"),
+                );
+            } else if previous.metrics_error.is_some() {
+                push_msg(&self.electrs_queue, "Electrs metrics check recovered.");
+            }
         }
 
-        if warnings_ready {
-            if previous.metrics_error != next_status.metrics_error {
-                if let Some(error) = next_status.metrics_error.as_deref() {
-                    push_msg(
-                        &self.electrs_queue,
-                        &format!("Electrs metrics check failed: {error}"),
-                    );
-                }
+        if previous.bitcoin_error != next_status.bitcoin_error {
+            if let Some(error) = next_status.bitcoin_error.as_deref() {
+                push_msg(
+                    &self.electrs_queue,
+                    &format!("Electrs Bitcoin check failed: {error}"),
+                );
+            } else if previous.bitcoin_error.is_some() {
+                push_msg(&self.electrs_queue, "Electrs Bitcoin check recovered.");
             }
+        }
 
-            if previous.bitcoin_error != next_status.bitcoin_error {
-                if let Some(error) = next_status.bitcoin_error.as_deref() {
-                    push_msg(
-                        &self.electrs_queue,
-                        &format!("Electrs sync check failed: {error}"),
-                    );
-                }
+        if previous.connect_error != next_status.connect_error {
+            if let Some(error) = next_status.connect_error.as_deref() {
+                push_msg(
+                    &self.electrs_queue,
+                    &format!("Electrs connectivity check failed: {error}"),
+                );
+            } else if previous.connect_error.is_some() {
+                push_msg(&self.electrs_queue, "Electrs connectivity check recovered.");
             }
+        }
 
-            if previous.connect_error != next_status.connect_error {
-                if let Some(error) = next_status.connect_error.as_deref() {
-                    push_msg(
-                        &self.electrs_queue,
-                        &format!("Electrs connectivity check failed: {error}"),
-                    );
-                }
-            }
+        if !previous.connected && next_status.connected {
+            push_msg(
+                &self.electrs_queue,
+                "Electrs completed its managed Bitcoin connection and is answering Electrum protocol requests.",
+            );
+        }
+        if !previous.ready && next_status.ready {
+            push_msg(
+                &self.electrs_queue,
+                "Electrs is ready to serve BitEngine clients.",
+            );
         }
 
         if !previous.synced && next_status.synced {
@@ -1585,6 +1792,87 @@ fn log_binary_resolution(queue: &OutputQueue, binaries_path: &Path, binary: &str
     );
 }
 
+async fn probe_managed_bitcoin(
+    endpoints: Option<&ManagedBitcoinEndpoints>,
+    process_running: bool,
+) -> BitcoinProbeResult {
+    let Some(endpoints) = endpoints.filter(|_| process_running) else {
+        let error = "Bitcoin Core is not running in this managed generation".to_owned();
+        return BitcoinProbeResult {
+            blockchain_info: Err(error.clone()),
+            network_info: Err(error.clone()),
+            rpc_addr: None,
+            p2p_result: Err(error),
+        };
+    };
+
+    let (rpc_probe, p2p_result) = tokio::join!(
+        probe_managed_rpc(endpoints),
+        bitcoin_status::probe_p2p_candidates(&endpoints.p2p_candidates),
+    );
+    BitcoinProbeResult {
+        blockchain_info: rpc_probe.blockchain_info,
+        network_info: rpc_probe.network_info,
+        rpc_addr: rpc_probe.rpc_addr,
+        p2p_result: p2p_result.map_err(|error| error.to_string()),
+    }
+}
+
+struct ManagedRpcProbe {
+    blockchain_info: Result<BlockchainInfo, String>,
+    network_info: Result<NetworkInfo, String>,
+    rpc_addr: Option<SocketAddr>,
+}
+
+async fn probe_managed_rpc(endpoints: &ManagedBitcoinEndpoints) -> ManagedRpcProbe {
+    let mut failures = Vec::with_capacity(endpoints.rpc_candidates.len());
+    for &endpoint in &endpoints.rpc_candidates {
+        let auth = match RpcAuth::from_managed_cookie(&endpoints.cookie_file, endpoint) {
+            Ok(auth) => auth,
+            Err(error) => {
+                let error = error.to_string();
+                return ManagedRpcProbe {
+                    blockchain_info: Err(error.clone()),
+                    network_info: Err(error),
+                    rpc_addr: None,
+                };
+            }
+        };
+        let (blockchain_info, network_info) = tokio::join!(
+            rpc::get_blockchain_info(&auth),
+            rpc::get_network_info(&auth),
+        );
+        if blockchain_info.is_ok() && network_info.is_ok() {
+            return ManagedRpcProbe {
+                blockchain_info: blockchain_info.map_err(|error| error.to_string()),
+                network_info: network_info.map_err(|error| error.to_string()),
+                rpc_addr: Some(endpoint),
+            };
+        }
+        let blockchain_outcome = blockchain_info.as_ref().map_or_else(
+            |error| format!("failed: {error}"),
+            |_| "succeeded".to_owned(),
+        );
+        let network_outcome = network_info.as_ref().map_or_else(
+            |error| format!("failed: {error}"),
+            |_| "succeeded".to_owned(),
+        );
+        failures.push(format!(
+            "{endpoint}: getblockchaininfo {blockchain_outcome}; getnetworkinfo {network_outcome}"
+        ));
+    }
+
+    let error = format!(
+        "no managed Bitcoin RPC endpoint was usable ({})",
+        failures.join("; ")
+    );
+    ManagedRpcProbe {
+        blockchain_info: Err(error.clone()),
+        network_info: Err(error),
+        rpc_addr: None,
+    }
+}
+
 fn build_worker_count() -> usize {
     std::thread::available_parallelism()
         .map_or(4, |count| count.get().saturating_sub(1).clamp(1, 8))
@@ -1594,12 +1882,95 @@ fn build_worker_count() -> usize {
 mod tests {
     use super::*;
     use anyhow::Context as _;
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[cfg(unix)]
     use std::{os::unix::fs::PermissionsExt as _, sync::atomic::AtomicUsize, time::Instant};
 
     fn test_app(root: &Path) -> App {
         App::from_config(Config::defaults(root), None, root.join("build-state.json"))
+    }
+
+    fn blockchain_info(
+        blocks: u64,
+        headers: u64,
+        initial_block_download: bool,
+        pruned: bool,
+    ) -> BlockchainInfo {
+        BlockchainInfo {
+            blocks,
+            headers,
+            verification_progress: 1.0,
+            initial_block_download,
+            pruned,
+        }
+    }
+
+    fn healthy_bitcoin_probe(info: BlockchainInfo) -> BitcoinProbeResult {
+        BitcoinProbeResult {
+            blockchain_info: Ok(info),
+            network_info: Ok(NetworkInfo {
+                version: 300_000,
+                network_active: true,
+            }),
+            rpc_addr: Some(SocketAddr::from(([127, 0, 0, 1], 8332))),
+            p2p_result: Ok(SocketAddr::from(([127, 0, 0, 1], 8333))),
+        }
+    }
+
+    fn failed_bitcoin_probe(error: &str) -> BitcoinProbeResult {
+        BitcoinProbeResult {
+            blockchain_info: Err(error.to_owned()),
+            network_info: Err(error.to_owned()),
+            rpc_addr: None,
+            p2p_result: Err(error.to_owned()),
+        }
+    }
+
+    fn apply_current_status(
+        app: &mut App,
+        bitcoin_probe: BitcoinProbeResult,
+        electrs_status: ElectrsStatus,
+    ) {
+        let identity = StatusPollIdentity {
+            request_id: app.next_status_poll,
+            lifecycle_generation: app.lifecycle_generation,
+        };
+        app.active_status_poll = Some(identity);
+        app.apply_status_poll(StatusPollResult {
+            identity,
+            bitcoin_probe,
+            electrs_status,
+        });
+    }
+
+    fn ready_electrs_status() -> ElectrsStatus {
+        ElectrsStatus {
+            running: true,
+            connected: true,
+            synced: true,
+            ready: true,
+            electrs_height: Some(100),
+            bitcoin_blocks: Some(100),
+            bitcoin_headers: Some(100),
+            sync_percent: Some(100.0),
+            ..ElectrsStatus::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn mark_bitcoin_dependency_ready(app: &mut App) -> anyhow::Result<()> {
+        let endpoints = app
+            .managed_endpoints
+            .as_ref()
+            .context("managed endpoint snapshot")?;
+        app.active_rpc_addr = endpoints.rpc_candidates.first().copied();
+        app.active_p2p_addr = endpoints.p2p_candidates.first().copied();
+        app.bitcoin_rpc_reachable = true;
+        app.bitcoin_p2p_reachable = true;
+        app.bitcoin_compatibility_error = None;
+        Ok(())
     }
 
     fn activate_build(app: &mut App, operation_id: BuildOperationId, kind: BinaryKind) {
@@ -1615,6 +1986,123 @@ mod tests {
             bitcoin_data_path: root.join("BitcoinChain"),
             electrs_data_path: root.join("ElectrsDB"),
         }
+    }
+
+    async fn read_test_rpc_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Value> {
+        const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+        let mut request = Vec::with_capacity(1024);
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut buffer).await?;
+            anyhow::ensure!(bytes_read > 0, "test RPC client closed before its request");
+            request.extend_from_slice(&buffer[..bytes_read]);
+            anyhow::ensure!(
+                request.len() <= MAX_REQUEST_BYTES,
+                "test RPC request exceeded {MAX_REQUEST_BYTES} bytes"
+            );
+
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end])?;
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .map(|(_, value)| value.trim().parse::<usize>())
+                .transpose()?
+                .context("test RPC request omitted Content-Length")?;
+            let body_start = header_end + 4;
+            let body_end = body_start + content_length;
+            if request.len() >= body_end {
+                return serde_json::from_slice(&request[body_start..body_end])
+                    .context("parse test RPC request");
+            }
+        }
+    }
+
+    async fn spawn_test_rpc_server(
+        network_succeeds: bool,
+    ) -> anyhow::Result<(
+        SocketAddr,
+        tokio::task::JoinHandle<anyhow::Result<Vec<String>>>,
+    )> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let mut methods = Vec::with_capacity(2);
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await?;
+                let request = read_test_rpc_request(&mut stream).await?;
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .context("test RPC request omitted method")?;
+                let body = match method {
+                    "getblockchaininfo" => serde_json::json!({
+                        "result": {
+                            "blocks": 100,
+                            "headers": 100,
+                            "verificationprogress": 1.0,
+                            "initialblockdownload": false,
+                            "pruned": false
+                        },
+                        "error": null
+                    }),
+                    "getnetworkinfo" if network_succeeds => serde_json::json!({
+                        "result": {
+                            "version": 300_000,
+                            "networkactive": true
+                        },
+                        "error": null
+                    }),
+                    "getnetworkinfo" => serde_json::json!({
+                        "result": null,
+                        "error": {"code": -1, "message": "partial candidate"}
+                    }),
+                    unexpected => anyhow::bail!("unexpected test RPC method {unexpected}"),
+                }
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await?;
+                methods.push(method.to_owned());
+            }
+            Ok(methods)
+        });
+        Ok((endpoint, server))
+    }
+
+    #[tokio::test]
+    async fn managed_rpc_probe_skips_a_partially_usable_candidate() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let cookie_file = temporary.path().join(".cookie");
+        std::fs::write(&cookie_file, "user:password\n")?;
+        let (partial_endpoint, partial_server) = spawn_test_rpc_server(false).await?;
+        let (healthy_endpoint, healthy_server) = spawn_test_rpc_server(true).await?;
+        let endpoints = ManagedBitcoinEndpoints {
+            rpc_candidates: vec![partial_endpoint, healthy_endpoint],
+            rpc_port: partial_endpoint.port(),
+            p2p_candidates: Vec::new(),
+            cookie_file,
+        };
+
+        let probe = probe_managed_rpc(&endpoints).await;
+
+        assert_eq!(probe.rpc_addr, Some(healthy_endpoint));
+        assert!(probe.blockchain_info.is_ok());
+        assert!(probe.network_info.is_ok());
+        for server in [partial_server, healthy_server] {
+            let mut methods = tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .context("test RPC server timed out")???;
+            methods.sort_unstable();
+            assert_eq!(methods, ["getblockchaininfo", "getnetworkinfo"]);
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2192,6 +2680,245 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn spawned_bitcoin_process_cannot_launch_electrs_before_services_are_ready(
+    ) -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let mut app = test_app(temporary.path());
+
+        drop(app.launch_bitcoin());
+        let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        assert!(app.bitcoin_running);
+        assert!(!app.bitcoin_ready());
+
+        drop(app.launch_electrs());
+
+        assert!(app.electrs_handle.is_none());
+        assert!(!electrs_pid_log.exists());
+        assert!(app.overlay_message.as_deref().is_some_and(|message| {
+            message.contains("not usable by managed Electrs")
+                && message.contains("readiness have not yet been confirmed")
+        }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incompatible_listen_setting_prevents_a_partial_launch() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        let bitcoin_data = temporary.path().join("BitcoinChain");
+        std::fs::create_dir(&bitcoin_data)?;
+        std::fs::write(bitcoin_data.join("bitcoin.conf"), "listen=0\n")?;
+        let mut app = test_app(temporary.path());
+
+        drop(app.launch_bitcoin());
+
+        assert!(app.bitcoin_handle.is_none());
+        assert!(!bitcoin_pid_log.exists());
+        assert!(app.overlay_message.as_deref().is_some_and(|message| {
+            message.contains("incompatible with managed Electrs")
+                && message.contains("listen=0")
+                && message.contains("did not change bitcoin.conf or settings.json")
+        }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruned_core_is_reported_before_electrs_is_spawned() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+            100, 100, false, true,
+        )));
+
+        assert!(!app.bitcoin_ready());
+        drop(app.launch_electrs());
+
+        assert!(app.electrs_handle.is_none());
+        assert!(!electrs_pid_log.exists());
+        assert!(app
+            .overlay_message
+            .as_deref()
+            .is_some_and(|message| message.contains("prune=0")));
+        Ok(())
+    }
+
+    #[test]
+    fn bitcoin_sync_and_compatibility_follow_electrs_prerequisites() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+
+        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+            100, 100, true, false,
+        )));
+        assert!(!app.bitcoin_synced, "IBD must remain unsynchronized");
+
+        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+            99, 100, false, false,
+        )));
+        assert!(
+            !app.bitcoin_synced,
+            "a one-block lag must remain unsynchronized"
+        );
+
+        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+            100, 100, false, false,
+        )));
+        assert!(app.bitcoin_synced);
+        assert!(app.bitcoin_compatibility_error.is_none());
+
+        app.apply_bitcoin_probe(healthy_bitcoin_probe(blockchain_info(
+            100, 100, false, true,
+        )));
+        assert!(app
+            .bitcoin_compatibility_error
+            .as_deref()
+            .is_some_and(|error| error.contains("prune=0")));
+
+        let mut inactive = healthy_bitcoin_probe(blockchain_info(100, 100, false, false));
+        inactive.network_info = Ok(NetworkInfo {
+            version: 300_000,
+            network_active: false,
+        });
+        app.apply_bitcoin_probe(inactive);
+        assert!(app
+            .bitcoin_compatibility_error
+            .as_deref()
+            .is_some_and(|error| error.contains("setnetworkactive true")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_failure_is_reported_and_a_current_generation_recovery_clears_it(
+    ) -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        mark_bitcoin_dependency_ready(&mut app)?;
+        drop(app.launch_electrs());
+        let _ = wait_for_pids(&electrs_pid_log, 1)?;
+
+        apply_current_status(
+            &mut app,
+            failed_bitcoin_probe("RPC connection refused"),
+            ElectrsStatus {
+                running: true,
+                metrics_error: Some("metrics connection refused".to_owned()),
+                bitcoin_error: Some("Bitcoin Core unavailable: connection refused".to_owned()),
+                connect_error: Some("Electrum protocol unavailable".to_owned()),
+                ..ElectrsStatus::default()
+            },
+        );
+
+        assert!(!app.bitcoin_ready());
+        assert!(!app.electrs_status.connected);
+        assert!(!app.electrs_status.ready);
+        assert!(app.electrs_status.bitcoin_error.is_some());
+        assert!(app.electrs_status.connect_error.is_some());
+        assert!(app.electrs_queue.lock().is_ok_and(|lines| {
+            lines
+                .iter()
+                .any(|line| line.contains("Electrs Bitcoin check failed"))
+        }));
+
+        apply_current_status(
+            &mut app,
+            healthy_bitcoin_probe(blockchain_info(100, 100, false, false)),
+            ready_electrs_status(),
+        );
+
+        assert!(app.bitcoin_ready());
+        assert!(app.electrs_status.connected);
+        assert!(app.electrs_status.ready);
+        assert!(app.electrs_status.bitcoin_error.is_none());
+        assert!(app.electrs_status.connect_error.is_none());
+        assert!(app.electrs_queue.lock().is_ok_and(|lines| {
+            lines
+                .iter()
+                .any(|line| line.contains("connectivity check recovered"))
+                && lines
+                    .iter()
+                    .any(|line| line.contains("ready to serve BitEngine clients"))
+        }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bitcoin_exit_invalidates_electrs_and_blocks_a_mixed_generation_relaunch(
+    ) -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
+        let electrs_pid_log = temporary.path().join("electrs-pids");
+        install_node_helper(temporary.path(), "bitcoind", &bitcoin_pid_log)?;
+        install_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
+        let mut app = test_app(temporary.path());
+        drop(app.launch_bitcoin());
+        let bitcoin_process_id = wait_for_pids(&bitcoin_pid_log, 1)?[0];
+        mark_bitcoin_dependency_ready(&mut app)?;
+        drop(app.launch_electrs());
+        let _ = wait_for_pids(&electrs_pid_log, 1)?;
+        app.electrs_status = ready_electrs_status();
+        let stale_identity = StatusPollIdentity {
+            request_id: 71,
+            lifecycle_generation: app.lifecycle_generation,
+        };
+        app.active_status_poll = Some(stale_identity);
+
+        // SAFETY: the PID belongs to the helper process launched above.
+        assert_eq!(unsafe { libc::kill(bitcoin_process_id, libc::SIGKILL) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.bitcoin_handle.is_some() && Instant::now() < deadline {
+            app.reconcile_node_lifecycle();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(app.bitcoin_handle.is_none());
+        assert!(app.electrs_handle.is_some());
+        assert!(!app.electrs_status.connected);
+        assert!(!app.electrs_status.ready);
+        assert!(app
+            .electrs_status
+            .bitcoin_error
+            .as_deref()
+            .is_some_and(|error| error.contains("stop Electrs")));
+
+        app.apply_status_poll(StatusPollResult {
+            identity: stale_identity,
+            bitcoin_probe: healthy_bitcoin_probe(blockchain_info(100, 100, false, false)),
+            electrs_status: ready_electrs_status(),
+        });
+        assert!(!app.electrs_status.connected);
+        assert!(!app.electrs_status.ready);
+
+        drop(app.launch_bitcoin());
+        assert_eq!(wait_for_pids(&bitcoin_pid_log, 1)?.len(), 1);
+        assert!(app.overlay_message.as_deref().is_some_and(|message| {
+            message.contains("previous Bitcoin generation") && message.contains("Stop Electrs")
+        }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stale_prelaunch_poll_cannot_clear_a_new_electrs_generation() -> anyhow::Result<()> {
         let temporary = tempfile::tempdir()?;
         let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
@@ -2201,6 +2928,7 @@ mod tests {
         let mut app = test_app(temporary.path());
         drop(app.launch_bitcoin());
         let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        mark_bitcoin_dependency_ready(&mut app)?;
 
         let stale_identity = StatusPollIdentity {
             request_id: 17,
@@ -2212,7 +2940,7 @@ mod tests {
 
         app.apply_status_poll(StatusPollResult {
             identity: stale_identity,
-            blockchain_info: Err("stale poll".to_owned()),
+            bitcoin_probe: failed_bitcoin_probe("stale poll"),
             electrs_status: ElectrsStatus::default(),
         });
 
@@ -2233,6 +2961,7 @@ mod tests {
         let mut app = test_app(temporary.path());
         drop(app.launch_bitcoin());
         let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        mark_bitcoin_dependency_ready(&mut app)?;
         drop(app.launch_electrs());
         let pids = wait_for_pids(&electrs_pid_log, 1)?;
 
@@ -2260,10 +2989,12 @@ mod tests {
         let mut app = test_app(temporary.path());
         drop(app.launch_bitcoin());
         let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
+        mark_bitcoin_dependency_ready(&mut app)?;
         drop(app.launch_electrs());
         let process_id = wait_for_pids(&electrs_pid_log, 1)?[0];
         app.electrs_status = ElectrsStatus {
             running: true,
+            connected: true,
             synced: true,
             ready: true,
             electrs_height: Some(100),
@@ -2307,7 +3038,7 @@ mod tests {
 
         app.apply_status_poll(StatusPollResult {
             identity,
-            blockchain_info: Err("RPC timed out".to_owned()),
+            bitcoin_probe: failed_bitcoin_probe("RPC timed out"),
             electrs_status: ElectrsStatus::default(),
         });
 
@@ -2329,13 +3060,10 @@ mod tests {
 
         app.apply_status_poll(StatusPollResult {
             identity,
-            blockchain_info: Ok(BlockchainInfo {
-                blocks: 100,
-                headers: 100,
-                verification_progress: 1.0,
-            }),
+            bitcoin_probe: healthy_bitcoin_probe(blockchain_info(100, 100, false, false)),
             electrs_status: ElectrsStatus {
                 running: true,
+                connected: true,
                 ready: true,
                 ..ElectrsStatus::default()
             },
@@ -2374,7 +3102,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn active_lifecycle_retains_the_bitcoin_rpc_port_snapshot() -> anyhow::Result<()> {
+    fn active_lifecycle_retains_the_bitcoin_endpoint_snapshot() -> anyhow::Result<()> {
         let temporary = tempfile::tempdir()?;
         let bitcoin_pid_log = temporary.path().join("bitcoin-pids");
         let electrs_pid_log = temporary.path().join("electrs-pids");
@@ -2382,21 +3110,46 @@ mod tests {
         install_node_helper(temporary.path(), "electrs", &electrs_pid_log)?;
         let bitcoin_data = temporary.path().join("BitcoinChain");
         std::fs::create_dir(&bitcoin_data)?;
-        std::fs::write(bitcoin_data.join("bitcoin.conf"), "rpcport=18443\n")?;
+        std::fs::write(
+            bitcoin_data.join("bitcoin.conf"),
+            "rpcport=18443\nport=18444\nbind=127.0.0.1\n",
+        )?;
         let mut app = test_app(temporary.path());
         drop(app.launch_bitcoin());
         let _ = wait_for_pids(&bitcoin_pid_log, 1)?;
-        assert_eq!(app.managed_rpc_port, Some(18_443));
+        let endpoints = app
+            .managed_endpoints
+            .as_ref()
+            .context("managed endpoint snapshot")?;
+        assert_eq!(endpoints.rpc_port, 18_443);
+        assert_eq!(
+            endpoints.p2p_candidates.first().copied(),
+            Some(SocketAddr::from(([127, 0, 0, 1], 18_444)))
+        );
 
-        std::fs::write(bitcoin_data.join("bitcoin.conf"), "rpcport=19999\n")?;
+        std::fs::write(
+            bitcoin_data.join("bitcoin.conf"),
+            "rpcport=19999\nport=20000\nbind=[::1]\n",
+        )?;
+        std::fs::write(bitcoin_data.join(".cookie"), "managed:secret\n")?;
 
-        assert_eq!(app.bitcoin_rpc_auth().port, 18_443);
+        mark_bitcoin_dependency_ready(&mut app)?;
+        assert_eq!(
+            app.bitcoin_rpc_auth()
+                .map_err(anyhow::Error::msg)?
+                .endpoint
+                .port(),
+            18_443
+        );
         drop(app.launch_electrs());
         let _ = wait_for_pids(&electrs_pid_log, 1)?;
         assert!(app
             .electrs_queue
             .lock()
-            .is_ok_and(|lines| lines.iter().any(|line| line.contains("127.0.0.1:18443"))));
+            .is_ok_and(|lines| lines.iter().any(|line| {
+                line.contains("--daemon-rpc-addr 127.0.0.1:18443")
+                    && line.contains("--daemon-p2p-addr 127.0.0.1:18444")
+            })));
         Ok(())
     }
 
@@ -2428,6 +3181,7 @@ mod tests {
         let mut app = test_app(temporary.path());
         drop(app.launch_bitcoin());
         let bitcoin_process_id = wait_for_pids(&bitcoin_pid_log, 1)?[0];
+        mark_bitcoin_dependency_ready(&mut app)?;
         drop(app.launch_electrs());
         let electrs_process_id = wait_for_pids(&electrs_pid_log, 1)?[0];
         let started = Instant::now();
@@ -2451,6 +3205,7 @@ mod tests {
         let mut app = test_app(temporary.path());
         drop(app.launch_bitcoin());
         let bitcoin_process_id = wait_for_pids(&bitcoin_pid_log, 1)?[0];
+        mark_bitcoin_dependency_ready(&mut app)?;
         drop(app.launch_electrs());
         let electrs_process_id = wait_for_pids(&electrs_pid_log, 1)?[0];
         app.bitcoin_synced = true;

@@ -88,13 +88,15 @@ macOS Intel/x86_64 and universal macOS app bundles are intentionally not built o
 Each node gets its own scrollable terminal panel showing real-time stdout and stderr. Output is streamed on dedicated OS threads and drained into the UI every 100 ms — the interface never blocks.
 
 ### Status indicators
-Three per node, updated automatically:
+Three per node, updated automatically from the owned process and current lifecycle generation:
 
-| Indicator | Condition |
-|---|---|
-| **Running** | Process is alive |
-| **Synced** | Bitcoin: `verificationprogress > 99.99%` via RPC · Electrs: key log phrases detected |
-| **Ready** | Running AND Synced |
+| Indicator | Bitcoin Core | Electrs |
+|---|---|---|
+| **Running** | The managed child process is alive | The managed child process is alive |
+| **Synced** | Authenticated RPC reports `initialblockdownload=false` and `blocks >= headers` | Core is synced, Electrs has answered the protocol probe, and its metrics tip is at least the current Core block height |
+| **Ready** | Authenticated RPC is usable, Core is compatible with Electrs, and a configured endpoint completes a Bitcoin mainnet P2P `version`/`verack` handshake | A correlated `server.version` response identifies Electrs and `server.features` succeeds for Bitcoin mainnet |
+
+Readiness is deliberately separate from synchronization. In particular, Bitcoin can be ready for Electrs to connect while both services are still catching up. A listening TCP socket, metrics endpoint, or live process alone never marks either service ready.
 
 ### Live block height
 Polls `getblockchaininfo` via JSON-RPC every 5 seconds and displays the current block height with comma formatting (e.g. `895,234`).
@@ -253,7 +255,11 @@ rpcallowip=127.0.0.1
 # Cookie-based authentication is active by default.
 ```
 
-Cookie-based RPC authentication (`.cookie` file) is used by default. BitEngine checks `<datadir>/.cookie` and `<datadir>/mainnet/.cookie` before falling back to `rpcuser`/`rpcpassword` from `bitcoin.conf`.
+For a managed launch, BitEngine owns the mainnet RPC endpoint policy: it resolves the effective `rpcport`, passes that port to Core, uses Core's default loopback RPC binding, and forces the cookie to `<bitcoin_data_path>/.cookie`. Status checks and Electrs use that exact snapshotted cookie and the first working numeric loopback RPC address (`127.0.0.1` or `::1`); stale alternate cookies and static RPC credentials are not used.
+
+Bitcoin P2P exposure remains user-owned. BitEngine does not add or change `port`, `bind`, `whitebind`, or `listen`. Before spawning Core it inspects `settings.json`, `[main]` and global `bitcoin.conf` values, primary `includeconf` files, negations, and repeatable bind values using Core's precedence. It derives an ordered candidate set, confirms the actual listener with a bounded mainnet handshake, snapshots the selected endpoint for that running generation, and passes it explicitly to Electrs as `--daemon-p2p-addr`. Wildcard IPv4/IPv6 binds are reached through their matching loopback address; explicit numeric binds and ports are preserved. File edits while Core is running apply only to the next clean generation.
+
+Managed Electrs is rejected with a setting-specific explanation when configuration inspection is ambiguous or unsafe, P2P listening is disabled, a bind has no usable numeric endpoint, a managed port is zero/invalid, `maxconnections` is below Electrs's required 12, or relevant config/settings/include files cannot be inspected. Runtime checks also block Electrs when Core is pruned, has networking inactive, is too old, has no authenticated RPC service, or exposes no candidate that completes the P2P handshake. BitEngine does not weaken those settings or broaden Core's P2P exposure automatically.
 
 ---
 
@@ -299,9 +305,9 @@ src/
 │
 ├── rpc.rs             Bitcoin JSON-RPC client
 │                      · reqwest + rustls (no OpenSSL dependency)
-│                      · Cookie-file auth with bitcoin.conf fallback
+│                      · Exact managed-generation cookie and numeric endpoint
 │                      · Auto-creates bitcoin.conf when missing
-│                      · getblockchaininfo polling, stop command
+│                      · getblockchaininfo/getnetworkinfo polling, stop command
 │
 ├── process_manager.rs Child process lifecycle
 │                      · Spawns bitcoind / electrs with stdout+stderr pipes
@@ -379,8 +385,8 @@ The Iced update loop is the only writer to UI state. The background threads only
 | Process shutdown | `terminate()` only | RPC stop → platform termination → kill |
 | Binary copy safety | `shutil.copy2` (non-atomic) | temp file → executable bit on Unix → atomic rename |
 | Semver comparison | Regex + string sort | Tuple comparison `(major, minor, patch)` |
-| Electrs sync detection | 3 log patterns | 5 log patterns |
-| RPC auth | Cookie + fallback | Same, cleaner error messages |
+| Electrs sync detection | Log patterns | Metrics plus correlated Electrum JSON-RPC probes |
+| RPC auth | Cookie + fallback | Exact managed-generation cookie and endpoint snapshot |
 | Single-instance guard | Unix file lock | localhost listener guard |
 | Error handling | `try/except`, silent failures | `Result<T,E>` throughout, no `unwrap()` |
 | Type safety | Runtime | Compile-time |

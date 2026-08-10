@@ -11,6 +11,8 @@
 )]
 
 mod binaries;
+mod bitcoin_config;
+mod bitcoin_status;
 mod config;
 mod electrs_status;
 mod platform;

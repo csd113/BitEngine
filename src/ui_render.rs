@@ -1072,18 +1072,23 @@ fn view_node_panels(app: &App) -> Element<'_, Message> {
         title: "Bitcoin",
         subtitle: "Bitcoin Core node",
         accent: BTC_ACC,
-        launch_action: (app.bitcoin_handle.is_none() && app.bitcoin_shutdown.is_none())
-            .then_some(Message::LaunchBitcoin),
+        launch_action: (app.bitcoin_handle.is_none()
+            && app.bitcoin_shutdown.is_none()
+            && app.electrs_handle.is_none()
+            && app.electrs_shutdown.is_none())
+        .then_some(Message::LaunchBitcoin),
         launch_hint: if app.bitcoin_shutdown.is_some() {
             "Bitcoin is shutting down."
         } else if app.bitcoin_handle.is_some() {
             "Bitcoin is already running."
+        } else if app.electrs_handle.is_some() || app.electrs_shutdown.is_some() {
+            "Stop Electrs from the previous Bitcoin generation before relaunching Bitcoin."
         } else {
             "Starts bitcoind with the configured data directory."
         },
         running: app.bitcoin_running,
         synced: app.bitcoin_synced,
-        ready: app.bitcoin_running && app.bitcoin_synced,
+        ready: app.bitcoin_ready(),
         lines: &app.bitcoin_lines,
         scroll_id: bitcoin_scroll_id(),
     });
@@ -1093,6 +1098,7 @@ fn view_node_panels(app: &App) -> Element<'_, Message> {
         accent: ELS_ACC,
         launch_action: (app.bitcoin_handle.is_some()
             && app.bitcoin_shutdown.is_none()
+            && app.bitcoin_ready()
             && app.electrs_handle.is_none()
             && app.electrs_shutdown.is_none())
         .then_some(Message::LaunchElectrs),
@@ -1102,8 +1108,11 @@ fn view_node_panels(app: &App) -> Element<'_, Message> {
             "Electrs is already running."
         } else if app.bitcoin_handle.is_none() || app.bitcoin_shutdown.is_some() {
             "Start Bitcoin before launching Electrs."
+        } else if !app.bitcoin_ready() {
+            app.bitcoin_dependency_error()
+                .unwrap_or("Wait for Bitcoin RPC and P2P readiness.")
         } else {
-            "Starts electrs against the configured Bitcoin data directory."
+            "Starts Electrs with this Bitcoin generation's verified RPC and P2P endpoints."
         },
         running: app.electrs_status.running,
         synced: app.electrs_status.synced,

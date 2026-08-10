@@ -10,6 +10,7 @@
 
 use std::{
     collections::VecDeque,
+    net::SocketAddr,
     path::Path,
     process::{Child, Command, Stdio},
     sync::{
@@ -329,13 +330,21 @@ pub fn launch_bitcoind(
 
 // ── Electrs ───────────────────────────────────────────────────────────────────
 
+/// Bitcoin Core connection snapshot passed to one managed Electrs launch.
+#[derive(Clone, Copy)]
+pub struct ElectrsBitcoinConnection<'a> {
+    pub rpc_addr: SocketAddr,
+    pub p2p_addr: SocketAddr,
+    pub cookie_file: &'a Path,
+}
+
 /// Launch `electrs` and stream its output into `queue`.
 pub fn launch_electrs(
     binaries_path: &Path,
     bitcoin_data_dir: &Path,
     electrs_db_dir: &Path,
     electrum_addr: &str,
-    daemon_rpc_port: u16,
+    connection: ElectrsBitcoinConnection<'_>,
     queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
     let electrs = validated_managed_executable(binaries_path, &platform::electrs_binary_name())?;
@@ -343,9 +352,6 @@ pub fn launch_electrs(
         platform::prepare_real_directory(bitcoin_data_dir, "Bitcoin data directory", false)?;
     let electrs_db_dir =
         platform::prepare_real_directory(electrs_db_dir, "electrs database directory", true)?;
-    let daemon_rpc_addr = format!("127.0.0.1:{daemon_rpc_port}");
-    let cookie_file = bitcoin_data_dir.join(".cookie");
-
     let args = [
         "--skip-default-conf-files".into(),
         "--network".into(),
@@ -353,9 +359,11 @@ pub fn launch_electrs(
         "--daemon-dir".into(),
         bitcoin_data_dir.to_string_lossy().into_owned(),
         "--daemon-rpc-addr".into(),
-        daemon_rpc_addr,
+        connection.rpc_addr.to_string(),
+        "--daemon-p2p-addr".into(),
+        connection.p2p_addr.to_string(),
         "--cookie-file".into(),
-        cookie_file.to_string_lossy().into_owned(),
+        connection.cookie_file.to_string_lossy().into_owned(),
         "--db-dir".into(),
         electrs_db_dir.to_string_lossy().into_owned(),
         "--electrum-rpc-addr".into(),
@@ -673,7 +681,11 @@ mod tests {
             &bitcoin_data,
             &electrs_data,
             "127.0.0.1:50001",
-            8332,
+            ElectrsBitcoinConnection {
+                rpc_addr: "127.0.0.1:8332".parse()?,
+                p2p_addr: "127.0.0.1:8333".parse()?,
+                cookie_file: &bitcoin_data.join(".cookie"),
+            },
             &queue
         )
         .is_err());
@@ -789,7 +801,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bitcoin_launch_forces_foreground_rpc_server_arguments() -> Result<()> {
+    fn bitcoin_launch_forces_managed_rpc_without_overriding_p2p_exposure() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let binaries = temporary.path().join("Binaries");
         let bitcoin_data = temporary.path().join("BitcoinChain");
@@ -806,6 +818,9 @@ mod tests {
              daemon=1\n\
              rpcport=18441\n\
              rpcbind=127.0.0.1:19000\n\
+             port=18444\n\
+             bind=[::1]:18444\n\
+             listen=1\n\
              rpccookiefile=elsewhere.cookie\n\
              rpcuser=legacy-user\n\
              rpcpassword=legacy-password\n",
@@ -850,13 +865,18 @@ mod tests {
         assert!(arguments
             .lines()
             .any(|argument| argument == "-daemonwait=0"));
+        for p2p_option in ["-port", "-bind", "-whitebind", "-listen"] {
+            assert!(!arguments.lines().any(|argument| {
+                argument == p2p_option || argument.starts_with(&format!("{p2p_option}="))
+            }));
+        }
         drop(handle);
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn electrs_launch_uses_configured_bitcoin_rpc_port() -> Result<()> {
+    fn electrs_launch_uses_the_managed_bitcoin_connection_snapshot() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let binaries = temporary.path().join("Binaries");
         let bitcoin_data = temporary.path().join("BitcoinChain");
@@ -875,13 +895,18 @@ mod tests {
         )?;
         write_executable(&binaries.join("electrs"), &argument_capture_script(&marker))?;
         let queue = new_queue();
+        let cookie_path = std::fs::canonicalize(&bitcoin_data)?.join(".cookie");
 
         let handle = launch_electrs(
             &binaries,
             &bitcoin_data,
             &electrs_data,
             "127.0.0.1:50001",
-            18_443,
+            ElectrsBitcoinConnection {
+                rpc_addr: "[::1]:18443".parse()?,
+                p2p_addr: "[::1]:18444".parse()?,
+                cookie_file: &cookie_path,
+            },
             &queue,
         )?;
         wait_for_file(&marker)?;
@@ -890,15 +915,15 @@ mod tests {
 
         assert!(arguments
             .windows(2)
-            .any(|arguments| { arguments == ["--daemon-rpc-addr", "127.0.0.1:18443"] }));
+            .any(|arguments| { arguments == ["--daemon-rpc-addr", "[::1]:18443"] }));
+        assert!(arguments
+            .windows(2)
+            .any(|arguments| { arguments == ["--daemon-p2p-addr", "[::1]:18444"] }));
         assert!(arguments.contains(&"--skip-default-conf-files"));
         assert!(arguments
             .windows(2)
             .any(|arguments| { arguments == ["--monitoring-addr", "127.0.0.1:4224"] }));
-        let cookie_file = std::fs::canonicalize(&bitcoin_data)?
-            .join(".cookie")
-            .to_string_lossy()
-            .into_owned();
+        let cookie_file = cookie_path.to_string_lossy().into_owned();
         assert!(arguments
             .windows(2)
             .any(|arguments| { arguments == ["--cookie-file", cookie_file.as_str()] }));

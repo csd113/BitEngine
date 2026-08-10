@@ -305,6 +305,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
