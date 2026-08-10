@@ -1,8 +1,16 @@
+# macOS-generated files and local application bundles
 .DS_Store
+/BitEngine.app/
+*.dSYM/
+
+# Rust build and profiling output
+/target/
+*.profraw
+
+# Local release-packaging output
+/dist/
+/out/
+
+# Local development helpers
 dev-check.sh
 clippy.sh
-.DS_Store
-.DS_Store
-.DS_Store
-.DS_Store
-/target

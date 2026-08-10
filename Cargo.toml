@@ -1,8 +1,8 @@
 [package]
 name = "bitengine"
-version = "0.1.2"
+version = "1.0.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.97.1"
 description = "BitEngine GUI for Bitcoin Core and Electrs"
 license = "MIT"
 repository = "https://github.com/csd113/BitEngine"
@@ -16,14 +16,29 @@ path = "src/main.rs"
 [dependencies]
 # GUI framework: Iced chosen for pure-Rust native rendering (no webview dependency
 # or Node.js toolchain) and an Elm-style architecture that maps onto the
-# reactive status-polling model here.
-iced = { version = "0.14", features = ["tokio", "advanced"] }
+# reactive status-polling model here. Tiny-Skia avoids Iced's optional WGPU
+# macOS chain, whose obsolete block 0.1 dependency is future-incompatible.
+iced = { version = "0.14", default-features = false, features = [
+    "advanced",
+    "crisp",
+    "linux-theme-detection",
+    "thread-pool",
+    "tiny-skia",
+    "tokio",
+    "wayland",
+    "web-colors",
+    "x11",
+] }
 
 # Async runtime (iced tokio feature drives the executor)
 tokio = { version = "1", features = ["full"] }
 
 # HTTP client for Bitcoin JSON-RPC calls
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+# SHA-256 for validating Bitcoin P2P wire-message checksums. This crate is
+# already present through the rustls dependency graph.
+ring = "0.17"
 
 # Serialisation
 serde       = { version = "1",  features = ["derive"] }

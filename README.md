@@ -1,14 +1,16 @@
 <div align="center">
 
+<img src="assets/bitengine-readme-banner.png" alt="BitEngine Bitcoin node network banner" width="100%">
+
 # ⚙️ BitEngine
 
 **A native cross-platform GUI for managing Bitcoin Core and Electrs nodes**
 
 Built with Rust · Iced · Native desktop rendering
 
-Current release: `0.1.2`
+Current release: `1.0.0`
 
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%2Farm64-blue)](#supported-platforms)
 [![Architecture](https://img.shields.io/badge/macos-Apple%20Silicon%20only-lightgrey)](#supported-platforms)
@@ -26,14 +28,14 @@ BitEngine is a desktop application that lets you launch, monitor, and shut down 
 - Real-time block height display via JSON-RPC
 - Green/grey status indicators: **Running · Synced · Ready** for each node
 - One-click shutdown (Bitcoin RPC stop first, then platform fallback)
-- Binary updater: scans the platform Downloads `bitcoin_builds/` folder and atomically replaces binaries
+- Native Bitcoin Core and electrs source builds with version checks, progress, logs, and transactional installation
 - Fully configurable data paths, persisted across sessions
 - Single-binary distribution — no runtime, no WebView, no Electron
 
-Recent release work in `0.1.2`:
-- Renamed the app, config namespace, and built binary to `BitEngine`
-- Bumped the crate and release version to `0.1.2`
-- Added first-class release artifacts for macOS Apple Silicon, Linux x86_64, and Linux ARM64
+Recent release work in `1.0.0`:
+- Integrated native Bitcoin Core and electrs source builds with authenticated release selection
+- Added transactional binary installation, rollback, and recovery
+- Added protocol-level Bitcoin/Electrs readiness and managed endpoint validation
 
 ---
 
@@ -86,21 +88,23 @@ macOS Intel/x86_64 and universal macOS app bundles are intentionally not built o
 Each node gets its own scrollable terminal panel showing real-time stdout and stderr. Output is streamed on dedicated OS threads and drained into the UI every 100 ms — the interface never blocks.
 
 ### Status indicators
-Three per node, updated automatically:
+Three per node, updated automatically from the owned process and current lifecycle generation:
 
-| Indicator | Condition |
-|---|---|
-| **Running** | Process is alive |
-| **Synced** | Bitcoin: `verificationprogress > 99.99%` via RPC · Electrs: key log phrases detected |
-| **Ready** | Running AND Synced |
+| Indicator | Bitcoin Core | Electrs |
+|---|---|---|
+| **Running** | The managed child process is alive | The managed child process is alive |
+| **Synced** | Authenticated RPC reports `initialblockdownload=false` and `blocks >= headers` | Core is synced, Electrs has answered the protocol probe, and its metrics tip is at least the current Core block height |
+| **Ready** | Authenticated RPC is usable, Core is compatible with Electrs, and a configured endpoint completes a Bitcoin mainnet P2P `version`/`verack` handshake | A correlated `server.version` response identifies Electrs and `server.features` succeeds for Bitcoin mainnet |
+
+Readiness is deliberately separate from synchronization. In particular, Bitcoin can be ready for Electrs to connect while both services are still catching up. A listening TCP socket, metrics endpoint, or live process alone never marks either service ready.
 
 ### Live block height
 Polls `getblockchaininfo` via JSON-RPC every 5 seconds and displays the current block height with comma formatting (e.g. `895,234`).
 
-### Binary updater
-Click **Update Binaries…** to scan the platform Downloads `bitcoin_builds/binaries/` folder for versioned folders (`bitcoin-27.0`, `electrs-0.10.5`), pick the highest semantic version, and atomically replace binaries in your configured `Binaries/` folder.
+### Binaries and updates
+Click **Update Binaries** to open BitEngine's native binaries page. Installed versions are detected directly from `bitcoind --version` and `electrs --version` while stable upstream releases load separately. Each row tells you whether the binary is missing, current, or has an update available.
 
-On macOS, if `bitcoin_builds` is not found, BitEngine checks for **BitForge.app** in `/Applications` and offers to open it. Linux users should place platform-specific Bitcoin Core and Electrs builds in the same Downloads layout.
+Builds run in the background with clear download, source-authentication, preparation, compilation, binary-verification, installation, and completion stages. Detailed Git/CMake/Cargo output is hidden behind **Build Details** and each durable build log is capped at 64 MiB. Advanced controls allow a specific stable release to be selected without cluttering the normal update flow.
 
 ### Graceful shutdown
 - **Electrs only**: graceful termination on Unix where available, then kill fallback
@@ -122,15 +126,20 @@ BitEngine derives default paths from the directory containing the executable. On
 ├── Binaries/
 │   ├── bitcoind
 │   ├── bitcoin-cli
+│   ├── bitcoin
 │   ├── bitcoin-tx
 │   ├── bitcoin-util
+│   ├── bitcoin-wallet
 │   └── electrs
+├── BitEngineBuilds/           ← private per-job sources/workspaces and bounded retained logs
 ├── BitcoinChain/
 │   └── bitcoin.conf         ← auto-created with sensible defaults if missing
 └── ElectrsDB/
 ```
 
 You can override this with the `BITENGINE_ROOT` environment variable; the legacy `BITCOIN_NODE_MANAGER_ROOT` name is still accepted for compatibility.
+
+The Bitcoin utility entries above are the complete managed filename family; the exact subset present depends on the selected upstream release and enabled build features.
 
 ---
 
@@ -149,7 +158,7 @@ rustup target add x86_64-unknown-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 ```
 
-> **Requires:** Rust 1.80+. macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
+> **Requires:** Rust 1.88+. macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
 
 ### Development build
 
@@ -246,29 +255,34 @@ rpcallowip=127.0.0.1
 # Cookie-based authentication is active by default.
 ```
 
-Cookie-based RPC authentication (`.cookie` file) is used by default. BitEngine checks `<datadir>/.cookie` and `<datadir>/mainnet/.cookie` before falling back to `rpcuser`/`rpcpassword` from `bitcoin.conf`.
+For a managed launch, BitEngine owns the mainnet RPC endpoint policy: it resolves the effective `rpcport`, passes that port to Core, uses Core's default loopback RPC binding, and forces the cookie to `<bitcoin_data_path>/.cookie`. Status checks and Electrs use that exact snapshotted cookie and the first working numeric loopback RPC address (`127.0.0.1` or `::1`); stale alternate cookies and static RPC credentials are not used.
+
+Bitcoin P2P exposure remains user-owned. BitEngine does not add or change `port`, `bind`, `whitebind`, or `listen`. Before spawning Core it inspects `settings.json`, `[main]` and global `bitcoin.conf` values, primary `includeconf` files, negations, and repeatable bind values using Core's precedence. It derives an ordered candidate set, confirms the actual listener with a bounded mainnet handshake, snapshots the selected endpoint for that running generation, and passes it explicitly to Electrs as `--daemon-p2p-addr`. Wildcard IPv4/IPv6 binds are reached through their matching loopback address; explicit numeric binds and ports are preserved. File edits while Core is running apply only to the next clean generation.
+
+Managed Electrs is rejected with a setting-specific explanation when configuration inspection is ambiguous or unsafe, P2P listening is disabled, a bind has no usable numeric endpoint, a managed port is zero/invalid, `maxconnections` is below Electrs's required 12, or relevant config/settings/include files cannot be inspected. Runtime checks also block Electrs when Core is pruned, has networking inactive, is too old, has no authenticated RPC service, or exposes no candidate that completes the P2P handshake. BitEngine does not weaken those settings or broaden Core's P2P exposure automatically.
 
 ---
 
 ## Binary update system
 
-**Update Binaries…** (toolbar button) runs the following flow:
+**Update Binaries** routes to a dedicated BitEngine page and runs the following native flow:
 
-1. Check the platform Downloads `bitcoin_builds/binaries/` directory
-2. Scan for folders matching `bitcoin-X.Y.Z` and `electrs-X.Y.Z`
-3. Pick the highest semantic version for each (major.minor.patch tuple comparison)
-4. Copy binaries into the configured `Binaries/` folder:
-   - Written to a `.tmp` file first
-   - executable permissions applied on Unix platforms
-   - Atomically renamed to the final path — a running binary is never half-replaced
-5. Report what was updated in an overlay dialog
+1. Detect installed versions and fetch stable upstream releases
+2. Validate build tools and available disk space using the filesystem's native free-space information
+3. Clone the selected release into a fresh private per-job source directory
+4. Check the Git origin, selected tag/commit, signed tag, and pristine working tree
+5. Compile Bitcoin Core with the node-only CMake flags or electrs with Cargo `--locked`
+6. Run every discovered managed output and confirm that it reports the requested version
+7. Stage the complete binary set inside the configured destination filesystem
+8. Durably journal, back up, activate, and commit the complete managed set, rolling back on failure
 
-If `bitcoin_builds` is not found:
+Bitcoin Core tags are accepted only when Git verifies them through GnuPG and the reported primary fingerprint is in BitEngine's pinned copy of Bitcoin Core's official trusted-key set. Older electrs tags use the maintainer's pinned OpenPGP fingerprint; electrs v0.11.1 uses the maintainer's pinned SSH signing key. A missing verifier, missing key, invalid signature, expired/revoked key, or unexpected signer fails closed before compilation. Maintainer keys must be obtained and their full fingerprints checked using the upstream projects' official verification guidance; BitEngine does not fetch keys or weaken authentication automatically. Unknown future electrs releases are withheld until a reviewed BitEngine signer-policy update covers them.
 
-| Condition | Behaviour |
-|---|---|
-| macOS `/Applications/BitForge.app` exists | Offers to open BitForge |
-| BitForge not found or non-macOS platform | Shows instructions to place platform-specific builds in Downloads |
+In-process coordination and cross-process workspace and destination locks prevent overlapping mutation. Builds can be cancelled before installation; BitEngine terminates the complete build process group and escalates to a kill if it does not exit. Installation itself is a short, non-cancellable transaction. A durable `Prepared`/`Committed` journal lets startup recovery either restore the entire old managed set or validate and finish the new set before the destination can be used again. Outputs absent from the new Bitcoin release are transactionally removed from the managed `bitcoind`, `bitcoin-cli`, `bitcoin`, `bitcoin-tx`, `bitcoin-util`, and `bitcoin-wallet` family rather than leaving mixed-version tools behind.
+
+Job stage, result, and log location are persisted to `build-job.json` in BitEngine's config directory. Each log is capped at 64 MiB, only the eight newest job directories/logs are retained, and private source and work trees are removed after the job. Existing binaries are not touched until source, compilation, and every-artifact verification have succeeded.
+
+See [Native binary build architecture](docs/binaries.md) for the module map, safety model, and former BitForge boundary.
 
 ---
 
@@ -283,7 +297,6 @@ src/
 │
 ├── platform.rs        Platform boundary
 │                      · Supported target detection
-│                      · Downloads/home fallbacks
 │                      · Unix executable permissions and termination signal
 │
 ├── config.rs          Persistent configuration
@@ -292,21 +305,25 @@ src/
 │
 ├── rpc.rs             Bitcoin JSON-RPC client
 │                      · reqwest + rustls (no OpenSSL dependency)
-│                      · Cookie-file auth with bitcoin.conf fallback
+│                      · Exact managed-generation cookie and numeric endpoint
 │                      · Auto-creates bitcoin.conf when missing
-│                      · getblockchaininfo polling, stop command
+│                      · getblockchaininfo/getnetworkinfo polling, stop command
 │
 ├── process_manager.rs Child process lifecycle
 │                      · Spawns bitcoind / electrs with stdout+stderr pipes
 │                      · Two OS reader threads per process → Arc<Mutex<VecDeque>>
 │                      · Platform termination request → 10 s grace period → kill
 │
-├── updater.rs         Binary update system
-│                      · Semver folder scanning (tuple comparison, no regex)
-│                      · Atomic copy: temp file → executable bit on Unix → rename
-│                      · macOS BitForge.app detection and fallback instructions
+├── binaries/          Native binary build/update service
+│   ├── mod.rs         Versions, release discovery, installed detection, shared types
+│   ├── environment.rs PATH, pkg-config, Cargo, and LLVM environment setup
+│   ├── dependencies.rs Target-specific build requirement checks and guidance
+│   ├── process.rs     Cancellable process execution and streamed output
+│   ├── install.rs     Transactional multi-binary installation and rollback
+│   └── service.rs     Single-job orchestration, persistence, build pipelines
 │
-└── ui.rs              Iced 0.14 MVU application
+├── ui.rs              Iced 0.14 MVU state, routing, and task dispatch
+└── ui_render.rs       Dashboard and native binaries-page rendering
                        · App state struct
                        · Message enum (all events)
                        · update() — state transitions + Task dispatch
@@ -318,9 +335,16 @@ src/
 
 ```
 Main thread (Iced / tokio event loop)
-   ├─ OutputTick every 100 ms  → drains both output queues into terminal buffers
+   ├─ OutputTick every 100 ms  → drains node output and native build events
    └─ RpcTick every 5 s        → Task::perform(async getblockchaininfo)
                                       └─ reqwest HTTP → BlockchainInfoReceived
+
+Native build task (at most one)
+   ├─ release/version HTTP and local probes
+   ├─ git / cmake / cargo child processes
+   │    ├─ stdout reader task ─┐
+   │    └─ stderr reader task ─┴→ progress UI + durable build log
+   └─ verified staging → transactional install or rollback
 
 Per-process background threads (2 per running node)
    ├─ stdout reader  ─┐
@@ -361,8 +385,8 @@ The Iced update loop is the only writer to UI state. The background threads only
 | Process shutdown | `terminate()` only | RPC stop → platform termination → kill |
 | Binary copy safety | `shutil.copy2` (non-atomic) | temp file → executable bit on Unix → atomic rename |
 | Semver comparison | Regex + string sort | Tuple comparison `(major, minor, patch)` |
-| Electrs sync detection | 3 log patterns | 5 log patterns |
-| RPC auth | Cookie + fallback | Same, cleaner error messages |
+| Electrs sync detection | Log patterns | Metrics plus correlated Electrum JSON-RPC probes |
+| RPC auth | Cookie + fallback | Exact managed-generation cookie and endpoint snapshot |
 | Single-instance guard | Unix file lock | localhost listener guard |
 | Error handling | `try/except`, silent failures | `Result<T,E>` throughout, no `unwrap()` |
 | Type safety | Runtime | Compile-time |
@@ -377,6 +401,6 @@ MIT — see [LICENSE](LICENSE).
 
 ## Related projects
 
-- [BitForge](https://github.com/csd113/BitForge) — builds Bitcoin Core and Electrs binaries for use with BitEngine
+- [BitForge](https://github.com/csd113/BitForge) — frozen historical standalone implementation; active build/update code now lives in BitEngine
 - [Bitcoin Core](https://github.com/bitcoin/bitcoin)
 - [Electrs](https://github.com/romanz/electrs)

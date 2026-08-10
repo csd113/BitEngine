@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_NAME="BitEngine"
 BUNDLE_ID="com.yourname.bitengine"
-VERSION="0.1.2"
+VERSION="1.0.0"
 TARGET="aarch64-apple-darwin"
 
 # Set this to your actual Cargo binary name if different

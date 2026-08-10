@@ -2,12 +2,11 @@
 
 use std::{
     net::TcpListener,
-    path::{Path, PathBuf},
-    process::{Child, Command},
+    path::{Component, Path, PathBuf},
+    process::Child,
 };
 
 use anyhow::{Context as _, Result};
-use directories::UserDirs;
 
 pub const APP_NAME: &str = "BitEngine";
 
@@ -64,24 +63,8 @@ pub fn executable_name(base: &str) -> String {
 }
 
 #[must_use]
-pub fn bitcoin_binary_names() -> Vec<String> {
-    ["bitcoind", "bitcoin-cli", "bitcoin-tx", "bitcoin-util"]
-        .into_iter()
-        .map(executable_name)
-        .collect()
-}
-
-#[must_use]
 pub fn electrs_binary_name() -> String {
     executable_name("electrs")
-}
-
-#[must_use]
-pub fn downloads_bitcoin_builds_dir() -> PathBuf {
-    UserDirs::new()
-        .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
-        .unwrap_or_else(home_dir)
-        .join("bitcoin_builds")
 }
 
 #[must_use]
@@ -102,47 +85,57 @@ pub fn set_executable_permissions(path: &Path) -> Result<()> {
     std::fs::set_permissions(path, perms).with_context(|| format!("chmod {}", path.display()))
 }
 
+/// Resolve an application-managed directory only after rejecting a symbolic
+/// link or non-directory at its final path component.
+pub fn prepare_real_directory(path: &Path, label: &str, create: bool) -> Result<PathBuf> {
+    if !path.is_absolute()
+        || path.parent().is_none()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        anyhow::bail!("unsafe {label} path: {}", path.display());
+    }
+
+    let mut created = false;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            anyhow::bail!("{label} must be a real directory: {}", path.display());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("create {label} {}", path.display()))?;
+            created = true;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("{label} not found at {}", path.display());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {label} {}", path.display()));
+        }
+    }
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reinspect {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("{label} changed during validation: {}", path.display());
+    }
+    if created {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("secure {label} {}", path.display()))?;
+    }
+    std::fs::canonicalize(path).with_context(|| format!("canonicalize {label} {}", path.display()))
+}
+
 pub fn terminate_child(child: &Child) {
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
         // SAFETY: `pid` comes from a live child process owned by this handle,
         // and `kill` only sends a signal to that operating-system process.
         let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
     }
-}
-
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn bitforge_app_path() -> Option<PathBuf> {
-    let path = PathBuf::from("/Applications/BitForge.app");
-    path.exists().then_some(path)
-}
-
-#[cfg(not(target_os = "macos"))]
-#[must_use]
-pub fn bitforge_app_path() -> Option<PathBuf> {
-    None
-}
-
-pub fn open_path(path: &Path) -> Result<()> {
-    open_path_impl(path)
-}
-
-#[cfg(target_os = "macos")]
-fn open_path_impl(path: &Path) -> Result<()> {
-    Command::new("open")
-        .arg(path)
-        .spawn()
-        .with_context(|| format!("open {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn open_path_impl(path: &Path) -> Result<()> {
-    Command::new("xdg-open")
-        .arg(path)
-        .spawn()
-        .with_context(|| format!("open {}", path.display()))?;
-    Ok(())
 }
 
 #[must_use]

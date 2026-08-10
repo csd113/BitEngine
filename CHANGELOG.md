@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+## 1.0.0 - 2026-08-09
+
+- Bumped the crate and release version to `1.0.0`
+- Integrated Bitcoin Core and electrs source builds as a native BitEngine binaries page
+- Added installed/latest version detection, stable release selection, staged progress, cancellation, and expandable build logs
+- Added dependency and native disk-space checks, fresh private source trees, authorized-signer-pinned tag authentication, and all-artifact version validation
+- Added bounded build logs and retention, process-group cancellation, cross-process workspace/destination locks, and path-confinement checks
+- Added durable prepared/committed installation recovery with startup gating, complete-set rollback, and transactional removal of obsolete managed binaries
+- Corrected the declared Rust minimum to 1.88 to match the locked dependency graph
+- Removed the legacy Downloads-folder updater and BitForge application-launch fallback
+- Documented the native build architecture and the frozen historical BitForge boundary
+
 ## 0.1.2 - 2026-05-15
 
 - Renamed the app, config namespace, and packaged binary to `BitEngine`
