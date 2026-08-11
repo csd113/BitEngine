@@ -2,8 +2,8 @@ use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::{
     font::Font,
     widget::{
-        button, column, container, pick_list, progress_bar, row, scrollable, text, text_input, Id,
-        Space,
+        button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, text,
+        text_input, Id, Space,
     },
     Alignment, Color, Element, Length, Padding,
 };
@@ -14,7 +14,7 @@ use crate::{
     platform::APP_NAME,
 };
 
-use super::{App, Message, Page};
+use super::{App, Message, OutputPane, Page};
 
 const BG: Color = Color {
     r: 0.949,
@@ -141,6 +141,26 @@ pub(super) const fn electrs_scroll_id() -> Id {
 
 pub(super) const fn build_scroll_id() -> Id {
     Id::new("binary_build_details")
+}
+
+pub(super) const fn output_scroll_id(pane: OutputPane) -> Id {
+    match pane {
+        OutputPane::Bitcoin => bitcoin_scroll_id(),
+        OutputPane::Electrs => electrs_scroll_id(),
+        OutputPane::Build => build_scroll_id(),
+    }
+}
+
+fn output_viewport_changed(
+    pane: OutputPane,
+    viewport: iced::widget::scrollable::Viewport,
+) -> Message {
+    Message::OutputViewportChanged {
+        pane,
+        offset_y: viewport.absolute_offset().y,
+        viewport_height: viewport.bounds().height,
+        content_height: viewport.content_bounds().height,
+    }
 }
 
 pub(super) fn view(app: &App) -> Element<'_, Message> {
@@ -733,9 +753,19 @@ fn build_details(app: &App) -> Element<'_, Message> {
     };
     let details = scrollable(container(terminal_content).padding(12).width(Length::Fill))
         .id(build_scroll_id())
+        .on_scroll(|viewport| output_viewport_changed(OutputPane::Build, viewport))
         .direction(Direction::Vertical(Scrollbar::default()))
         .height(260)
         .width(Length::Fill);
+    let details = mouse_area(details)
+        .on_enter(Message::OutputPaneHoverChanged {
+            pane: OutputPane::Build,
+            hovered: true,
+        })
+        .on_exit(Message::OutputPaneHoverChanged {
+            pane: OutputPane::Build,
+            hovered: false,
+        });
     container(details)
         .width(Length::Fill)
         .style(|_| container::Style {
@@ -1090,6 +1120,7 @@ fn view_node_panels(app: &App) -> Element<'_, Message> {
         synced: app.bitcoin_synced,
         ready: app.bitcoin_ready(),
         lines: &app.bitcoin_lines,
+        output_pane: OutputPane::Bitcoin,
         scroll_id: bitcoin_scroll_id(),
     });
     let electrs_panel = view_node_panel(NodePanelSpec {
@@ -1118,6 +1149,7 @@ fn view_node_panels(app: &App) -> Element<'_, Message> {
         synced: app.electrs_status.synced,
         ready: app.electrs_status.ready,
         lines: &app.electrs_lines,
+        output_pane: OutputPane::Electrs,
         scroll_id: electrs_scroll_id(),
     });
 
@@ -1137,6 +1169,7 @@ struct NodePanelSpec<'a> {
     synced: bool,
     ready: bool,
     lines: &'a [String],
+    output_pane: OutputPane,
     scroll_id: Id,
 }
 
@@ -1153,7 +1186,7 @@ fn view_node_panel(spec: NodePanelSpec<'_>) -> Element<'_, Message> {
         horizontal_rule(),
         panel_indicators(spec.running, spec.synced, spec.ready),
         horizontal_rule(),
-        terminal_container(spec.running, spec.lines, spec.scroll_id),
+        terminal_container(spec.running, spec.lines, spec.output_pane, spec.scroll_id,),
     ]
     .width(Length::Fill)
     .height(Length::Fill);
@@ -1261,7 +1294,12 @@ fn panel_indicators(running: bool, synced: bool, ready: bool) -> Element<'static
     .into()
 }
 
-fn terminal_container(running: bool, lines: &[String], scroll_id: Id) -> Element<'_, Message> {
+fn terminal_container(
+    running: bool,
+    lines: &[String],
+    output_pane: OutputPane,
+    scroll_id: Id,
+) -> Element<'_, Message> {
     let terminal_header = container(
         row![
             row![
@@ -1314,9 +1352,19 @@ fn terminal_container(running: bool, lines: &[String], scroll_id: Id) -> Element
 
     let terminal = scrollable(terminal_content)
         .id(scroll_id)
+        .on_scroll(move |viewport| output_viewport_changed(output_pane, viewport))
         .direction(Direction::Vertical(Scrollbar::default()))
         .height(Length::Fill)
         .width(Length::Fill);
+    let terminal = mouse_area(terminal)
+        .on_enter(Message::OutputPaneHoverChanged {
+            pane: output_pane,
+            hovered: true,
+        })
+        .on_exit(Message::OutputPaneHoverChanged {
+            pane: output_pane,
+            hovered: false,
+        });
 
     container(column![terminal_header, terminal].spacing(8))
         .width(Length::Fill)

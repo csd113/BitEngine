@@ -36,7 +36,7 @@ use std::{
 mod ui_render;
 
 use iced::{
-    time,
+    keyboard, time,
     widget::{self, scrollable},
     Element, Subscription, Task,
 };
@@ -61,6 +61,8 @@ const BUILD_EVENT_QUEUE_CAPACITY: usize = 256;
 const MAX_BUILD_EVENTS_PER_TICK: usize = 256;
 const BITCOIN_RPC_STARTUP_TIMEOUT: Duration = Duration::from_mins(5);
 const BITCOIN_RPC_STARTUP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const OUTPUT_BOTTOM_TOLERANCE: f32 = 2.0;
+const OUTPUT_PAGE_SCROLL_FRACTION: f32 = 0.9;
 
 // ── Message ───────────────────────────────────────────────────────────────────
 
@@ -71,6 +73,20 @@ pub enum Message {
     OutputTick,
     /// 5 s — poll Bitcoin RPC for chain state.
     RpcTick,
+
+    // ── Terminal viewport scrolling ─────────────────────────────────────────
+    OutputViewportChanged {
+        pane: OutputPane,
+        offset_y: f32,
+        viewport_height: f32,
+        content_height: f32,
+    },
+    OutputPaneHoverChanged {
+        pane: OutputPane,
+        hovered: bool,
+    },
+    OutputPageUp,
+    OutputPageDown,
 
     // ── Path editing ─────────────────────────────────────────────────────────
     BinariesPathChanged(String),
@@ -130,6 +146,99 @@ pub enum Message {
 enum Page {
     Dashboard,
     Binaries,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputPane {
+    Bitcoin,
+    Electrs,
+    Build,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputViewportState {
+    follow_output: bool,
+    offset_y: f32,
+    viewport_height: f32,
+    content_height: f32,
+}
+
+impl Default for OutputViewportState {
+    fn default() -> Self {
+        Self {
+            follow_output: true,
+            offset_y: 0.0,
+            viewport_height: 0.0,
+            content_height: 0.0,
+        }
+    }
+}
+
+impl OutputViewportState {
+    fn update(&mut self, offset_y: f32, viewport_height: f32, content_height: f32) {
+        let offset_y = finite_nonnegative(offset_y);
+        let viewport_height = finite_nonnegative(viewport_height);
+        let content_height = finite_nonnegative(content_height);
+        let maximum_offset = (content_height - viewport_height).max(0.0);
+        let offset_y = offset_y.min(maximum_offset);
+        let moved_up = offset_y + f32::EPSILON < self.offset_y;
+        let content_grew = content_height > self.content_height + f32::EPSILON;
+        let at_bottom = maximum_offset - offset_y <= OUTPUT_BOTTOM_TOLERANCE;
+
+        self.follow_output = if moved_up {
+            false
+        } else if at_bottom {
+            true
+        } else if content_grew {
+            self.follow_output
+        } else {
+            false
+        };
+        self.offset_y = offset_y;
+        self.viewport_height = viewport_height;
+        self.content_height = content_height;
+    }
+
+    fn can_scroll(&self) -> bool {
+        self.content_height > self.viewport_height + f32::EPSILON
+    }
+
+    fn page_scroll_distance(&self) -> f32 {
+        self.viewport_height * OUTPUT_PAGE_SCROLL_FRACTION
+    }
+}
+
+#[derive(Debug, Default)]
+struct OutputViewports {
+    bitcoin: OutputViewportState,
+    electrs: OutputViewportState,
+    build: OutputViewportState,
+}
+
+impl OutputViewports {
+    const fn get(&self, pane: OutputPane) -> &OutputViewportState {
+        match pane {
+            OutputPane::Bitcoin => &self.bitcoin,
+            OutputPane::Electrs => &self.electrs,
+            OutputPane::Build => &self.build,
+        }
+    }
+
+    const fn get_mut(&mut self, pane: OutputPane) -> &mut OutputViewportState {
+        match pane {
+            OutputPane::Bitcoin => &mut self.bitcoin,
+            OutputPane::Electrs => &mut self.electrs,
+            OutputPane::Build => &mut self.build,
+        }
+    }
+}
+
+const fn finite_nonnegative(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 #[derive(Debug)]
@@ -370,6 +479,8 @@ pub struct App {
     page: Page,
     paths_visible: bool,
     binary_page: BinaryPageState,
+    output_viewports: OutputViewports,
+    hovered_output_pane: Option<OutputPane>,
     build_service: BuildService,
     build_event_tx: mpsc::Sender<BuildEvent>,
     build_event_rx: mpsc::Receiver<BuildEvent>,
@@ -509,6 +620,8 @@ impl App {
             page: Page::Dashboard,
             paths_visible: true,
             binary_page,
+            output_viewports: OutputViewports::default(),
+            hovered_output_pane: None,
             build_service,
             build_event_tx,
             build_event_rx,
@@ -537,6 +650,29 @@ impl App {
         match message {
             Message::OutputTick => self.handle_output_tick(),
             Message::RpcTick => self.handle_rpc_tick(),
+            Message::OutputViewportChanged {
+                pane,
+                offset_y,
+                viewport_height,
+                content_height,
+            } => {
+                self.output_viewports.get_mut(pane).update(
+                    offset_y,
+                    viewport_height,
+                    content_height,
+                );
+                Task::none()
+            }
+            Message::OutputPaneHoverChanged { pane, hovered } => {
+                if hovered {
+                    self.hovered_output_pane = Some(pane);
+                } else if self.hovered_output_pane == Some(pane) {
+                    self.hovered_output_pane = None;
+                }
+                Task::none()
+            }
+            Message::OutputPageUp => self.scroll_output_page(-1.0),
+            Message::OutputPageDown => self.scroll_output_page(1.0),
             Message::BinariesPathChanged(s) => {
                 if self.paths_are_editable() {
                     self.binaries_path_edit = s;
@@ -617,10 +753,12 @@ impl App {
             Message::ShutdownElectrsOnly => self.shutdown_electrs_only(),
             Message::OpenDashboard => {
                 self.page = Page::Dashboard;
+                self.hovered_output_pane = None;
                 Task::none()
             }
             Message::OpenBinaries => {
                 self.page = Page::Binaries;
+                self.hovered_output_pane = None;
                 self.refresh_binary_info()
             }
             Message::RefreshBinaryInfo => self.refresh_binary_info(),
@@ -665,6 +803,11 @@ impl App {
             Message::ToggleBuildDetails => {
                 self.binary_page.disclosures.build_details =
                     !self.binary_page.disclosures.build_details;
+                if !self.binary_page.disclosures.build_details
+                    && self.hovered_output_pane == Some(OutputPane::Build)
+                {
+                    self.hovered_output_pane = None;
+                }
                 Task::none()
             }
             Message::ToggleBuildAdvanced => {
@@ -726,7 +869,7 @@ impl App {
         self.reconcile_node_lifecycle();
 
         let mut tasks: Vec<Task<Message>> = Vec::new();
-        if btc_new {
+        if self.should_follow_new_output(OutputPane::Bitcoin, btc_new) {
             tasks.push(widget::operation::scroll_to(
                 ui_render::bitcoin_scroll_id(),
                 scrollable::AbsoluteOffset {
@@ -735,7 +878,7 @@ impl App {
                 },
             ));
         }
-        if els_new {
+        if self.should_follow_new_output(OutputPane::Electrs, els_new) {
             tasks.push(widget::operation::scroll_to(
                 ui_render::electrs_scroll_id(),
                 scrollable::AbsoluteOffset {
@@ -744,7 +887,9 @@ impl App {
                 },
             ));
         }
-        if build_new && self.binary_page.disclosures.build_details {
+        if self.should_follow_new_output(OutputPane::Build, build_new)
+            && self.binary_page.disclosures.build_details
+        {
             tasks.push(widget::operation::scroll_to(
                 ui_render::build_scroll_id(),
                 scrollable::AbsoluteOffset {
@@ -762,6 +907,31 @@ impl App {
         } else {
             Task::batch(tasks)
         }
+    }
+
+    const fn should_follow_new_output(&self, pane: OutputPane, has_new_output: bool) -> bool {
+        has_new_output && self.output_viewports.get(pane).follow_output
+    }
+
+    fn scroll_output_page(&mut self, direction: f32) -> Task<Message> {
+        let Some(pane) = self.hovered_output_pane else {
+            return Task::none();
+        };
+        let viewport = self.output_viewports.get_mut(pane);
+        if !viewport.can_scroll() {
+            return Task::none();
+        }
+        if direction.is_sign_negative() {
+            viewport.follow_output = false;
+        }
+
+        widget::operation::scroll_by(
+            ui_render::output_scroll_id(pane),
+            scrollable::AbsoluteOffset {
+                x: 0.0,
+                y: direction * viewport.page_scroll_distance(),
+            },
+        )
     }
 
     fn handle_rpc_tick(&mut self) -> Task<Message> {
@@ -1644,6 +1814,7 @@ impl App {
         self.binary_page.stage = Some(BuildStage::CheckingRequirements);
         self.binary_page.progress = BuildStage::CheckingRequirements.progress();
         self.binary_page.log_lines.clear();
+        self.output_viewports.build = OutputViewportState::default();
         self.binary_page.disclosures.build_details = false;
         self.binary_page.cancellation_requested = false;
         self.binary_page.error = None;
@@ -1866,6 +2037,19 @@ impl App {
         Subscription::batch([
             time::every(Duration::from_millis(100)).map(|_| Message::OutputTick),
             time::every(Duration::from_secs(5)).map(|_| Message::RpcTick),
+            keyboard::listen().filter_map(|event| match event {
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::PageUp),
+                    ..
+                } => Some(Message::OutputPageUp),
+                keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::PageDown),
+                    ..
+                } => Some(Message::OutputPageDown),
+                keyboard::Event::KeyPressed { .. }
+                | keyboard::Event::KeyReleased { .. }
+                | keyboard::Event::ModifiersChanged(_) => None,
+            }),
         ])
     }
 
@@ -2205,6 +2389,143 @@ mod tests {
         app.binary_page.active_operation = Some(operation_id);
         app.binary_page.displayed_operation = Some(operation_id);
         app.binary_page.active_kind = Some(kind);
+    }
+
+    fn clear_node_output_queues(app: &App) -> anyhow::Result<()> {
+        let Ok(mut bitcoin) = app.bitcoin_queue.lock() else {
+            anyhow::bail!("bitcoin output queue was poisoned");
+        };
+        bitcoin.clear();
+        drop(bitcoin);
+
+        let Ok(mut electrs) = app.electrs_queue.lock() else {
+            anyhow::bail!("electrs output queue was poisoned");
+        };
+        electrs.clear();
+        Ok(())
+    }
+
+    fn update_output_viewport(
+        app: &mut App,
+        pane: OutputPane,
+        offset_y: f32,
+        viewport_height: f32,
+        content_height: f32,
+    ) {
+        drop(app.update(Message::OutputViewportChanged {
+            pane,
+            offset_y,
+            viewport_height,
+            content_height,
+        }));
+    }
+
+    #[test]
+    fn terminal_at_bottom_follows_new_output() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        clear_node_output_queues(&app)?;
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 800.0, 200.0, 1_000.0);
+
+        // A layout notification can report the newly-grown content before the
+        // queued scroll operation runs. It must not look like user scrolling.
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 800.0, 200.0, 1_010.0);
+        push_msg(&app.bitcoin_queue, "new output");
+
+        let task = app.handle_output_tick();
+
+        assert_eq!(task.units(), 1);
+        assert!(app.output_viewports.bitcoin.follow_output);
+        assert_eq!(app.bitcoin_lines, vec!["new output"]);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_scrolled_up_preserves_viewport_when_output_arrives() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        clear_node_output_queues(&app)?;
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 800.0, 200.0, 1_000.0);
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 799.5, 200.0, 1_000.0);
+        let preserved_offset = app.output_viewports.bitcoin.offset_y;
+        push_msg(&app.bitcoin_queue, "new output while reading history");
+
+        let task = app.handle_output_tick();
+
+        assert_eq!(task.units(), 0);
+        assert!(!app.output_viewports.bitcoin.follow_output);
+        assert!((app.output_viewports.bitcoin.offset_y - preserved_offset).abs() < f32::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_scrolled_up_ignores_large_output_burst() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        clear_node_output_queues(&app)?;
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 800.0, 200.0, 1_000.0);
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 250.0, 200.0, 1_000.0);
+
+        let Ok(mut queue) = app.bitcoin_queue.lock() else {
+            anyhow::bail!("bitcoin output queue was poisoned");
+        };
+        queue.extend((0..4_000).map(|index| format!("burst line {index}")));
+        drop(queue);
+
+        let task = app.handle_output_tick();
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 250.0, 200.0, 5_000.0);
+
+        assert_eq!(task.units(), 0);
+        assert_eq!(app.bitcoin_lines.len(), 4_000);
+        assert!(!app.output_viewports.bitcoin.follow_output);
+        assert!((app.output_viewports.bitcoin.offset_y - 250.0).abs() < f32::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_returned_to_bottom_resumes_following() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        clear_node_output_queues(&app)?;
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 800.0, 200.0, 1_000.0);
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 300.0, 200.0, 1_000.0);
+        assert!(!app.output_viewports.bitcoin.follow_output);
+
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 798.5, 200.0, 1_000.0);
+        assert!(app.output_viewports.bitcoin.follow_output);
+        push_msg(&app.bitcoin_queue, "following again");
+
+        assert_eq!(app.handle_output_tick().units(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_scroll_inputs_and_page_keys_share_follow_state() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        update_output_viewport(&mut app, OutputPane::Electrs, 800.0, 200.0, 1_000.0);
+        drop(app.update(Message::OutputPaneHoverChanged {
+            pane: OutputPane::Electrs,
+            hovered: true,
+        }));
+
+        assert_eq!(app.update(Message::OutputPageUp).units(), 1);
+        assert!(!app.output_viewports.electrs.follow_output);
+        assert_eq!(app.update(Message::OutputPageDown).units(), 1);
+
+        // Wheel, trackpad, touch, and scrollbar movements all arrive through
+        // the scrollable's viewport callback and therefore use this same path.
+        update_output_viewport(&mut app, OutputPane::Electrs, 600.0, 200.0, 1_000.0);
+        assert!(!app.output_viewports.electrs.follow_output);
+        update_output_viewport(&mut app, OutputPane::Electrs, 800.0, 200.0, 1_000.0);
+        assert!(app.output_viewports.electrs.follow_output);
+
+        drop(app.update(Message::OutputPaneHoverChanged {
+            pane: OutputPane::Electrs,
+            hovered: false,
+        }));
+        assert_eq!(app.update(Message::OutputPageUp).units(), 0);
+        Ok(())
     }
 
     fn alternate_config(root: &Path) -> Config {
