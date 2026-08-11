@@ -45,12 +45,12 @@ use tokio::sync::mpsc;
 use crate::{
     binaries::{
         self, AvailableVersions, BinaryKind, BuildEvent, BuildFailure, BuildOperationId,
-        BuildRequest, BuildService, BuildStage, BuildSummary, InstalledVersions, PersistedBuild,
-        PersistedBuildStatus, ReleaseVersion,
+        BuildRequest, BuildService, BuildStage, BuildSummary, DependencyInstallOutcome,
+        DependencyReport, InstalledVersions, PersistedBuild, PersistedBuildStatus, ReleaseVersion,
     },
     bitcoin_config::{resolve_managed_endpoints, ManagedBitcoinEndpoints},
     bitcoin_status,
-    config::Config,
+    config::{BuildPerformance, BuildSettings, Config},
     electrs_status::{self, ElectrsStatus},
     platform::{self, Platform},
     process_manager::{self, new_queue, ElectrsBitcoinConnection, OutputQueue, ProcessHandle},
@@ -133,6 +133,22 @@ pub enum Message {
     CancelBuild,
     ToggleBuildDetails,
     ToggleBuildAdvanced,
+    BuildPerformanceChanged(BuildPerformance),
+    KeepSourceChanged(bool),
+    CleanBuildChanged(bool),
+    VerboseBuildOutputChanged(bool),
+    RestoreBuildDefaults,
+    CheckDependencies,
+    DependenciesScanned {
+        request_id: u64,
+        report: DependencyReport,
+    },
+    InstallDependencies,
+    DependenciesInstalled {
+        request_id: u64,
+        outcome: DependencyInstallOutcome,
+    },
+    ToggleDependencyDetails,
 
     // ── Async results ─────────────────────────────────────────────────────────
     StatusPollReceived(Box<StatusPollResult>),
@@ -262,6 +278,10 @@ struct BinaryPageState {
     error: Option<String>,
     success: Option<String>,
     last_log_path: Option<PathBuf>,
+    dependency_report: Option<DependencyReport>,
+    dependency_load: DependencyLoad,
+    dependency_request: Option<u64>,
+    dependency_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +299,13 @@ enum InventoryLoad {
     Loading,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyLoad {
+    Idle,
+    Checking,
+    Installing,
+}
+
 impl InventoryLoad {
     const fn is_loading(self) -> bool {
         matches!(self, Self::Loading)
@@ -289,6 +316,7 @@ impl InventoryLoad {
 struct BinaryDisclosures {
     build_details: bool,
     advanced: bool,
+    dependency_details: bool,
 }
 
 impl BinaryPageState {
@@ -313,6 +341,10 @@ impl BinaryPageState {
             error: None,
             success: None,
             last_log_path: None,
+            dependency_report: None,
+            dependency_load: DependencyLoad::Idle,
+            dependency_request: None,
+            dependency_message: None,
         };
 
         if let Some(build) = recovered {
@@ -488,6 +520,7 @@ pub struct App {
     next_path_save: u64,
     next_inventory_request: u64,
     next_build_operation: u64,
+    next_dependency_request: u64,
     lifecycle_generation: u64,
     next_status_poll: u64,
     active_status_poll: Option<StatusPollIdentity>,
@@ -629,6 +662,7 @@ impl App {
             next_path_save: 1,
             next_inventory_request: 1,
             next_build_operation: 1,
+            next_dependency_request: 1,
             lifecycle_generation: 1,
             next_status_poll: 1,
             active_status_poll: None,
@@ -759,9 +793,9 @@ impl App {
             Message::OpenBinaries => {
                 self.page = Page::Binaries;
                 self.hovered_output_pane = None;
-                self.refresh_binary_info()
+                self.refresh_binaries_page()
             }
-            Message::RefreshBinaryInfo => self.refresh_binary_info(),
+            Message::RefreshBinaryInfo => self.refresh_binaries_page(),
             Message::InstalledVersionsLoaded {
                 request_id,
                 versions,
@@ -812,6 +846,49 @@ impl App {
             }
             Message::ToggleBuildAdvanced => {
                 self.binary_page.disclosures.advanced = !self.binary_page.disclosures.advanced;
+                Task::none()
+            }
+            Message::BuildPerformanceChanged(performance) => {
+                self.update_build_settings(|settings| settings.performance = performance)
+            }
+            Message::KeepSourceChanged(keep_source) => {
+                self.update_build_settings(|settings| settings.keep_source = keep_source)
+            }
+            Message::CleanBuildChanged(clean_build) => {
+                self.update_build_settings(|settings| settings.clean_build = clean_build)
+            }
+            Message::VerboseBuildOutputChanged(verbose_output) => {
+                self.update_build_settings(|settings| settings.verbose_output = verbose_output)
+            }
+            Message::RestoreBuildDefaults => {
+                self.update_build_settings(|settings| *settings = BuildSettings::default())
+            }
+            Message::CheckDependencies => self.check_dependencies(),
+            Message::DependenciesScanned { request_id, report } => {
+                if self.binary_page.dependency_request == Some(request_id) {
+                    self.binary_page.dependency_load = DependencyLoad::Idle;
+                    self.binary_page.dependency_report = Some(report);
+                    self.binary_page.dependency_request = None;
+                    self.binary_page.dependency_message = None;
+                }
+                Task::none()
+            }
+            Message::InstallDependencies => self.install_dependencies(),
+            Message::DependenciesInstalled {
+                request_id,
+                outcome,
+            } => {
+                if self.binary_page.dependency_request == Some(request_id) {
+                    self.binary_page.dependency_load = DependencyLoad::Idle;
+                    self.binary_page.dependency_report = Some(outcome.report);
+                    self.binary_page.dependency_request = None;
+                    self.binary_page.dependency_message = Some(outcome.message);
+                }
+                Task::none()
+            }
+            Message::ToggleDependencyDetails => {
+                self.binary_page.disclosures.dependency_details =
+                    !self.binary_page.disclosures.dependency_details;
                 Task::none()
             }
             Message::StatusPollReceived(result) => self.apply_status_poll(*result),
@@ -1370,6 +1447,10 @@ impl App {
         self.binary_page.selected_electrs = None;
     }
 
+    fn refresh_binaries_page(&mut self) -> Task<Message> {
+        Task::batch([self.refresh_binary_info(), self.check_dependencies()])
+    }
+
     fn save_paths(&mut self) -> Task<Message> {
         if !self.paths_are_editable() {
             self.overlay_message = Some(
@@ -1392,6 +1473,7 @@ impl App {
             binaries_path: PathBuf::from(&bins),
             bitcoin_data_path: PathBuf::from(&btc),
             electrs_data_path: PathBuf::from(&els),
+            build_settings: self.config.build_settings,
         };
         if let Err(error) = candidate.validate_paths() {
             self.overlay_message = Some(format!("Invalid paths:\n{error}"));
@@ -1778,6 +1860,13 @@ impl App {
             );
             return Task::none();
         }
+        if self.binary_page.dependency_load != DependencyLoad::Idle {
+            self.binary_page.error = Some(
+                "Wait for the dependency check or installation to finish before starting a build."
+                    .to_owned(),
+            );
+            return Task::none();
+        }
         if self.binary_page.active_operation.is_some() {
             self.binary_page.error = Some(
                 "A build is already active. Wait for it to finish or cancel it first.".to_owned(),
@@ -1815,11 +1904,13 @@ impl App {
         self.binary_page.progress = BuildStage::CheckingRequirements.progress();
         self.binary_page.log_lines.clear();
         self.output_viewports.build = OutputViewportState::default();
-        self.binary_page.disclosures.build_details = false;
+        self.binary_page.disclosures.build_details = self.config.build_settings.verbose_output;
         self.binary_page.cancellation_requested = false;
         self.binary_page.error = None;
         self.binary_page.success = None;
         self.binary_page.last_log_path = None;
+
+        let settings = self.config.build_settings;
 
         let service = self.build_service.clone();
         let event_tx = self.build_event_tx.clone();
@@ -1829,7 +1920,10 @@ impl App {
             version,
             binaries_dir,
             workspace,
-            cores: build_worker_count(),
+            cores: build_worker_count(kind, settings.performance),
+            keep_source: settings.keep_source,
+            clean_build: settings.clean_build,
+            verbose_output: settings.verbose_output,
         };
         Task::perform(
             async move { service.run(request, event_tx).await },
@@ -1852,6 +1946,57 @@ impl App {
                 false
             }
         }
+    }
+
+    fn update_build_settings(&mut self, update: impl FnOnce(&mut BuildSettings)) -> Task<Message> {
+        if self.binary_page.active_operation.is_some() {
+            self.overlay_message =
+                Some("Build settings cannot be changed while a binary build is active.".to_owned());
+            return Task::none();
+        }
+
+        let previous = self.config.build_settings;
+        update(&mut self.config.build_settings);
+        if let Err(error) = self.config.save() {
+            self.config.build_settings = previous;
+            self.overlay_message = Some(format!("Failed to save build settings:\n{error:#}"));
+        }
+        Task::none()
+    }
+
+    fn check_dependencies(&mut self) -> Task<Message> {
+        if self.binary_page.active_operation.is_some()
+            || self.binary_page.dependency_load != DependencyLoad::Idle
+        {
+            return Task::none();
+        }
+        let request_id = self.next_dependency_request;
+        self.next_dependency_request = self.next_dependency_request.wrapping_add(1).max(1);
+        self.binary_page.dependency_load = DependencyLoad::Checking;
+        self.binary_page.dependency_request = Some(request_id);
+        self.binary_page.dependency_message = None;
+        Task::perform(binaries::scan_build_dependencies(), move |report| {
+            Message::DependenciesScanned { request_id, report }
+        })
+    }
+
+    fn install_dependencies(&mut self) -> Task<Message> {
+        if self.binary_page.active_operation.is_some()
+            || self.binary_page.dependency_load != DependencyLoad::Idle
+        {
+            return Task::none();
+        }
+        let request_id = self.next_dependency_request;
+        self.next_dependency_request = self.next_dependency_request.wrapping_add(1).max(1);
+        self.binary_page.dependency_load = DependencyLoad::Installing;
+        self.binary_page.dependency_request = Some(request_id);
+        self.binary_page.dependency_message = None;
+        Task::perform(binaries::install_build_dependencies(), move |outcome| {
+            Message::DependenciesInstalled {
+                request_id,
+                outcome,
+            }
+        })
     }
 
     fn apply_build_event(&mut self, event: BuildEvent) {
@@ -2283,9 +2428,9 @@ fn failed_managed_rpc_readiness(error: &str) -> ManagedRpcReadiness {
     }
 }
 
-fn build_worker_count() -> usize {
-    std::thread::available_parallelism()
-        .map_or(4, |count| count.get().saturating_sub(1).clamp(1, 8))
+fn build_worker_count(kind: BinaryKind, performance: BuildPerformance) -> usize {
+    let available = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    performance.jobs(kind, available)
 }
 
 #[cfg(test)]
@@ -2534,6 +2679,7 @@ mod tests {
             binaries_path: root.join("Binaries"),
             bitcoin_data_path: root.join("BitcoinChain"),
             electrs_data_path: root.join("ElectrsDB"),
+            build_settings: BuildSettings::default(),
         }
     }
 

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added a collapsed Binaries → Advanced settings panel with persisted performance, source-retention, clean-build, and verbose-output controls
+- Added version-aware macOS/Homebrew and Debian/Ubuntu apt dependency checks and narrowly scoped installation with Rust installation-method detection
+- Raised the minimum supported Rust version to 1.91 and added an explicit MSRV CI check
+- Added authenticated source reuse and clean compilation-cache handling without changing transactional installation or rollback guarantees
+
 ## 1.0.0 - 2026-08-09
 
 - Bumped the crate and release version to `1.0.0`

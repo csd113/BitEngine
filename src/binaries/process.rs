@@ -66,6 +66,7 @@ pub enum CommandError {
     clippy::too_many_arguments,
     reason = "the operation identity and independent UI, durable-log, environment, and cancellation inputs are intentionally explicit"
 )]
+#[cfg(test)]
 pub async fn run(
     operation_id: BuildOperationId,
     program: &str,
@@ -75,6 +76,35 @@ pub async fn run(
     event_tx: &mpsc::Sender<BuildEvent>,
     log_tx: &mpsc::Sender<String>,
     cancelled: &Arc<AtomicBool>,
+) -> Result<(), CommandError> {
+    run_with_ui_output(
+        operation_id,
+        program,
+        arguments,
+        working_directory,
+        environment,
+        event_tx,
+        log_tx,
+        cancelled,
+        true,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the immutable output presentation choice joins the existing explicit command inputs"
+)]
+pub async fn run_with_ui_output(
+    operation_id: BuildOperationId,
+    program: &str,
+    arguments: &[String],
+    working_directory: Option<&Path>,
+    environment: &BuildEnvironment,
+    event_tx: &mpsc::Sender<BuildEvent>,
+    log_tx: &mpsc::Sender<String>,
+    cancelled: &Arc<AtomicBool>,
+    verbose_output: bool,
 ) -> Result<(), CommandError> {
     if cancelled.load(Ordering::Acquire) {
         return Err(CommandError::Cancelled);
@@ -120,6 +150,7 @@ pub async fn run(
             event_tx.clone(),
             log_tx.clone(),
             "stdout",
+            verbose_output,
         ))
     });
     let mut stderr_task = stderr.map(|reader| {
@@ -129,6 +160,7 @@ pub async fn run(
             event_tx.clone(),
             log_tx.clone(),
             "stderr",
+            verbose_output,
         ))
     });
 
@@ -487,6 +519,7 @@ async fn drain<R>(
     event_tx: mpsc::Sender<BuildEvent>,
     log_tx: mpsc::Sender<String>,
     stream_name: &'static str,
+    verbose_output: bool,
 ) -> bool
 where
     R: AsyncRead + Unpin,
@@ -497,7 +530,15 @@ where
             Ok(0) => return true,
             Ok(read) => {
                 let text = String::from_utf8_lossy(&buffer[..read]);
-                if !emit_log(operation_id, &event_tx, &log_tx, normalise_output(&text)).await {
+                if !emit_process_output(
+                    operation_id,
+                    &event_tx,
+                    &log_tx,
+                    normalise_output(&text),
+                    verbose_output,
+                )
+                .await
+                {
                     return false;
                 }
             }
@@ -528,6 +569,22 @@ pub async fn emit_log(
     log_tx.send(message).await.is_ok()
 }
 
+async fn emit_process_output(
+    operation_id: BuildOperationId,
+    event_tx: &mpsc::Sender<BuildEvent>,
+    log_tx: &mpsc::Sender<String>,
+    message: String,
+    verbose_output: bool,
+) -> bool {
+    if verbose_output {
+        let _ = event_tx.try_send(BuildEvent::Log {
+            operation_id,
+            message: message.clone(),
+        });
+    }
+    log_tx.send(message).await.is_ok()
+}
+
 fn normalise_output(output: &str) -> String {
     output.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -549,6 +606,52 @@ fn command_display(program: &str, arguments: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concise_output_keeps_raw_process_bytes_in_the_durable_log() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir()?;
+        let helper = temporary.path().join("compiler-fixture");
+        fs::write(&helper, "#!/bin/sh\nprintf 'FULL_COMPILER_OUTPUT\\n'\n")?;
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
+        let mut environment = BuildEnvironment::new();
+        environment.insert("PATH".to_owned(), temporary.path().display().to_string());
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (log_tx, mut log_rx) = mpsc::channel(16);
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        run_with_ui_output(
+            BuildOperationId(77),
+            "compiler-fixture",
+            &[],
+            None,
+            &environment,
+            &event_tx,
+            &log_tx,
+            &cancelled,
+            false,
+        )
+        .await?;
+        drop(log_tx);
+        drop(event_tx);
+
+        let mut durable = String::new();
+        while let Some(message) = log_rx.recv().await {
+            durable.push_str(&message);
+        }
+        let mut presented = String::new();
+        while let Some(event) = event_rx.recv().await {
+            if let BuildEvent::Log { message, .. } = event {
+                presented.push_str(&message);
+            }
+        }
+        assert!(durable.contains("FULL_COMPILER_OUTPUT"));
+        assert!(!presented.contains("FULL_COMPILER_OUTPUT"));
+        assert!(presented.contains("compiler-fixture"));
+        Ok(())
+    }
 
     #[cfg(unix)]
     async fn receive_descendant_pid(receiver: &mut mpsc::Receiver<String>) -> i32 {

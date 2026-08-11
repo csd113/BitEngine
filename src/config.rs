@@ -14,6 +14,8 @@ use anyhow::{Context as _, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::binaries::BinaryKind;
+
 const LEGACY_APP_NAME: &str = "BitcoinNodeManager";
 const CONFIG_FILENAME: &str = "config.json";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -21,11 +23,55 @@ static TEMPORARY_FILE_ID: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_ELECTRS_METRICS_ADDR: &str = "127.0.0.1:4224";
 pub const DEFAULT_ELECTRUM_ADDR: &str = "127.0.0.1:50001";
 
+/// User-facing parallelism presets for native source builds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuildPerformance {
+    Low,
+    #[default]
+    Balanced,
+    Fastest,
+}
+
+impl BuildPerformance {
+    /// Map a friendly preset to the worker count accepted by `CMake` or Cargo.
+    #[must_use]
+    pub fn jobs(self, kind: BinaryKind, available: usize) -> usize {
+        let available = available.clamp(1, 64);
+        match self {
+            Self::Low => (available / 4).clamp(1, 4),
+            Self::Balanced => match kind {
+                BinaryKind::BitcoinCore => available.saturating_sub(1).clamp(1, 8),
+                BinaryKind::Electrs => available.saturating_sub(1).clamp(1, 12),
+            },
+            Self::Fastest => available,
+        }
+    }
+}
+
+impl std::fmt::Display for BuildPerformance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Low => "Low",
+            Self::Balanced => "Balanced",
+            Self::Fastest => "Fastest",
+        })
+    }
+}
+
+/// Persistent settings exposed by Binaries → Advanced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildSettings {
+    #[serde(default)]
+    pub performance: BuildPerformance,
+    #[serde(default)]
+    pub keep_source: bool,
+    #[serde(default)]
+    pub clean_build: bool,
+    #[serde(default)]
+    pub verbose_output: bool,
+}
+
 /// All persisted settings for the node manager.
-#[expect(
-    clippy::struct_field_names,
-    reason = "persisted fields mirror the stored config keys"
-)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Directory containing `bitcoind`, `bitcoin-cli`, `electrs`, etc.
@@ -34,6 +80,9 @@ pub struct Config {
     pub bitcoin_data_path: PathBuf,
     /// Electrs database directory.
     pub electrs_data_path: PathBuf,
+    /// Advanced native build settings.
+    #[serde(default)]
+    pub build_settings: BuildSettings,
 }
 
 impl Config {
@@ -152,6 +201,7 @@ impl Config {
             binaries_path: ssd_root.join("Binaries"),
             bitcoin_data_path: ssd_root.join("BitcoinChain"),
             electrs_data_path: ssd_root.join("ElectrsDB"),
+            build_settings: BuildSettings::default(),
         }
     }
 
@@ -391,11 +441,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn build_settings_default_and_parallelism_mapping_are_stable() {
+        let defaults = BuildSettings::default();
+        assert_eq!(defaults.performance, BuildPerformance::Balanced);
+        assert!(!defaults.keep_source);
+        assert!(!defaults.clean_build);
+        assert!(!defaults.verbose_output);
+
+        assert_eq!(BuildPerformance::Low.jobs(BinaryKind::BitcoinCore, 16), 4);
+        assert_eq!(BuildPerformance::Low.jobs(BinaryKind::Electrs, 8), 2);
+        assert_eq!(
+            BuildPerformance::Balanced.jobs(BinaryKind::BitcoinCore, 16),
+            8
+        );
+        assert_eq!(BuildPerformance::Balanced.jobs(BinaryKind::Electrs, 16), 12);
+        assert_eq!(
+            BuildPerformance::Fastest.jobs(BinaryKind::BitcoinCore, 16),
+            16
+        );
+        assert_eq!(BuildPerformance::Fastest.jobs(BinaryKind::Electrs, 16), 16);
+    }
+
+    #[test]
+    fn restore_build_defaults_resets_all_four_settings() {
+        let mut settings = BuildSettings {
+            performance: BuildPerformance::Fastest,
+            keep_source: true,
+            clean_build: true,
+            verbose_output: true,
+        };
+        assert_ne!(settings, BuildSettings::default());
+
+        settings = BuildSettings::default();
+
+        assert_eq!(settings.performance, BuildPerformance::Balanced);
+        assert!(!settings.keep_source);
+        assert!(!settings.clean_build);
+        assert!(!settings.verbose_output);
+    }
+
+    #[test]
+    fn old_config_defaults_build_settings_and_new_settings_survive_reload() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("config.json");
+        let root = temporary.path().join("storage");
+        let old_json = serde_json::json!({
+            "binaries_path": root.join("Binaries"),
+            "bitcoin_data_path": root.join("BitcoinChain"),
+            "electrs_data_path": root.join("ElectrsDB"),
+        });
+        write_atomically(&path, &serde_json::to_vec_pretty(&old_json)?)?;
+        let mut config = Config::load_from_file(&path)?;
+        assert_eq!(config.build_settings, BuildSettings::default());
+
+        config.build_settings = BuildSettings {
+            performance: BuildPerformance::Fastest,
+            keep_source: true,
+            clean_build: true,
+            verbose_output: true,
+        };
+        write_atomically(&path, &serde_json::to_vec_pretty(&config)?)?;
+        let reloaded = Config::load_from_file(&path)?;
+        assert_eq!(reloaded.build_settings, config.build_settings);
+
+        let mut restored = reloaded;
+        restored.build_settings = BuildSettings::default();
+        assert_eq!(
+            restored.build_settings.performance,
+            BuildPerformance::Balanced
+        );
+        assert!(!restored.build_settings.keep_source);
+        assert!(!restored.build_settings.clean_build);
+        assert!(!restored.build_settings.verbose_output);
+        Ok(())
+    }
+
+    #[test]
     fn build_and_data_paths_must_be_absolute_and_disjoint() {
         let valid = Config {
             binaries_path: PathBuf::from("/tmp/bitengine-root/Binaries"),
             bitcoin_data_path: PathBuf::from("/tmp/bitengine-root/BitcoinChain"),
             electrs_data_path: PathBuf::from("/tmp/bitengine-root/ElectrsDB"),
+            build_settings: BuildSettings::default(),
         };
         valid
             .validate_paths()
@@ -416,6 +543,7 @@ mod tests {
             binaries_path: PathBuf::from("/tmp/bitengine-root/BitEngineBuilds"),
             bitcoin_data_path: PathBuf::from("/tmp/bitengine-root/BitcoinChain"),
             electrs_data_path: PathBuf::from("/tmp/bitengine-root/ElectrsDB"),
+            build_settings: BuildSettings::default(),
         };
         assert!(config.validate_paths().is_err());
     }
@@ -434,6 +562,7 @@ mod tests {
             binaries_path: alias.join("Binaries"),
             bitcoin_data_path: real.join("Binaries").join("chain"),
             electrs_data_path: real.join("ElectrsDB"),
+            build_settings: BuildSettings::default(),
         };
         assert!(config.validate_paths().is_err());
         Ok(())

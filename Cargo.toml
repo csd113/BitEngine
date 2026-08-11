@@ -2,7 +2,7 @@
 name = "bitengine"
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.97.1"
+rust-version = "1.91"
 description = "BitEngine GUI for Bitcoin Core and Electrs"
 license = "MIT"
 repository = "https://github.com/csd113/BitEngine"

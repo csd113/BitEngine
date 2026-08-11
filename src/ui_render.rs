@@ -3,18 +3,18 @@ use iced::{
     font::Font,
     widget::{
         button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, text,
-        text_input, Id, Space,
+        text_input, toggler, Id, Space,
     },
     Alignment, Color, Element, Length, Padding,
 };
 
 use crate::{
-    binaries::{BinaryKind, BuildStage},
-    config::Config,
+    binaries::{BinaryKind, BuildStage, DependencyReport, DependencyState},
+    config::{BuildPerformance, Config},
     platform::APP_NAME,
 };
 
-use super::{App, Message, OutputPane, Page};
+use super::{App, DependencyLoad, Message, OutputPane, Page};
 
 const BG: Color = Color {
     r: 0.949,
@@ -130,6 +130,12 @@ const DISABLED_BG: Color = Color {
     b: 0.933,
     a: 1.0,
 }; // #e9e9ee
+
+const BUILD_PERFORMANCE_OPTIONS: [BuildPerformance; 3] = [
+    BuildPerformance::Low,
+    BuildPerformance::Balanced,
+    BuildPerformance::Fastest,
+];
 
 pub(super) const fn bitcoin_scroll_id() -> Id {
     Id::new("bitcoin_terminal")
@@ -445,6 +451,10 @@ fn binary_row_presentation(app: &App, kind: BinaryKind) -> BinaryRowPresentation
         ("Building…", None)
     } else if build_active {
         ("Build / Update", None)
+    } else if app.binary_page.dependency_load == DependencyLoad::Checking {
+        ("Checking dependencies…", None)
+    } else if app.binary_page.dependency_load == DependencyLoad::Installing {
+        ("Installing dependencies…", None)
     } else if app.pending_path_save.is_some() {
         ("Saving paths…", None)
     } else if selected.is_none() {
@@ -795,7 +805,7 @@ fn view_binary_advanced(app: &App) -> Element<'_, Message> {
                     ..Font::default()
                 })
                 .color(Color::BLACK),
-            text("Choose a specific stable release or inspect build settings.")
+            text("Release selection, build performance, source retention, and output detail.")
                 .size(10)
                 .color(TEXT_TER),
         ]
@@ -816,6 +826,8 @@ fn view_binary_advanced(app: &App) -> Element<'_, Message> {
             ]
             .into(),
         );
+        content.push(advanced_build_settings(app));
+        content.push(build_dependencies_card(app));
         content.push(
             column![
                 text("BUILD WORKSPACE").size(9).color(TEXT_TER),
@@ -825,10 +837,7 @@ fn view_binary_advanced(app: &App) -> Element<'_, Message> {
                     .color(TEXT_SEC)
                     .width(Length::Fill)
                     .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
-                text(format!(
-                    "BitEngine uses {} compiler workers. Node-only Bitcoin flags, source checks, and transactional installation are always enabled.",
-                    super::build_worker_count()
-                ))
+                text("Node-only Bitcoin flags, source authentication, and transactional installation remain enabled for every build.")
                 .size(10)
                 .color(TEXT_TER)
                 .width(Length::Fill)
@@ -852,6 +861,220 @@ fn view_binary_advanced(app: &App) -> Element<'_, Message> {
             ..Default::default()
         })
         .into()
+}
+
+fn advanced_build_settings(app: &App) -> Element<'_, Message> {
+    let settings = app.config.build_settings;
+    column![
+        row![
+            column![
+                text("BUILD PERFORMANCE").size(9).color(TEXT_TER),
+                text("Controls parallel work without exposing compiler flags.")
+                    .size(10)
+                    .color(TEXT_SEC),
+            ]
+            .spacing(3)
+            .width(Length::Fill),
+            pick_list(
+                BUILD_PERFORMANCE_OPTIONS,
+                Some(settings.performance),
+                Message::BuildPerformanceChanged,
+            )
+            .width(150)
+            .text_size(11),
+        ]
+        .align_y(Alignment::Center),
+        build_setting_toggle(
+            "Keep Source Code",
+            "Retain authenticated source after a successful installation for faster repeat builds.",
+            settings.keep_source,
+            Message::KeepSourceChanged,
+        ),
+        build_setting_toggle(
+            "Clean Build",
+            "Discard reusable compilation artifacts before building; authenticated source stays verified.",
+            settings.clean_build,
+            Message::CleanBuildChanged,
+        ),
+        build_setting_toggle(
+            "Verbose Build Output",
+            "Show complete compiler and build-system output while preserving the durable build log.",
+            settings.verbose_output,
+            Message::VerboseBuildOutputChanged,
+        ),
+        row![
+            text(format!(
+                "Bitcoin Core: {} workers  •  electrs: {} workers",
+                super::build_worker_count(BinaryKind::BitcoinCore, settings.performance),
+                super::build_worker_count(BinaryKind::Electrs, settings.performance),
+            ))
+            .size(10)
+            .color(TEXT_TER)
+            .width(Length::Fill),
+            styled_button("Restore Defaults", ButtonStyle::Secondary)
+                .on_press(Message::RestoreBuildDefaults),
+        ]
+        .align_y(Alignment::Center),
+    ]
+    .spacing(13)
+    .into()
+}
+
+fn build_dependencies_card(app: &App) -> Element<'_, Message> {
+    let report = app.binary_page.dependency_report.as_ref();
+    let (status, color) = match app.binary_page.dependency_load {
+        DependencyLoad::Checking => ("Checking…".to_owned(), MAC_BLUE),
+        DependencyLoad::Installing => ("Installing…".to_owned(), MAC_BLUE),
+        DependencyLoad::Idle => report.map_or_else(
+            || ("Not checked".to_owned(), TEXT_TER),
+            |report| {
+                if report.is_ready() {
+                    ("✓ Ready".to_owned(), GREEN)
+                } else {
+                    let count = report.issue_count();
+                    (
+                        format!(
+                            "⚠ {count} {} missing or outdated",
+                            if count == 1 {
+                                "dependency"
+                            } else {
+                                "dependencies"
+                            }
+                        ),
+                        MAC_ORG,
+                    )
+                }
+            },
+        ),
+    };
+    let can_install = report.is_some_and(|report| report.platform.supports_installation());
+    let action = if app.binary_page.active_operation.is_some()
+        || app.binary_page.dependency_load != DependencyLoad::Idle
+    {
+        None
+    } else if report.is_some_and(|report| !report.is_ready()) && can_install {
+        Some(Message::InstallDependencies)
+    } else {
+        Some(Message::CheckDependencies)
+    };
+    let action_label = if report.is_some_and(|report| !report.is_ready()) && can_install {
+        "Install Build Dependencies"
+    } else {
+        "Check Dependencies"
+    };
+    let mut content: Vec<Element<Message>> = vec![row![
+        column![
+            text("Build Dependencies")
+                .size(12)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::default()
+                })
+                .color(Color::BLACK),
+            text(status).size(10).color(color),
+        ]
+        .spacing(3)
+        .width(Length::Fill),
+        styled_button(action_label, ButtonStyle::Secondary).on_press_maybe(action),
+    ]
+    .align_y(Alignment::Center)
+    .into()];
+    if let Some(message) = app.binary_page.dependency_message.as_deref() {
+        content.push(build_notice(
+            message,
+            if report.is_some_and(DependencyReport::is_ready) {
+                GREEN
+            } else {
+                MAC_ORG
+            },
+        ));
+    }
+    if let Some(report) = report {
+        content.extend(dependency_report_details(
+            report,
+            app.binary_page.disclosures.dependency_details,
+        ));
+    }
+
+    container(column(content).spacing(10))
+        .width(Length::Fill)
+        .padding(14)
+        .style(|_| container::Style {
+            background: Some(BG.into()),
+            border: iced::Border {
+                color: BORDER,
+                width: 1.0,
+                radius: 9.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn dependency_report_details(
+    report: &DependencyReport,
+    expanded: bool,
+) -> Vec<Element<'_, Message>> {
+    let mut content = vec![row![
+        column![
+            text(format!("PLATFORM: {}", report.platform.label()))
+                .size(8)
+                .color(TEXT_TER),
+            text(&report.guidance)
+                .size(9)
+                .color(TEXT_TER)
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        styled_button(
+            if expanded { "Hide Details" } else { "Details" },
+            ButtonStyle::Secondary,
+        )
+        .on_press(Message::ToggleDependencyDetails),
+    ]
+    .spacing(16)
+    .align_y(Alignment::Center)
+    .into()];
+    if expanded {
+        let rows = report.items.iter().map(|item| {
+            let detected = item.detected_version.as_deref().map_or_else(
+                || item.detail.as_deref().unwrap_or("Not detected").to_owned(),
+                |version| {
+                    item.path.as_ref().map_or_else(
+                        || version.to_owned(),
+                        |path| format!("{version}  •  {}", path.display()),
+                    )
+                },
+            );
+            row![
+                column![
+                    text(item.name).size(10).color(Color::BLACK),
+                    text(detected)
+                        .size(9)
+                        .font(Font::MONOSPACE)
+                        .color(TEXT_TER)
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
+                status_pill(
+                    item.state.label(),
+                    match item.state {
+                        DependencyState::Ready => GREEN,
+                        DependencyState::Missing => MAC_ORG,
+                        DependencyState::Outdated => MAC_RED,
+                    },
+                ),
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        });
+        content.push(column(rows).spacing(9).into());
+    }
+    content
 }
 
 fn release_picker(app: &App, kind: BinaryKind) -> Element<'_, Message> {
@@ -1291,6 +1514,30 @@ fn panel_indicators(running: bool, synced: bool, ready: bool) -> Element<'static
     ]
     .align_y(Alignment::Center)
     .padding(Padding::from([10, 20]))
+    .into()
+}
+
+fn build_setting_toggle<'a>(
+    label: &'a str,
+    description: &'a str,
+    value: bool,
+    on_toggle: fn(bool) -> Message,
+) -> Element<'a, Message> {
+    row![
+        column![
+            text(label).size(11).color(Color::BLACK),
+            text(description)
+                .size(9)
+                .color(TEXT_TER)
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        toggler(value).on_toggle(on_toggle).size(18),
+    ]
+    .spacing(16)
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -1760,6 +2007,27 @@ mod tests {
         let success = terminal_line_style("electrs ready");
         assert_eq!(success.color, GREEN);
         assert!(!success.bold);
+    }
+
+    #[test]
+    fn advanced_build_settings_are_collapsed_and_render_with_defaults() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let app = App::from_config(
+            Config::defaults(temporary.path()),
+            None,
+            temporary.path().join("build-state.json"),
+        );
+
+        assert!(!app.binary_page.disclosures.advanced);
+        assert_eq!(
+            app.config.build_settings.performance,
+            BuildPerformance::Balanced
+        );
+        assert!(!app.config.build_settings.keep_source);
+        assert!(!app.config.build_settings.clean_build);
+        assert!(!app.config.build_settings.verbose_output);
+        drop(view_binary_advanced(&app));
+        Ok(())
     }
 
     #[test]
