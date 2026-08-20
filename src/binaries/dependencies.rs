@@ -28,6 +28,7 @@ const MINIMUM_GCC: [u64; 3] = [12, 1, 0];
 const MINIMUM_CMAKE: [u64; 3] = [3, 22, 0];
 const MINIMUM_BOOST: [u64; 3] = [1, 74, 0];
 const MINIMUM_LIBEVENT: [u64; 3] = [2, 1, 8];
+const MINIMUM_OPENSSH: [u64; 3] = [8, 1, 0];
 const INSTALL_TIMEOUT: Duration = Duration::from_mins(30);
 const MAX_OS_RELEASE_BYTES: u64 = 64 * 1024;
 const MAX_RUSTUP_SCRIPT_BYTES: u64 = 2 * 1024 * 1024;
@@ -417,9 +418,7 @@ async fn scan_item(id: DependencyId, environment: &BuildEnvironment) -> Dependen
         DependencyId::GnuPg => {
             scan_simple_tool(id, &["gpg", "gpg2"], &["--version"], None, environment).await
         }
-        DependencyId::SshKeygen => {
-            scan_simple_tool(id, &["ssh-keygen"], &["-Q", "key"], None, environment).await
-        }
+        DependencyId::SshKeygen => scan_openssh_signing(environment).await,
         DependencyId::CMake => {
             scan_simple_tool(
                 id,
@@ -454,6 +453,72 @@ async fn scan_item(id: DependencyId, environment: &BuildEnvironment) -> Dependen
         DependencyId::RustToolchain => scan_rust(environment).await,
         DependencyId::Libclang => scan_libclang(environment).await,
     }
+}
+
+async fn scan_openssh_signing(environment: &BuildEnvironment) -> DependencyItem {
+    let Some(keygen_path) = find_in_path("ssh-keygen", environment) else {
+        return DependencyItem::missing(
+            DependencyId::SshKeygen,
+            "ssh-keygen was not found in BitEngine's build PATH",
+        );
+    };
+    let Some(ssh_path) = find_in_path("ssh", environment) else {
+        return DependencyItem::missing(
+            DependencyId::SshKeygen,
+            "ssh was not found with the required ssh-keygen signing tool",
+        );
+    };
+    if keygen_path.parent() != ssh_path.parent() {
+        return DependencyItem::missing(
+            DependencyId::SshKeygen,
+            "ssh and ssh-keygen did not resolve from the same OpenSSH tool directory",
+        );
+    }
+    let Some(program) = ssh_path.to_str() else {
+        return DependencyItem::missing(
+            DependencyId::SshKeygen,
+            "the resolved ssh executable path is not valid UTF-8",
+        );
+    };
+    let output =
+        if let Some(stderr) = process::probe_stderr(program, &["-V"], None, environment).await {
+            stderr
+        } else if let Some(stdout) = process::probe(program, &["-V"], None, environment).await {
+            stdout
+        } else {
+            return DependencyItem::missing(
+                DependencyId::SshKeygen,
+                "the resolved OpenSSH tools did not run successfully",
+            );
+        };
+    let Some((version, text)) = extract_numeric_version(&output) else {
+        return DependencyItem::outdated(
+            DependencyId::SshKeygen,
+            None,
+            Some(keygen_path),
+            format!(
+                "could not validate OpenSSH {} or newer for SSH signature verification",
+                display_version(MINIMUM_OPENSSH)
+            ),
+        );
+    };
+    if !version.is_at_least(MINIMUM_OPENSSH) {
+        return DependencyItem::outdated(
+            DependencyId::SshKeygen,
+            Some(text),
+            Some(keygen_path),
+            format!(
+                "BitEngine requires OpenSSH {} or newer for SSH signature verification",
+                display_version(MINIMUM_OPENSSH)
+            ),
+        );
+    }
+    DependencyItem::ready(
+        DependencyId::SshKeygen,
+        Some(text),
+        Some(keygen_path),
+        Some(format!("OpenSSH client: {}", ssh_path.display())),
+    )
 }
 
 async fn scan_simple_tool(
@@ -1524,6 +1589,48 @@ mod tests {
         assert!(extract_numeric_version("rustc nightly").is_none());
         assert!(parse_apt_rust_candidate("  Candidate: 1.91.0+dfsg")
             .is_some_and(|version| version.is_at_least(MINIMUM_RUST)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn openssh_signing_detection_uses_the_suite_version_instead_of_a_krl_query() -> Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        for (version, expected) in [
+            ("8.0p1", DependencyState::Outdated),
+            ("8.1p1", DependencyState::Ready),
+            ("10.3p1", DependencyState::Ready),
+        ] {
+            let temporary = tempfile::tempdir()?;
+            let keygen = temporary.path().join("ssh-keygen");
+            fs::write(
+                &keygen,
+                "#!/bin/sh\necho 'the dependency scan must not query a KRL' >&2\nexit 99\n",
+            )?;
+            fs::set_permissions(&keygen, fs::Permissions::from_mode(0o755))?;
+
+            let ssh = temporary.path().join("ssh");
+            fs::write(
+                &ssh,
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = '-V' ] || exit 98\necho 'OpenSSH_{version}, fixture' >&2\n"
+                ),
+            )?;
+            fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755))?;
+
+            let mut environment = BuildEnvironment::new();
+            environment.insert("PATH".to_owned(), temporary.path().display().to_string());
+
+            let item = scan_item(DependencyId::SshKeygen, &environment).await;
+
+            assert_eq!(
+                item.state, expected,
+                "unexpected state for OpenSSH {version}"
+            );
+            assert_eq!(item.path.as_deref(), Some(keygen.as_path()));
+        }
+        Ok(())
     }
 
     #[test]

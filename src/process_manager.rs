@@ -23,7 +23,10 @@ use std::{
 
 use anyhow::{bail, Context as _, Result};
 
-use crate::platform;
+use crate::{connection::ElectrsListenAddr, platform};
+
+#[cfg(test)]
+use crate::connection::ElectrsBindPolicy;
 
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(10);
 const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -59,6 +62,7 @@ pub struct ProcessHandle {
     stdout_reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
     reader_cancel: Arc<AtomicBool>,
+    exit_diagnostic: Option<String>,
 }
 
 impl ProcessHandle {
@@ -70,6 +74,7 @@ impl ProcessHandle {
             stdout_reader: None,
             stderr_reader: None,
             reader_cancel: Arc::new(AtomicBool::new(false)),
+            exit_diagnostic: None,
         }
     }
 
@@ -85,15 +90,24 @@ impl ProcessHandle {
                 // Keep the exited leader waitable until cleanup has disarmed
                 // its process group. This prevents the numeric PID/PGID from
                 // being reused before the group signal is sent.
-                self.force_cleanup();
+                self.force_cleanup_after_observed_exit();
                 false
             }
-            Err(_) => {
+            Err(error) => {
                 // Losing the ability to supervise the child must fail closed.
+                self.exit_diagnostic = Some(bounded_diagnostic(&format!(
+                    "managed process supervision failed: {error}"
+                )));
                 self.force_cleanup();
                 false
             }
         }
+    }
+
+    /// Take the bounded diagnostic retained after an unexpected child exit or
+    /// supervision failure. Expected shutdown paths may ignore this value.
+    pub const fn take_exit_diagnostic(&mut self) -> Option<String> {
+        self.exit_diagnostic.take()
     }
 
     /// Gracefully terminate unless `force` requests immediate kill and reap.
@@ -178,6 +192,14 @@ impl ProcessHandle {
     }
 
     fn force_cleanup(&mut self) {
+        self.force_cleanup_inner(false);
+    }
+
+    fn force_cleanup_after_observed_exit(&mut self) {
+        self.force_cleanup_inner(true);
+    }
+
+    fn force_cleanup_inner(&mut self, record_observed_exit: bool) {
         if self.is_cleaned_up() {
             return;
         }
@@ -191,7 +213,13 @@ impl ProcessHandle {
         }
 
         if let Some(mut child) = self.child.take() {
-            if !matches!(child.try_wait(), Ok(Some(_))) {
+            if let Ok(Some(status)) = child.try_wait() {
+                if record_observed_exit {
+                    self.exit_diagnostic = Some(bounded_diagnostic(&format!(
+                        "managed process exited with {status}; see its service log"
+                    )));
+                }
+            } else {
                 let _ = child.kill();
                 // The direct child must always be waited after a kill so it
                 // cannot remain as a zombie owned by BitEngine.
@@ -224,6 +252,11 @@ impl ProcessHandle {
             let _ = reader.join();
         }
     }
+}
+
+fn bounded_diagnostic(message: &str) -> String {
+    const MAX_DIAGNOSTIC_CHARS: usize = 512;
+    message.chars().take(MAX_DIAGNOSTIC_CHARS).collect()
 }
 
 fn child_has_exited(child: &Child) -> std::io::Result<bool> {
@@ -339,11 +372,44 @@ pub struct ElectrsBitcoinConnection<'a> {
 }
 
 /// Launch `electrs` and stream its output into `queue`.
+#[cfg(test)]
 pub fn launch_electrs(
     binaries_path: &Path,
     bitcoin_data_dir: &Path,
     electrs_db_dir: &Path,
     electrum_addr: &str,
+    connection: ElectrsBitcoinConnection<'_>,
+    queue: &OutputQueue,
+) -> Result<ProcessHandle> {
+    let requested: SocketAddr = electrum_addr
+        .parse()
+        .context("parse managed electrs listener")?;
+    if !requested.ip().is_loopback() {
+        bail!(
+            "legacy electrs launch accepts only a loopback listener; use the explicit listener API for local-network access"
+        );
+    }
+    let listener =
+        ElectrsListenAddr::for_policy(ElectrsBindPolicy::LoopbackOnly, None, requested.port())?;
+    launch_electrs_with_listener(
+        binaries_path,
+        bitcoin_data_dir,
+        electrs_db_dir,
+        listener,
+        connection,
+        queue,
+    )
+}
+
+/// Launch `electrs` with one explicit, validated client-listener snapshot.
+///
+/// LAN exposure cannot be requested with a wildcard or public address because
+/// [`ElectrsListenAddr`] is the only accepted boundary type.
+pub fn launch_electrs_with_listener(
+    binaries_path: &Path,
+    bitcoin_data_dir: &Path,
+    electrs_db_dir: &Path,
+    listener: ElectrsListenAddr,
     connection: ElectrsBitcoinConnection<'_>,
     queue: &OutputQueue,
 ) -> Result<ProcessHandle> {
@@ -367,7 +433,7 @@ pub fn launch_electrs(
         "--db-dir".into(),
         electrs_db_dir.to_string_lossy().into_owned(),
         "--electrum-rpc-addr".into(),
-        electrum_addr.to_owned(),
+        listener.socket_addr().to_string(),
         "--monitoring-addr".into(),
         "127.0.0.1:4224".into(),
     ];
@@ -751,6 +817,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unexpected_exit_retains_a_bounded_actionable_diagnostic() -> Result<()> {
+        let (mut handle, _) = spawn_shell("exit 7")?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while handle.is_running() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        let diagnostic = handle
+            .take_exit_diagnostic()
+            .context("unexpected exit diagnostic")?;
+        assert!(diagnostic.contains('7'), "{diagnostic}");
+        assert!(diagnostic.contains("service log"), "{diagnostic}");
+        assert!(diagnostic.chars().count() <= 512);
+        assert!(handle.take_exit_diagnostic().is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn forced_termination_is_bounded_when_sigterm_is_ignored() -> Result<()> {
         let (mut handle, queue) =
             spawn_shell("printf 'READY\\n'; trap '' TERM; while :; do sleep 1; done")?;
@@ -929,5 +1014,72 @@ mod tests {
             .any(|arguments| { arguments == ["--cookie-file", cookie_file.as_str()] }));
         drop(handle);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn electrs_lan_launch_binds_only_the_validated_private_interface() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let binaries = temporary.path().join("Binaries");
+        let bitcoin_data = temporary.path().join("BitcoinChain");
+        let electrs_data = temporary.path().join("ElectrsDB");
+        let marker = temporary.path().join("electrs-lan-arguments");
+        std::fs::create_dir(&binaries)?;
+        std::fs::create_dir(&bitcoin_data)?;
+        std::fs::create_dir(&electrs_data)?;
+        write_executable(&binaries.join("electrs"), &argument_capture_script(&marker))?;
+        let queue = new_queue();
+        let cookie_path = std::fs::canonicalize(&bitcoin_data)?.join(".cookie");
+        let listener = ElectrsListenAddr::for_policy(
+            ElectrsBindPolicy::LocalNetwork,
+            Some("192.168.50.8".parse()?),
+            50_001,
+        )?;
+
+        let handle = launch_electrs_with_listener(
+            &binaries,
+            &bitcoin_data,
+            &electrs_data,
+            listener,
+            ElectrsBitcoinConnection {
+                rpc_addr: "127.0.0.1:8332".parse()?,
+                p2p_addr: "127.0.0.1:8333".parse()?,
+                cookie_file: &cookie_path,
+            },
+            &queue,
+        )?;
+        wait_for_file(&marker)?;
+        let arguments = std::fs::read_to_string(&marker)?;
+        let arguments = arguments.lines().collect::<Vec<_>>();
+
+        assert!(arguments
+            .windows(2)
+            .any(|arguments| arguments == ["--electrum-rpc-addr", "192.168.50.8:50001"]));
+        assert!(!arguments.contains(&"0.0.0.0:50001"));
+        assert!(arguments
+            .windows(2)
+            .any(|arguments| arguments == ["--monitoring-addr", "127.0.0.1:4224"]));
+        drop(handle);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_electrs_launch_cannot_broaden_the_listener() {
+        let queue = new_queue();
+        let result = launch_electrs(
+            Path::new("/not/consulted"),
+            Path::new("/not/consulted"),
+            Path::new("/not/consulted"),
+            "0.0.0.0:50001",
+            ElectrsBitcoinConnection {
+                rpc_addr: "127.0.0.1:8332".parse().expect("static RPC address"),
+                p2p_addr: "127.0.0.1:8333".parse().expect("static P2P address"),
+                cookie_file: Path::new("/not/consulted/.cookie"),
+            },
+            &queue,
+        );
+
+        let error = result.err().expect("wildcard listener must be rejected");
+        assert!(error.to_string().contains("only a loopback listener"));
     }
 }

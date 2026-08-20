@@ -46,8 +46,10 @@ jobs:
           APP_ROOT="dist/${APP_NAME}.app"
           MACOS_DIR="$APP_ROOT/Contents/MacOS"
           RESOURCES_DIR="$APP_ROOT/Contents/Resources"
+          BUNDLE_ID="com.csd113.BitEngine"
           SHORT_VERSION="${GITHUB_REF_NAME#v}"
           BUILD_VERSION="${GITHUB_RUN_NUMBER}"
+          REMOVABLE_VOLUMES_USAGE_DESCRIPTION="BitEngine needs access to removable volumes containing your configured node binaries and data."
 
           mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" out
 
@@ -63,7 +65,7 @@ jobs:
             <key>CFBundleExecutable</key>
             <string>${APP_EXECUTABLE}</string>
             <key>CFBundleIdentifier</key>
-            <string>com.csd113.BitEngine</string>
+            <string>${BUNDLE_ID}</string>
             <key>CFBundleInfoDictionaryVersion</key>
             <string>6.0</string>
             <key>CFBundleName</key>
@@ -80,9 +82,21 @@ jobs:
             <string>12.0</string>
             <key>NSHighResolutionCapable</key>
             <true/>
+            <key>NSRemovableVolumesUsageDescription</key>
+            <string>${REMOVABLE_VOLUMES_USAGE_DESCRIPTION}</string>
           </dict>
           </plist>
           EOF
+
+          plutil -lint "$APP_ROOT/Contents/Info.plist" >/dev/null
+          if [[ "$(plutil -extract CFBundleIdentifier raw -o - "$APP_ROOT/Contents/Info.plist")" != "$BUNDLE_ID" ]]; then
+            echo "Generated Info.plist has an unexpected bundle identifier" >&2
+            exit 1
+          fi
+          if [[ "$(plutil -extract NSRemovableVolumesUsageDescription raw -o - "$APP_ROOT/Contents/Info.plist")" != "$REMOVABLE_VOLUMES_USAGE_DESCRIPTION" ]]; then
+            echo "Generated Info.plist is missing the removable-volume usage description" >&2
+            exit 1
+          fi
 
           cp target/aarch64-apple-darwin/release/bitengine "$MACOS_DIR/$APP_EXECUTABLE"
           chmod 755 "$MACOS_DIR/$APP_EXECUTABLE"
