@@ -124,6 +124,7 @@ pub enum Message {
         pane: OutputPane,
         hovered: bool,
     },
+    OutputFollowLatest(OutputPane),
     OutputPageUp,
     OutputPageDown,
 
@@ -847,7 +848,7 @@ impl App {
             tor_latest_sync_request: None,
             next_tor_sync_request: 1,
             closing: false,
-            paths_visible: true,
+            paths_visible: false,
             binary_page,
             output_viewports: OutputViewports::default(),
             hovered_output_pane: None,
@@ -1118,6 +1119,16 @@ impl App {
                     self.hovered_output_pane = None;
                 }
                 Task::none()
+            }
+            Message::OutputFollowLatest(pane) => {
+                self.output_viewports.get_mut(pane).follow_output = true;
+                widget::operation::scroll_to(
+                    ui_render::output_scroll_id(pane),
+                    scrollable::AbsoluteOffset {
+                        x: 0.0,
+                        y: f32::MAX,
+                    },
+                )
             }
             Message::OutputPageUp => self.scroll_output_page(-1.0),
             Message::OutputPageDown => self.scroll_output_page(1.0),
@@ -4637,6 +4648,21 @@ mod tests {
         push_msg(&app.bitcoin_queue, "following again");
 
         assert_eq!(app.handle_output_tick().units(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_jump_to_latest_resumes_following() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 800.0, 200.0, 1_000.0);
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 300.0, 200.0, 1_000.0);
+        assert!(!app.output_viewports.bitcoin.follow_output);
+
+        let task = app.update(Message::OutputFollowLatest(OutputPane::Bitcoin));
+
+        assert_eq!(task.units(), 1);
+        assert!(app.output_viewports.bitcoin.follow_output);
         Ok(())
     }
 

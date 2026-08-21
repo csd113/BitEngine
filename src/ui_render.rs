@@ -8,8 +8,8 @@ use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::{
     font::Font,
     widget::{
-        button, column, container, mouse_area, pick_list, progress_bar, row, scrollable, text,
-        text_input, toggler, Id, Space,
+        button, column, container, mouse_area, pick_list, progress_bar, responsive, row,
+        scrollable, text, text_input, toggler, Id, Space,
     },
     Alignment, Color, Element, Length, Padding, Point, Rectangle, Size,
 };
@@ -18,6 +18,7 @@ use crate::{
     binaries::{BinaryKind, BuildStage, DependencyReport, DependencyState, ReleaseVersion},
     config::{BuildPerformance, Config, ThemePreference},
     connection::{ConnectionReadiness, LocalEndpointState},
+    electrs_status::ElectrsStatus,
     platform::APP_NAME,
     tor::TorStatus,
 };
@@ -138,9 +139,9 @@ const TERM_FG: Color = Color {
     a: 1.0,
 }; // #d9dbe0
 const TERM_DIM: Color = Color {
-    r: 0.612,
-    g: 0.623,
-    b: 0.643,
+    r: 0.682,
+    g: 0.698,
+    b: 0.729,
     a: 1.0,
 }; // #9c9fb4
 const GREEN: Color = Color {
@@ -233,7 +234,9 @@ const BUILD_PERFORMANCE_OPTIONS: [BuildPerformance; 3] = [
     BuildPerformance::Balanced,
     BuildPerformance::Fastest,
 ];
-const DASHBOARD_NODE_PANELS_HEIGHT: f32 = 236.0;
+const DASHBOARD_SECTION_SPACING: f32 = 12.0;
+const DASHBOARD_PADDING: f32 = 12.0;
+const DASHBOARD_OVERVIEW_BREAKPOINT: f32 = 840.0;
 
 pub(super) const fn bitcoin_scroll_id() -> Id {
     Id::new("bitcoin_terminal")
@@ -289,28 +292,49 @@ pub(super) fn view(app: &App) -> Element<'_, Message> {
 }
 
 fn view_dashboard(app: &App) -> Element<'_, Message> {
-    let mut body_sections = vec![
-        view_connect_to_node(app),
-        horizontal_rule(),
-        view_paths_panel(app),
-    ];
-    if let Some(notice) = installation_recovery_notice(app) {
-        body_sections.push(notice);
-    }
-    body_sections.push(view_node_panels(app));
-    let body = column(body_sections).width(Length::Fill);
-
     column![
         view_toolbar(app),
         horizontal_rule(),
-        scrollable(body)
-            .direction(Direction::Vertical(Scrollbar::default()))
-            .height(Length::Fill),
+        responsive(move |size| view_dashboard_workspace(app, size)),
         horizontal_rule(),
         view_bottom_bar(app),
     ]
     .width(Length::Fill)
     .height(Length::Fill)
+    .into()
+}
+
+fn view_dashboard_workspace(app: &App, size: Size) -> Element<'_, Message> {
+    let connection = container(view_connect_to_node(app)).width(Length::FillPortion(3));
+    let paths = container(view_paths_panel(app)).width(Length::FillPortion(2));
+
+    let overview: Element<Message> = if size.width >= DASHBOARD_OVERVIEW_BREAKPOINT {
+        row![connection, paths]
+            .spacing(DASHBOARD_SECTION_SPACING)
+            .width(Length::Fill)
+            .into()
+    } else {
+        column![connection, paths]
+            .spacing(DASHBOARD_SECTION_SPACING)
+            .width(Length::Fill)
+            .into()
+    };
+
+    let mut sections = vec![overview];
+    if let Some(notice) = installation_recovery_notice(app) {
+        sections.push(notice);
+    }
+    sections.push(view_node_panels(app));
+
+    container(
+        column(sections)
+            .spacing(DASHBOARD_SECTION_SPACING)
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding(DASHBOARD_PADDING)
     .into()
 }
 
@@ -1470,11 +1494,11 @@ fn view_connect_to_node(app: &App) -> Element<'_, Message> {
     let (status_label, status_color) = connection_status(app, &readiness);
     let header = row![
         column![
-            text("Connect to your node").size(18).font(Font {
+            text("Wallet connection").size(17).font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::default()
             }),
-            text("Scan or copy an Electrum TCP endpoint when both services are genuinely ready.")
+            text("Electrum access appears only when both services are ready.")
                 .size(10)
                 .style(secondary_text_style),
         ]
@@ -1491,7 +1515,7 @@ fn view_connect_to_node(app: &App) -> Element<'_, Message> {
         ConnectionMode::Local => view_local_connection(app, &readiness),
         ConnectionMode::Tor => view_tor_connection(app, &readiness),
     };
-    let card = container(column![header, horizontal_rule(), body])
+    container(column![header, horizontal_rule(), body])
         .width(Length::Fill)
         .style(|theme| container::Style {
             background: Some(ui_palette(theme).panel.into()),
@@ -1500,14 +1524,6 @@ fn view_connect_to_node(app: &App) -> Element<'_, Message> {
                 width: 1.0,
                 radius: 12.0.into(),
             },
-            ..Default::default()
-        });
-
-    container(card)
-        .width(Length::Fill)
-        .padding(Padding::from([10, 20]))
-        .style(|theme| container::Style {
-            background: Some(ui_palette(theme).background.into()),
             ..Default::default()
         })
         .into()
@@ -1704,10 +1720,10 @@ fn view_local_connection<'a>(
     }
     details.push(local_network_control(app));
 
-    row![visual, column(details).spacing(8).width(Length::Fill)]
-        .spacing(16)
+    row![visual, column(details).spacing(7).width(Length::Fill)]
+        .spacing(12)
         .align_y(Alignment::Center)
-        .padding(Padding::from([12, 16]))
+        .padding(Padding::from([10, 12]))
         .into()
 }
 
@@ -1759,9 +1775,9 @@ fn view_tor_connection<'a>(app: &'a App, readiness: &ConnectionReadiness) -> Ele
     details.push(tor_controls(app, presentation.action));
 
     row![visual, column(details).spacing(7).width(Length::Fill)]
-        .spacing(16)
+        .spacing(12)
         .align_y(Alignment::Center)
-        .padding(Padding::from([12, 16]))
+        .padding(Padding::from([10, 12]))
         .into()
 }
 
@@ -2349,7 +2365,7 @@ fn connection_placeholder(
 ) -> Element<'static, Message> {
     container(
         column![
-            text("◇").size(30).style(tertiary_text_style),
+            text("◇").size(23).style(tertiary_text_style),
             text(title.into()).size(11).font(Font {
                 weight: iced::font::Weight::Semibold,
                 ..Font::default()
@@ -2362,8 +2378,8 @@ fn connection_placeholder(
         .spacing(4)
         .align_x(Alignment::Center),
     )
-    .width(142)
-    .height(142)
+    .width(100)
+    .height(100)
     .align_x(Alignment::Center)
     .align_y(Alignment::Center)
     .padding(10)
@@ -2390,16 +2406,19 @@ fn connection_unavailable(message: &str) -> Element<'_, Message> {
 fn view_paths_panel(app: &App) -> Element<'_, Message> {
     let paths_editable = app.paths_are_editable();
     let toggle_label = if app.paths_visible {
-        "Hide Paths"
+        "Collapse"
     } else {
-        "Show Paths"
+        "Edit Paths"
     };
 
     let heading = column![
-        text("DIRECTORY PATHS").size(10).style(tertiary_text_style),
-        text(format!("Config: {}", Config::config_file_path().display()))
-            .size(9)
-            .style(tertiary_text_style)
+        text("Storage & directories").size(15).font(Font {
+            weight: iced::font::Weight::Bold,
+            ..Font::default()
+        }),
+        text("Binary, blockchain, index, and configuration locations")
+            .size(10)
+            .style(secondary_text_style)
             .width(Length::Fill)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
     ]
@@ -2418,8 +2437,13 @@ fn view_paths_panel(app: &App) -> Element<'_, Message> {
         return container(header)
             .width(Length::Fill)
             .style(|theme| container::Style {
-                background: Some(ui_palette(theme).bar.into()),
-                ..Default::default()
+                background: Some(ui_palette(theme).panel.into()),
+                border: iced::Border {
+                    color: ui_palette(theme).border,
+                    width: 1.0,
+                    radius: 12.0.into(),
+                },
+                ..container::Style::default()
             })
             .into();
     }
@@ -2434,8 +2458,13 @@ fn view_paths_panel(app: &App) -> Element<'_, Message> {
     container(body)
         .width(Length::Fill)
         .style(|theme| container::Style {
-            background: Some(ui_palette(theme).bar.into()),
-            ..Default::default()
+            background: Some(ui_palette(theme).panel.into()),
+            border: iced::Border {
+                color: ui_palette(theme).border,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..container::Style::default()
         })
         .into()
 }
@@ -2477,6 +2506,14 @@ fn view_path_rows(app: &App, paths_editable: bool) -> Element<'_, Message> {
             ),
             paths_editable,
         ),
+        text(format!(
+            "Config file: {}",
+            Config::config_file_path().display()
+        ))
+        .size(9)
+        .style(tertiary_text_style)
+        .width(Length::Fill)
+        .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
         row![
             text(paths_status_text(app))
                 .size(10)
@@ -2579,12 +2616,396 @@ fn electrs_launch_action(app: &App) -> Option<Message> {
     .then_some(Message::LaunchElectrs)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct NodeStatePresentation {
+    label: &'static str,
+    color: Color,
+    detail: String,
+}
+
+#[derive(Clone, Copy)]
+struct NodeIndicator {
+    label: &'static str,
+    value: &'static str,
+    color: Color,
+}
+
+fn bitcoin_node_presentation(app: &App) -> NodeStatePresentation {
+    if app.bitcoin_shutdown.is_some() {
+        return NodeStatePresentation {
+            label: "Stopping",
+            color: NEUTRAL_STATUS,
+            detail: "Graceful Bitcoin Core shutdown is in progress.".to_owned(),
+        };
+    }
+    if let Some(error) = app.bitcoin_process_error.as_ref() {
+        return NodeStatePresentation {
+            label: "Failed",
+            color: MAC_RED,
+            detail: error.clone(),
+        };
+    }
+    if !app.bitcoin_running {
+        return NodeStatePresentation {
+            label: "Stopped",
+            color: NEUTRAL_STATUS,
+            detail: "Launch Bitcoin Core to begin node synchronization.".to_owned(),
+        };
+    }
+    if let Some(error) = app.bitcoin_compatibility_error.as_ref() {
+        return NodeStatePresentation {
+            label: "Unavailable",
+            color: MAC_RED,
+            detail: error.clone(),
+        };
+    }
+    if let Some(error) = app
+        .bitcoin_rpc_error
+        .as_ref()
+        .or(app.bitcoin_p2p_error.as_ref())
+    {
+        return NodeStatePresentation {
+            label: "Retrying",
+            color: MAC_ORG,
+            detail: error.clone(),
+        };
+    }
+
+    match app.connection_readiness() {
+        ConnectionReadiness::BitcoinStarting => NodeStatePresentation {
+            label: "Starting",
+            color: MAC_BLUE,
+            detail: app
+                .bitcoin_rpc_startup_status
+                .clone()
+                .unwrap_or_else(|| "Waiting for authenticated RPC and chain status.".to_owned()),
+        },
+        ConnectionReadiness::BitcoinSyncing {
+            percent,
+            blocks,
+            headers,
+        } => NodeStatePresentation {
+            label: "Synchronizing",
+            color: MAC_BLUE,
+            detail: format!("{percent:.1}% complete · {blocks} blocks · {headers} headers"),
+        },
+        ConnectionReadiness::BitcoinFailed { reason } => NodeStatePresentation {
+            label: "Unavailable",
+            color: MAC_RED,
+            detail: reason,
+        },
+        ConnectionReadiness::ServicesStopped => NodeStatePresentation {
+            label: "Stopped",
+            color: NEUTRAL_STATUS,
+            detail: "Bitcoin Core is not running.".to_owned(),
+        },
+        ConnectionReadiness::ElectrsStopped
+        | ConnectionReadiness::ElectrsStarting
+        | ConnectionReadiness::ElectrsIndexing { .. }
+        | ConnectionReadiness::ElectrsUnavailable { .. }
+        | ConnectionReadiness::Ready => {
+            if app.bitcoin_synced && app.bitcoin_ready() {
+                NodeStatePresentation {
+                    label: "Ready",
+                    color: GREEN,
+                    detail: "Chain synchronized; authenticated RPC and P2P checks passed."
+                        .to_owned(),
+                }
+            } else {
+                NodeStatePresentation {
+                    label: "Running",
+                    color: MAC_BLUE,
+                    detail: "Bitcoin Core is running while readiness checks complete.".to_owned(),
+                }
+            }
+        }
+    }
+}
+
+fn electrs_node_presentation(app: &App) -> NodeStatePresentation {
+    if app.electrs_shutdown.is_some() {
+        return NodeStatePresentation {
+            label: "Stopping",
+            color: NEUTRAL_STATUS,
+            detail: "Graceful Electrs shutdown is in progress.".to_owned(),
+        };
+    }
+    if let Some(error) = app.electrs_process_error.as_ref() {
+        return NodeStatePresentation {
+            label: "Failed",
+            color: MAC_RED,
+            detail: error.clone(),
+        };
+    }
+    if let Some(error) = app.electrs_listener_invalidation.as_ref() {
+        return NodeStatePresentation {
+            label: "Unavailable",
+            color: MAC_RED,
+            detail: error.clone(),
+        };
+    }
+    if app.electrs_launch_pending_for_lan {
+        return NodeStatePresentation {
+            label: "Starting",
+            color: MAC_BLUE,
+            detail: "Resolving the validated local-network listener before launch.".to_owned(),
+        };
+    }
+    if !app.electrs_status.running {
+        return NodeStatePresentation {
+            label: "Stopped",
+            color: NEUTRAL_STATUS,
+            detail: "Start Electrs after Bitcoin Core is ready.".to_owned(),
+        };
+    }
+    if let Some(error) = electrs_retry_error(&app.electrs_status) {
+        return NodeStatePresentation {
+            label: "Retrying",
+            color: MAC_ORG,
+            detail: error.to_owned(),
+        };
+    }
+    if app.electrs_status.is_connection_ready() {
+        return NodeStatePresentation {
+            label: "Ready",
+            color: GREEN,
+            detail: "Index synchronized; Electrum protocol checks passed for wallet access."
+                .to_owned(),
+        };
+    }
+    if app.electrs_status.sync_percent.is_some()
+        || app.electrs_status.electrs_height.is_some()
+        || app.electrs_status.connected
+    {
+        return NodeStatePresentation {
+            label: "Synchronizing",
+            color: MAC_BLUE,
+            detail: electrs_sync_detail(&app.electrs_status),
+        };
+    }
+
+    NodeStatePresentation {
+        label: "Starting",
+        color: MAC_BLUE,
+        detail: "Waiting for Bitcoin connectivity, metrics, and Electrum protocol checks."
+            .to_owned(),
+    }
+}
+
+fn electrs_retry_error(status: &ElectrsStatus) -> Option<&str> {
+    status
+        .bitcoin_error
+        .as_deref()
+        .or(status.metrics_error.as_deref())
+        .or(status.connect_error.as_deref())
+}
+
+fn electrs_sync_detail(status: &ElectrsStatus) -> String {
+    match (
+        status.sync_percent,
+        status.electrs_height,
+        status.bitcoin_blocks,
+    ) {
+        (Some(percent), Some(indexed), Some(bitcoin)) => {
+            format!("{percent:.1}% indexed · Electrs {indexed} · Bitcoin {bitcoin}")
+        }
+        (Some(percent), _, _) => format!("{percent:.1}% of the Bitcoin chain indexed"),
+        (_, Some(indexed), Some(bitcoin)) => {
+            format!("Index height {indexed} · Bitcoin height {bitcoin}")
+        }
+        _ => "Electrs is connected to Bitcoin Core and building its index.".to_owned(),
+    }
+}
+
+const fn bitcoin_node_indicators(app: &App) -> [NodeIndicator; 3] {
+    if app.bitcoin_shutdown.is_some() {
+        return [
+            NodeIndicator {
+                label: "Process",
+                value: "Stopping",
+                color: NEUTRAL_STATUS,
+            },
+            NodeIndicator {
+                label: "RPC + P2P",
+                value: "Closing",
+                color: NEUTRAL_STATUS,
+            },
+            NodeIndicator {
+                label: "Chain",
+                value: "Paused",
+                color: NEUTRAL_STATUS,
+            },
+        ];
+    }
+
+    let process = if app.bitcoin_process_error.is_some() {
+        NodeIndicator {
+            label: "Process",
+            value: "Failed",
+            color: MAC_RED,
+        }
+    } else if app.bitcoin_running {
+        NodeIndicator {
+            label: "Process",
+            value: "Running",
+            color: GREEN,
+        }
+    } else {
+        NodeIndicator {
+            label: "Process",
+            value: "Stopped",
+            color: NEUTRAL_STATUS,
+        }
+    };
+    let network = if app.bitcoin_ready() {
+        NodeIndicator {
+            label: "RPC + P2P",
+            value: "Ready",
+            color: GREEN,
+        }
+    } else if app.bitcoin_compatibility_error.is_some()
+        || app.bitcoin_rpc_error.is_some()
+        || app.bitcoin_p2p_error.is_some()
+    {
+        NodeIndicator {
+            label: "RPC + P2P",
+            value: "Retrying",
+            color: MAC_ORG,
+        }
+    } else if app.bitcoin_running {
+        NodeIndicator {
+            label: "RPC + P2P",
+            value: "Checking",
+            color: MAC_BLUE,
+        }
+    } else {
+        NodeIndicator {
+            label: "RPC + P2P",
+            value: "Offline",
+            color: NEUTRAL_STATUS,
+        }
+    };
+    let chain = if app.bitcoin_synced {
+        NodeIndicator {
+            label: "Chain",
+            value: "Synced",
+            color: GREEN,
+        }
+    } else if app.bitcoin_running {
+        NodeIndicator {
+            label: "Chain",
+            value: "Syncing",
+            color: MAC_BLUE,
+        }
+    } else {
+        NodeIndicator {
+            label: "Chain",
+            value: "Waiting",
+            color: NEUTRAL_STATUS,
+        }
+    };
+
+    [process, network, chain]
+}
+
+fn electrs_node_indicators(app: &App) -> [NodeIndicator; 3] {
+    if app.electrs_shutdown.is_some() {
+        return [
+            NodeIndicator {
+                label: "Process",
+                value: "Stopping",
+                color: NEUTRAL_STATUS,
+            },
+            NodeIndicator {
+                label: "Index",
+                value: "Paused",
+                color: NEUTRAL_STATUS,
+            },
+            NodeIndicator {
+                label: "Electrum",
+                value: "Closing",
+                color: NEUTRAL_STATUS,
+            },
+        ];
+    }
+
+    let process =
+        if app.electrs_process_error.is_some() || app.electrs_listener_invalidation.is_some() {
+            NodeIndicator {
+                label: "Process",
+                value: "Failed",
+                color: MAC_RED,
+            }
+        } else if app.electrs_status.running {
+            NodeIndicator {
+                label: "Process",
+                value: "Running",
+                color: GREEN,
+            }
+        } else {
+            NodeIndicator {
+                label: "Process",
+                value: "Stopped",
+                color: NEUTRAL_STATUS,
+            }
+        };
+    let index = if app.electrs_status.synced {
+        NodeIndicator {
+            label: "Index",
+            value: "Synced",
+            color: GREEN,
+        }
+    } else if app.electrs_status.running {
+        NodeIndicator {
+            label: "Index",
+            value: "Indexing",
+            color: MAC_BLUE,
+        }
+    } else {
+        NodeIndicator {
+            label: "Index",
+            value: "Waiting",
+            color: NEUTRAL_STATUS,
+        }
+    };
+    let service = if app.electrs_status.is_connection_ready() {
+        NodeIndicator {
+            label: "Electrum",
+            value: "Ready",
+            color: GREEN,
+        }
+    } else if electrs_retry_error(&app.electrs_status).is_some() {
+        NodeIndicator {
+            label: "Electrum",
+            value: "Retrying",
+            color: MAC_ORG,
+        }
+    } else if app.electrs_status.running {
+        NodeIndicator {
+            label: "Electrum",
+            value: "Checking",
+            color: MAC_BLUE,
+        }
+    } else {
+        NodeIndicator {
+            label: "Electrum",
+            value: "Offline",
+            color: NEUTRAL_STATUS,
+        }
+    };
+
+    [process, index, service]
+}
+
 fn view_node_panels(app: &App) -> Element<'_, Message> {
     let installation_ready = app.installation_recovery_ready();
     let bitcoin_panel = view_node_panel(NodePanelSpec {
-        title: "Bitcoin",
-        subtitle: "Bitcoin Core node",
+        title: "Bitcoin Core",
+        subtitle: "Full node · consensus and peer network",
+        terminal_label: "BITCOIN CORE LOG",
         accent: BTC_ACC,
+        state: bitcoin_node_presentation(app),
+        indicators: bitcoin_node_indicators(app),
         launch_action: bitcoin_launch_action(app),
         launch_hint: if !installation_ready {
             installation_recovery_short_hint(app)
@@ -2598,16 +3019,18 @@ fn view_node_panels(app: &App) -> Element<'_, Message> {
             "Starts bitcoind with the configured data directory."
         },
         running: app.bitcoin_running,
-        synced: app.bitcoin_synced,
-        ready: app.bitcoin_ready(),
         lines: &app.bitcoin_lines,
         output_pane: OutputPane::Bitcoin,
         scroll_id: bitcoin_scroll_id(),
+        follow_output: app.output_viewports.bitcoin.follow_output,
     });
     let electrs_panel = view_node_panel(NodePanelSpec {
         title: "Electrs",
-        subtitle: "Electrum server index",
+        subtitle: "Electrum server · wallet index",
+        terminal_label: "ELECTRS LOG",
         accent: ELS_ACC,
+        state: electrs_node_presentation(app),
+        indicators: electrs_node_indicators(app),
         launch_action: electrs_launch_action(app),
         launch_hint: if !installation_ready {
             installation_recovery_short_hint(app)
@@ -2624,31 +3047,32 @@ fn view_node_panels(app: &App) -> Element<'_, Message> {
             "Starts Electrs with this Bitcoin generation's verified RPC and P2P endpoints."
         },
         running: app.electrs_status.running,
-        synced: app.electrs_status.synced,
-        ready: app.electrs_status.ready,
         lines: &app.electrs_lines,
         output_pane: OutputPane::Electrs,
         scroll_id: electrs_scroll_id(),
+        follow_output: app.output_viewports.electrs.follow_output,
     });
 
     row![bitcoin_panel, electrs_panel]
-        .spacing(0)
-        .height(Length::Fixed(DASHBOARD_NODE_PANELS_HEIGHT))
+        .spacing(DASHBOARD_SECTION_SPACING)
+        .height(Length::Fill)
         .into()
 }
 
 struct NodePanelSpec<'a> {
     title: &'a str,
     subtitle: &'a str,
+    terminal_label: &'a str,
     accent: Color,
+    state: NodeStatePresentation,
+    indicators: [NodeIndicator; 3],
     launch_action: Option<Message>,
     launch_hint: &'a str,
     running: bool,
-    synced: bool,
-    ready: bool,
     lines: &'a [String],
     output_pane: OutputPane,
     scroll_id: Id,
+    follow_output: bool,
 }
 
 fn view_node_panel(spec: NodePanelSpec<'_>) -> Element<'_, Message> {
@@ -2658,13 +3082,19 @@ fn view_node_panel(spec: NodePanelSpec<'_>) -> Element<'_, Message> {
             spec.title,
             spec.subtitle,
             spec.accent,
+            spec.state,
             spec.launch_action,
             spec.launch_hint,
         ),
-        horizontal_rule(),
-        panel_indicators(spec.running, spec.synced, spec.ready),
-        horizontal_rule(),
-        terminal_container(spec.running, spec.lines, spec.output_pane, spec.scroll_id,),
+        panel_indicators(spec.indicators),
+        terminal_container(
+            spec.terminal_label,
+            spec.running,
+            spec.lines,
+            spec.output_pane,
+            spec.scroll_id,
+            spec.follow_output,
+        ),
     ]
     .width(Length::Fill)
     .height(Length::Fill);
@@ -2677,7 +3107,7 @@ fn view_node_panel(spec: NodePanelSpec<'_>) -> Element<'_, Message> {
             border: iced::Border {
                 color: ui_palette(theme).border,
                 width: 1.0,
-                radius: 0.0.into(),
+                radius: 12.0.into(),
             },
             ..Default::default()
         })
@@ -2698,6 +3128,7 @@ fn panel_header<'a>(
     title: &'a str,
     subtitle: &'a str,
     accent: Color,
+    state: NodeStatePresentation,
     launch_action: Option<Message>,
     launch_hint: &'a str,
 ) -> Element<'a, Message> {
@@ -2706,6 +3137,7 @@ fn panel_header<'a>(
     } else {
         BUTTON_ELECTRS
     };
+    let launch_disabled = launch_action.is_none();
     let launch_btn = button(text("Launch").size(13).font(Font {
         weight: iced::font::Weight::Bold,
         ..Font::default()
@@ -2736,46 +3168,200 @@ fn panel_header<'a>(
     .on_press_maybe(launch_action);
 
     let heading = column![
-        text(title).size(20).font(Font {
+        text(title).size(18).font(Font {
             weight: iced::font::Weight::Bold,
             ..Font::default()
         }),
-        text(subtitle).size(11).style(secondary_text_style),
-        text(launch_hint)
+        text(subtitle).size(10).style(secondary_text_style),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+
+    let detail = if launch_disabled && state.label == "Stopped" {
+        launch_hint.to_owned()
+    } else {
+        state.detail
+    };
+
+    column![
+        row![
+            heading,
+            status_pill(state.label, state.color),
+            Space::new().width(8),
+            launch_btn,
+        ]
+        .align_y(Alignment::Center),
+        text(detail)
             .size(10)
-            .style(tertiary_text_style)
+            .style(secondary_text_style)
             .width(Length::Fill)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
     ]
-    .spacing(3)
-    .width(Length::Fill);
-
-    row![heading, Space::new().width(Length::Fill), launch_btn,]
-        .align_y(Alignment::Center)
-        .padding(Padding {
-            top: 14.0,
-            right: 20.0,
-            bottom: 10.0,
-            left: 20.0,
-        })
-        .into()
+    .spacing(7)
+    .padding(Padding::from([10, 12]))
+    .into()
 }
 
-fn panel_indicators(running: bool, synced: bool, ready: bool) -> Element<'static, Message> {
-    row![
-        indicator_badge(
-            "Process",
-            if running { "Running" } else { "Stopped" },
-            running
-        ),
-        Space::new().width(8),
-        indicator_badge("Chain", if synced { "Synced" } else { "Waiting" }, synced),
-        Space::new().width(8),
-        indicator_badge("Service", if ready { "Ready" } else { "Not ready" }, ready),
-    ]
+fn panel_indicators(indicators: [NodeIndicator; 3]) -> Element<'static, Message> {
+    row(indicators
+        .into_iter()
+        .map(|indicator| indicator_badge(indicator.label, indicator.value, indicator.color)))
+    .spacing(6)
     .align_y(Alignment::Center)
-    .padding(Padding::from([10, 20]))
+    .padding(Padding {
+        top: 0.0,
+        right: 12.0,
+        bottom: 9.0,
+        left: 12.0,
+    })
     .into()
+}
+
+fn terminal_scroll_style(
+    theme: &iced::Theme,
+    status: iced::widget::scrollable::Status,
+) -> iced::widget::scrollable::Style {
+    let mut style = scrollable::default(theme, status);
+    style.vertical_rail.background = Some(TERM_FRAME.into());
+    style.vertical_rail.scroller.background = TERM_DIM.into();
+    style.vertical_rail.border.color = TERM_BORDER;
+    style
+}
+
+fn terminal_action_button(pane: OutputPane) -> button::Button<'static, Message> {
+    button(text("Jump to latest").size(9).color(TERM_FG))
+        .padding(Padding::from([3, 7]))
+        .on_press(Message::OutputFollowLatest(pane))
+        .style(|_, status| button::Style {
+            background: Some(
+                match status {
+                    button::Status::Hovered | button::Status::Pressed => TERM_BORDER,
+                    button::Status::Active | button::Status::Disabled => TERM_FRAME,
+                }
+                .into(),
+            ),
+            text_color: TERM_FG,
+            border: iced::Border {
+                color: TERM_BORDER,
+                width: 1.0,
+                radius: 5.0.into(),
+            },
+            ..button::Style::default()
+        })
+}
+
+fn terminal_container<'a>(
+    label: &'a str,
+    running: bool,
+    lines: &'a [String],
+    output_pane: OutputPane,
+    scroll_id: Id,
+    follow_output: bool,
+) -> Element<'a, Message> {
+    let activity = if !running {
+        "Idle"
+    } else if follow_output {
+        "Live · Following"
+    } else {
+        "Live · Viewing history"
+    };
+    let activity_color = if !running {
+        TERM_DIM
+    } else if follow_output {
+        GREEN
+    } else {
+        MAC_ORG
+    };
+    let mut header_actions: Vec<Element<Message>> = vec![
+        text("●").size(11).color(activity_color).into(),
+        text(activity).size(9).color(TERM_DIM).into(),
+    ];
+    if !follow_output {
+        header_actions.push(Space::new().width(4).into());
+        header_actions.push(terminal_action_button(output_pane).into());
+    }
+
+    let terminal_header = container(
+        row![
+            row![
+                text(label).size(9).color(TERM_DIM).font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::MONOSPACE
+                }),
+                Space::new().width(7),
+                text(format!("{} lines", lines.len()))
+                    .size(9)
+                    .color(TERM_DIM),
+            ]
+            .align_y(Alignment::Center),
+            Space::new().width(Length::Fill),
+            row(header_actions).spacing(4).align_y(Alignment::Center),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([7, 9]))
+    .style(|_| container::Style {
+        background: Some(TERM_FRAME.into()),
+        border: iced::Border {
+            color: TERM_BORDER,
+            width: 1.0,
+            radius: 7.0.into(),
+        },
+        ..Default::default()
+    });
+
+    let terminal_lines: Vec<Element<Message>> = if lines.is_empty() {
+        vec![empty_terminal_state(running)]
+    } else {
+        lines
+            .iter()
+            .map(|line| terminal_line_element(line))
+            .collect()
+    };
+
+    let terminal_content = column(terminal_lines)
+        .spacing(1)
+        .width(Length::Fill)
+        .padding(Padding::from([12, 14]));
+
+    let terminal = scrollable(terminal_content)
+        .id(scroll_id)
+        .on_scroll(move |viewport| output_viewport_changed(output_pane, viewport))
+        .direction(Direction::Vertical(
+            Scrollbar::default().width(9).scroller_width(6).spacing(2),
+        ))
+        .style(terminal_scroll_style)
+        .height(Length::Fill)
+        .width(Length::Fill);
+    let terminal = mouse_area(terminal)
+        .on_enter(Message::OutputPaneHoverChanged {
+            pane: output_pane,
+            hovered: true,
+        })
+        .on_exit(Message::OutputPaneHoverChanged {
+            pane: output_pane,
+            hovered: false,
+        });
+
+    container(column![terminal_header, terminal].spacing(6))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(Padding {
+            top: 0.0,
+            right: 8.0,
+            bottom: 8.0,
+            left: 8.0,
+        })
+        .style(|_| container::Style {
+            background: Some(TERM_BG.into()),
+            border: iced::Border {
+                color: TERM_BORDER,
+                width: 1.0,
+                radius: 10.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
 }
 
 fn build_setting_toggle<'a>(
@@ -2803,94 +3389,6 @@ fn build_setting_toggle<'a>(
     .spacing(16)
     .align_y(Alignment::Center)
     .into()
-}
-
-fn terminal_container(
-    running: bool,
-    lines: &[String],
-    output_pane: OutputPane,
-    scroll_id: Id,
-) -> Element<'_, Message> {
-    let terminal_header = container(
-        row![
-            row![
-                text("LOG OUTPUT").size(9).style(tertiary_text_style),
-                Space::new().width(6),
-                text(format!("{} lines", lines.len()))
-                    .size(9)
-                    .color(TERM_DIM),
-            ]
-            .align_y(Alignment::Center),
-            Space::new().width(Length::Fill),
-            row![
-                text("●").size(11).color(if running { GREEN } else { OFF }),
-                Space::new().width(4),
-                text(if running { "Live" } else { "Idle" })
-                    .size(9)
-                    .color(TERM_DIM),
-            ]
-            .align_y(Alignment::Center),
-        ]
-        .align_y(Alignment::Center)
-        .padding(Padding {
-            top: 0.0,
-            right: 2.0,
-            bottom: 0.0,
-            left: 2.0,
-        }),
-    )
-    .padding(Padding::from([8, 10]))
-    .style(|_| container::Style {
-        background: Some(TERM_FRAME.into()),
-        border: iced::Border {
-            color: TERM_BORDER,
-            width: 1.0,
-            radius: 10.0.into(),
-        },
-        ..Default::default()
-    });
-
-    let terminal_lines: Vec<Element<Message>> = if lines.is_empty() {
-        vec![empty_terminal_state(running)]
-    } else {
-        lines.iter().map(|l| terminal_line_element(l)).collect()
-    };
-
-    let terminal_content = column(terminal_lines)
-        .spacing(0)
-        .width(Length::Fill)
-        .padding(Padding::from([10, 12]));
-
-    let terminal = scrollable(terminal_content)
-        .id(scroll_id)
-        .on_scroll(move |viewport| output_viewport_changed(output_pane, viewport))
-        .direction(Direction::Vertical(Scrollbar::default()))
-        .height(Length::Fill)
-        .width(Length::Fill);
-    let terminal = mouse_area(terminal)
-        .on_enter(Message::OutputPaneHoverChanged {
-            pane: output_pane,
-            hovered: true,
-        })
-        .on_exit(Message::OutputPaneHoverChanged {
-            pane: output_pane,
-            hovered: false,
-        });
-
-    container(column![terminal_header, terminal].spacing(8))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(12)
-        .style(|_| container::Style {
-            background: Some(TERM_BG.into()),
-            border: iced::Border {
-                color: TERM_BORDER,
-                width: 1.0,
-                radius: 14.0.into(),
-            },
-            ..Default::default()
-        })
-        .into()
 }
 
 fn view_bottom_bar(app: &App) -> Element<'_, Message> {
@@ -3004,25 +3502,24 @@ fn horizontal_rule<'a>() -> Element<'a, Message> {
         .into()
 }
 
-fn indicator_badge<'a>(label: &'a str, value: &'a str, active: bool) -> Element<'a, Message> {
-    let dot_color = if active { GREEN } else { OFF };
+fn indicator_badge(
+    label: &'static str,
+    value: &'static str,
+    color: Color,
+) -> Element<'static, Message> {
     container(
         row![
-            text("●").size(13).style(semantic_text_style(dot_color)),
+            text("●").size(12).style(semantic_text_style(color)),
             column![
-                text(label).size(9).style(tertiary_text_style),
-                text(value).size(11).style(move |theme: &iced::Theme| {
-                    iced::widget::text::Style {
-                        color: (!active).then(|| ui_palette(theme).secondary_text),
-                    }
-                }),
+                text(label).size(8).style(tertiary_text_style),
+                text(value).size(10).style(semantic_text_style(color)),
             ]
             .spacing(1),
         ]
-        .spacing(7)
+        .spacing(6)
         .align_y(Alignment::Center),
     )
-    .padding(Padding::from([5, 9]))
+    .padding(Padding::from([4, 7]))
     .style(|theme| container::Style {
         background: Some(ui_palette(theme).indicator.into()),
         border: iced::Border {
@@ -3044,7 +3541,8 @@ fn empty_terminal_state(running: bool) -> Element<'static, Message> {
 
     container(
         text(message)
-            .size(11)
+            .size(12)
+            .font(Font::MONOSPACE)
             .color(TERM_DIM)
             .width(Length::Fill)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
@@ -3071,12 +3569,12 @@ fn terminal_line_element(line: &str) -> Element<'_, Message> {
     };
 
     text(line)
-        .size(11)
+        .size(12)
         .font(font)
         .color(style.color)
         .width(Length::Fill)
         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-        .line_height(iced::widget::text::LineHeight::Relative(1.25))
+        .line_height(iced::widget::text::LineHeight::Relative(1.35))
         .into()
 }
 
@@ -3165,25 +3663,29 @@ fn path_row<'a>(
         Space::new().width(4),
         text(status_text).size(10).style(secondary_text_style),
     ]
-    .align_y(Alignment::Center)
-    .width(76);
+    .align_y(Alignment::Center);
 
-    row![
-        text(label).size(11).style(secondary_text_style).width(180),
-        text_input(placeholder, value)
-            .on_input_maybe(enabled.then_some(on_change))
-            .padding(Padding::from([6, 8]))
-            .font(Font::MONOSPACE)
-            .size(11),
-        Space::new().width(6),
-        styled_button("Browse", ButtonStyle::Secondary)
-            .on_press_maybe(enabled.then_some(browse_msg)),
-        Space::new().width(6),
-        status,
+    column![
+        row![
+            text(label).size(11).style(secondary_text_style),
+            Space::new().width(Length::Fill),
+            status,
+        ]
+        .align_y(Alignment::Center),
+        row![
+            text_input(placeholder, value)
+                .on_input_maybe(enabled.then_some(on_change))
+                .padding(Padding::from([6, 8]))
+                .font(Font::MONOSPACE)
+                .size(11),
+            styled_button("Browse", ButtonStyle::Secondary)
+                .on_press_maybe(enabled.then_some(browse_msg)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
     ]
-    .align_y(Alignment::Center)
-    .spacing(6)
-    .padding(Padding::from([4, 0]))
+    .spacing(4)
+    .padding(Padding::from([3, 0]))
     .into()
 }
 
@@ -3258,6 +3760,45 @@ mod tests {
         let success = terminal_line_style("electrs ready");
         assert_eq!(success.color, GREEN);
         assert!(!success.bold);
+    }
+
+    #[test]
+    fn dashboard_node_presentations_cover_stopped_retrying_failed_and_ready() -> anyhow::Result<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        let mut app = App::from_config(
+            Config::defaults(temporary.path()),
+            None,
+            temporary.path().join("build-state.json"),
+        );
+
+        assert!(!app.paths_visible);
+        assert_eq!(bitcoin_node_presentation(&app).label, "Stopped");
+        assert_eq!(electrs_node_presentation(&app).label, "Stopped");
+
+        app.bitcoin_running = true;
+        app.bitcoin_rpc_error = Some("RPC warmup is still in progress".to_owned());
+        let bitcoin = bitcoin_node_presentation(&app);
+        assert_eq!(bitcoin.label, "Retrying");
+        assert!(bitcoin.detail.contains("RPC warmup"));
+
+        app.bitcoin_process_error = Some("bitcoind exited unexpectedly".to_owned());
+        assert_eq!(bitcoin_node_presentation(&app).label, "Failed");
+
+        app.electrs_status = ElectrsStatus {
+            running: true,
+            connected: true,
+            synced: true,
+            ready: true,
+            ..ElectrsStatus::default()
+        };
+        assert_eq!(electrs_node_presentation(&app).label, "Ready");
+
+        app.electrs_status.metrics_error = Some("metrics probe timed out".to_owned());
+        let electrs = electrs_node_presentation(&app);
+        assert_eq!(electrs.label, "Retrying");
+        assert!(electrs.detail.contains("metrics probe"));
+        Ok(())
     }
 
     #[test]
