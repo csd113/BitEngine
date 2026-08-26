@@ -284,10 +284,10 @@ impl OutputViewportState {
         let content_grew = content_height > self.content_height + f32::EPSILON;
         let at_bottom = maximum_offset - offset_y <= OUTPUT_BOTTOM_TOLERANCE;
 
-        self.follow_output = if moved_up {
-            false
-        } else if at_bottom {
+        self.follow_output = if at_bottom {
             true
+        } else if moved_up {
+            false
         } else if content_grew {
             self.follow_output
         } else {
@@ -4598,7 +4598,7 @@ mod tests {
         let mut app = test_app(temporary.path());
         clear_node_output_queues(&app)?;
         update_output_viewport(&mut app, OutputPane::Bitcoin, 800.0, 200.0, 1_000.0);
-        update_output_viewport(&mut app, OutputPane::Bitcoin, 799.5, 200.0, 1_000.0);
+        update_output_viewport(&mut app, OutputPane::Bitcoin, 790.0, 200.0, 1_000.0);
         let preserved_offset = app.output_viewports.bitcoin.offset_y;
         push_msg(&app.bitcoin_queue, "new output while reading history");
 
@@ -4607,6 +4607,21 @@ mod tests {
         assert_eq!(task.units(), 0);
         assert!(!app.output_viewports.bitcoin.follow_output);
         assert!((app.output_viewports.bitcoin.offset_y - preserved_offset).abs() < f32::EPSILON);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_bottom_tolerance_ignores_viewport_jitter_for_node_logs() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+
+        for pane in [OutputPane::Bitcoin, OutputPane::Electrs] {
+            update_output_viewport(&mut app, pane, 800.0, 200.0, 1_000.0);
+            update_output_viewport(&mut app, pane, 799.5, 200.0, 1_000.0);
+
+            assert!(app.output_viewports.get(pane).follow_output);
+        }
+
         Ok(())
     }
 
