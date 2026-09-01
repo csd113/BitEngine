@@ -15,3 +15,6 @@
 # Local development helpers
 dev-check.sh
 clippy.sh
+
+# Private Codex guidance
+/rules.md
