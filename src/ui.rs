@@ -204,6 +204,65 @@ pub enum Message {
     DismissOverlay,
 }
 
+#[derive(Clone, Copy)]
+enum PrefMsg {
+    SystemTheme(iced::theme::Mode),
+    Theme(ThemePreference),
+    ConnectionMode(ConnectionMode),
+    TorAutoStart(bool),
+}
+
+enum TorMsg {
+    Enabled(bool),
+    Start,
+    CopyEndpoint,
+    Retry,
+    LanAddress(Result<IpAddr, String>),
+    ManagerStarted(Result<TorManager, String>),
+}
+
+#[derive(Clone, Copy)]
+enum OutMsg {
+    PaneHoverChanged { pane: OutputPane, hovered: bool },
+    FollowLatest(OutputPane),
+    PageUp,
+    PageDown,
+}
+
+enum PathMsg {
+    BinariesChanged(String),
+    BitcoinDataChanged(String),
+    ElectrsDataChanged(String),
+    BrowseBinaries,
+    BrowseBitcoinData,
+    BrowseElectrsData,
+    BinariesBrowsed(Option<String>),
+    BitcoinDataBrowsed(Option<String>),
+    ElectrsDataBrowsed(Option<String>),
+    TogglePanel,
+}
+
+#[derive(Clone, Copy)]
+enum NavMsg {
+    OpenDashboard,
+    OpenBinaries,
+    RefreshBinaryInfo,
+}
+
+#[derive(Clone, Copy)]
+enum BuildMsg {
+    Cancel,
+    ToggleDetails,
+    ToggleAdvanced,
+}
+
+#[derive(Clone, Copy)]
+enum DepMsg {
+    Check,
+    Install,
+    ToggleDetails,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Dashboard,
@@ -874,330 +933,56 @@ impl App {
 
     // ── update ────────────────────────────────────────────────────────────────
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the exhaustive Iced message dispatcher keeps UI state transitions centralized"
-    )]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let task = match message {
             Message::OutputTick => self.handle_output_tick(),
             Message::RpcTick => self.handle_rpc_tick(),
-            Message::SystemThemeChanged(mode) => {
-                self.system_theme = mode;
-                Task::none()
-            }
-            Message::ThemePreferenceChanged(preference) => self
-                .update_ui_preferences("theme", move |config| config.theme_preference = preference),
-            Message::ConnectionModeChanged(mode) => {
-                self.selected_connection_mode = mode;
-                self.copied_endpoint_at = None;
-                Task::none()
-            }
+            Message::SystemThemeChanged(mode) => self.pref(PrefMsg::SystemTheme(mode)),
+            Message::ThemePreferenceChanged(preference) => self.pref(PrefMsg::Theme(preference)),
+            Message::ConnectionModeChanged(mode) => self.pref(PrefMsg::ConnectionMode(mode)),
             Message::LocalNetworkAccessChanged(enabled) => {
-                if self.electrs_handle.is_some() || self.electrs_shutdown.is_some() {
-                    self.overlay_message = Some(
-                        "Local network access cannot change while electrs is running or shutting down. Stop electrs first; the setting takes effect on its next launch."
-                            .to_owned(),
-                    );
-                    Task::none()
-                } else {
-                    let previous = self.config.local_network_access;
-                    let task = self.update_ui_preferences("local network access", move |config| {
-                        config.local_network_access = enabled;
-                    });
-                    if self.config.local_network_access != previous {
-                        self.lan_address = None;
-                    }
-                    task
-                }
+                self.update_local_network_access(enabled)
             }
-            Message::TorEnabledChanged(enabled) => {
-                if enabled && self.tor_manager.is_none() && !self.tor_manager_starting {
-                    self.tor_control_error = Some(
-                        "The embedded Tor manager is unavailable; restart BitEngine before enabling Tor."
-                            .to_owned(),
-                    );
-                    Task::none()
-                } else {
-                    let previous_runtime_request = self.tor_runtime_requested;
-                    let persist = self.update_ui_preferences("Tor access", move |config| {
-                        config.tor_enabled = enabled;
-                    });
-                    if self.config.tor_enabled == enabled {
-                        self.tor_runtime_requested = enabled;
-                        self.tor_control_error = None;
-                        if enabled {
-                            self.tor_status = TorStatus::Starting;
-                        }
-                        let runtime = self.schedule_tor_runtime_command(enabled);
-                        Task::batch([persist, runtime])
-                    } else {
-                        self.tor_runtime_requested = previous_runtime_request;
-                        persist
-                    }
-                }
-            }
-            Message::TorAutoStartChanged(enabled) => {
-                self.update_ui_preferences("Tor automatic startup", move |config| {
-                    config.tor_auto_start = enabled;
-                })
-            }
-            Message::StartTor => {
-                if !self.config.tor_enabled {
-                    Task::none()
-                } else if self.tor_manager.is_some() {
-                    self.tor_runtime_requested = true;
-                    self.tor_control_error = None;
-                    self.tor_status = TorStatus::Starting;
-                    self.schedule_tor_runtime_command(true)
-                } else {
-                    self.tor_control_error = Some(
-                        "The embedded Tor manager is not available yet. Try again in a moment."
-                            .to_owned(),
-                    );
-                    Task::none()
-                }
-            }
-            Message::CopySelectedEndpoint => {
-                self.selected_connection_endpoint()
-                    .map_or_else(Task::none, |endpoint| {
-                        self.copied_endpoint_at = Some(Instant::now());
-                        iced::clipboard::write(endpoint.payload())
-                    })
-            }
-            Message::RetryTor => {
-                if !self.config.tor_enabled {
-                    Task::none()
-                } else if let Some(manager) = self.tor_manager.clone() {
-                    self.tor_runtime_requested = true;
-                    self.tor_control_error = None;
-                    self.tor_status = TorStatus::Starting;
-                    retry_tor_task(manager)
-                } else {
-                    self.tor_control_error = Some(
-                        "The embedded Tor manager is unavailable; restart BitEngine to recreate it."
-                            .to_owned(),
-                    );
-                    Task::none()
-                }
-            }
-            Message::LanAddressDiscovered(result) => {
-                self.lan_address = Some(result.clone());
-                if self.electrs_launch_pending_for_lan {
-                    self.electrs_launch_pending_for_lan = false;
-                    match result {
-                        Ok(_) => Task::done(Message::LaunchElectrs),
-                        Err(error) => {
-                            self.overlay_message = Some(format!(
-                                "Local network access could not be prepared:\n{error}\n\nNo electrs listener was started."
-                            ));
-                            Task::none()
-                        }
-                    }
-                } else {
-                    Task::none()
-                }
-            }
-            Message::TorManagerStarted(result) => {
-                self.tor_manager_starting = false;
-                self.tor_runtime_command_in_flight = None;
-                match result {
-                    Ok(manager) => {
-                        let status = manager.status();
-                        let reconcile_enabled =
-                            tor_runtime_reconciliation(&status, self.tor_runtime_requested);
-                        self.tor_status = reconcile_enabled.map_or(status, |enabled| {
-                            if enabled {
-                                TorStatus::Starting
-                            } else {
-                                TorStatus::Disabled
-                            }
-                        });
-                        self.tor_status_subscription = Some(manager.subscribe());
-                        self.tor_manager = Some(manager);
-                        self.tor_control_error = None;
-                        self.tor_electrs_sync_error = None;
-                        self.tor_forwarded_electrs_state = None;
-                        self.tor_failed_electrs_state = None;
-                        self.tor_latest_sync_request = None;
-                        reconcile_enabled.map_or_else(Task::none, |enabled| {
-                            self.schedule_tor_runtime_command(enabled)
-                        })
-                    }
-                    Err(error) => {
-                        self.tor_manager = None;
-                        self.tor_status_subscription = None;
-                        self.tor_forwarded_electrs_state = None;
-                        self.tor_failed_electrs_state = None;
-                        self.tor_latest_sync_request = None;
-                        self.tor_electrs_sync_error = None;
-                        self.tor_status = TorStatus::Error {
-                            message: error.clone(),
-                            retryable: false,
-                        };
-                        self.tor_control_error = Some(error);
-                        Task::none()
-                    }
-                }
-            }
+            Message::TorEnabledChanged(enabled) => self.tor(TorMsg::Enabled(enabled)),
+            Message::TorAutoStartChanged(enabled) => self.pref(PrefMsg::TorAutoStart(enabled)),
+            Message::StartTor => self.tor(TorMsg::Start),
+            Message::CopySelectedEndpoint => self.tor(TorMsg::CopyEndpoint),
+            Message::RetryTor => self.tor(TorMsg::Retry),
+            Message::LanAddressDiscovered(result) => self.tor(TorMsg::LanAddress(result)),
+            Message::TorManagerStarted(result) => self.tor(TorMsg::ManagerStarted(result)),
             Message::TorCommandFinished { operation, result } => {
-                if let Some(completed_state) = operation.runtime_state() {
-                    self.finish_tor_runtime_command(completed_state, result)
-                } else {
-                    match result {
-                        Ok(()) => {
-                            self.tor_control_error = None;
-                            self.tor_forwarded_electrs_state = None;
-                            self.tor_failed_electrs_state = None;
-                            self.tor_electrs_sync_error = None;
-                        }
-                        Err(error) => self.tor_control_error = Some(error),
-                    }
-                    Task::none()
-                }
+                self.apply_tor_command_finished(operation, result)
             }
             Message::TorElectrsStateFinished {
                 request_id,
                 state,
                 result,
-            } => {
-                if self.tor_latest_sync_request == Some((request_id, state)) {
-                    self.tor_latest_sync_request = None;
-                    match result {
-                        Ok(()) => {
-                            self.tor_forwarded_electrs_state = Some(state);
-                            self.tor_failed_electrs_state = None;
-                            self.tor_electrs_sync_error = None;
-                        }
-                        Err(error) => {
-                            self.tor_forwarded_electrs_state = None;
-                            self.tor_failed_electrs_state = Some(state);
-                            self.tor_electrs_sync_error = Some(error);
-                        }
-                    }
-                }
-                Task::none()
-            }
-            Message::WindowCloseRequested(window_id) => {
-                if self.closing {
-                    Task::none()
-                } else {
-                    self.closing = true;
-                    self.tor_status_subscription = None;
-                    self.tor_manager.take().map_or_else(
-                        || iced::window::close(window_id),
-                        |manager| shutdown_tor_task(manager, window_id),
-                    )
-                }
-            }
+            } => self.apply_tor_electrs_state_finished(request_id, state, result),
+            Message::WindowCloseRequested(window_id) => self.close_window(window_id),
             Message::TorShutdownFinished { window_id, result } => {
-                if let Err(error) = result {
-                    push_msg(
-                        &self.electrs_queue,
-                        &format!("Tor shutdown completed with a warning: {error}"),
-                    );
-                }
-                iced::window::close(window_id)
+                self.apply_tor_shutdown_finished(window_id, result)
             }
             Message::OutputViewportChanged {
                 pane,
                 offset_y,
                 viewport_height,
                 content_height,
-            } => {
-                self.output_viewports.get_mut(pane).update(
-                    offset_y,
-                    viewport_height,
-                    content_height,
-                );
-                Task::none()
-            }
+            } => self.update_output_viewport_state(pane, offset_y, viewport_height, content_height),
             Message::OutputPaneHoverChanged { pane, hovered } => {
-                if hovered {
-                    self.hovered_output_pane = Some(pane);
-                } else if self.hovered_output_pane == Some(pane) {
-                    self.hovered_output_pane = None;
-                }
-                Task::none()
+                self.output(OutMsg::PaneHoverChanged { pane, hovered })
             }
-            Message::OutputFollowLatest(pane) => {
-                self.output_viewports.get_mut(pane).follow_output = true;
-                widget::operation::scroll_to(
-                    ui_render::output_scroll_id(pane),
-                    scrollable::AbsoluteOffset {
-                        x: 0.0,
-                        y: f32::MAX,
-                    },
-                )
-            }
-            Message::OutputPageUp => self.scroll_output_page(-1.0),
-            Message::OutputPageDown => self.scroll_output_page(1.0),
-            Message::BinariesPathChanged(s) => {
-                if self.paths_are_editable() {
-                    self.binaries_path_edit = s;
-                }
-                Task::none()
-            }
-            Message::BitcoinDataPathChanged(s) => {
-                if self.paths_are_editable() {
-                    self.bitcoin_data_path_edit = s;
-                }
-                Task::none()
-            }
-            Message::ElectrsDataPathChanged(s) => {
-                if self.paths_are_editable() {
-                    self.electrs_data_path_edit = s;
-                }
-                Task::none()
-            }
-            Message::BrowseBinaries => {
-                if self.paths_are_editable() {
-                    Task::perform(
-                        async { browse_folder("Select Binaries Folder").await },
-                        Message::BinariesBrowsed,
-                    )
-                } else {
-                    Task::none()
-                }
-            }
-            Message::BrowseBitcoinData => {
-                if self.paths_are_editable() {
-                    Task::perform(
-                        async { browse_folder("Select Bitcoin Data Directory").await },
-                        Message::BitcoinDataBrowsed,
-                    )
-                } else {
-                    Task::none()
-                }
-            }
-            Message::BrowseElectrsData => {
-                if self.paths_are_editable() {
-                    Task::perform(
-                        async { browse_folder("Select Electrs DB Directory").await },
-                        Message::ElectrsDataBrowsed,
-                    )
-                } else {
-                    Task::none()
-                }
-            }
-            Message::BinariesBrowsed(p) => {
-                if let Some(s) = p.filter(|_| self.paths_are_editable()) {
-                    self.binaries_path_edit = s;
-                }
-                Task::none()
-            }
-            Message::BitcoinDataBrowsed(p) => {
-                if let Some(s) = p.filter(|_| self.paths_are_editable()) {
-                    self.bitcoin_data_path_edit = s;
-                }
-                Task::none()
-            }
-            Message::ElectrsDataBrowsed(p) => {
-                if let Some(s) = p.filter(|_| self.paths_are_editable()) {
-                    self.electrs_data_path_edit = s;
-                }
-                Task::none()
-            }
+            Message::OutputFollowLatest(pane) => self.output(OutMsg::FollowLatest(pane)),
+            Message::OutputPageUp => self.output(OutMsg::PageUp),
+            Message::OutputPageDown => self.output(OutMsg::PageDown),
+            Message::BinariesPathChanged(path) => self.path(PathMsg::BinariesChanged(path)),
+            Message::BitcoinDataPathChanged(path) => self.path(PathMsg::BitcoinDataChanged(path)),
+            Message::ElectrsDataPathChanged(path) => self.path(PathMsg::ElectrsDataChanged(path)),
+            Message::BrowseBinaries => self.path(PathMsg::BrowseBinaries),
+            Message::BrowseBitcoinData => self.path(PathMsg::BrowseBitcoinData),
+            Message::BrowseElectrsData => self.path(PathMsg::BrowseElectrsData),
+            Message::BinariesBrowsed(path) => self.path(PathMsg::BinariesBrowsed(path)),
+            Message::BitcoinDataBrowsed(path) => self.path(PathMsg::BitcoinDataBrowsed(path)),
+            Message::ElectrsDataBrowsed(path) => self.path(PathMsg::ElectrsDataBrowsed(path)),
             Message::SavePaths => self.save_paths(),
             Message::PathsSaved { request_id, result } => {
                 self.apply_paths_saved(request_id, result)
@@ -1208,77 +993,422 @@ impl App {
                 result,
             } => self.apply_installation_recovery_finished(request_id, destination, result),
             Message::RetryInstallationRecovery => self.retry_installation_recovery(),
-            Message::TogglePathsPanel => {
-                self.paths_visible = !self.paths_visible;
-                Task::none()
-            }
+            Message::TogglePathsPanel => self.path(PathMsg::TogglePanel),
             Message::LaunchBitcoin => self.launch_bitcoin(),
             Message::LaunchElectrs => self.launch_electrs(),
             Message::ShutdownBoth => self.shutdown_both(),
             Message::ShutdownElectrsOnly => self.shutdown_electrs_only(),
-            Message::OpenDashboard => {
-                self.page = Page::Dashboard;
-                self.hovered_output_pane = None;
+            message @ (Message::OpenDashboard
+            | Message::OpenBinaries
+            | Message::RefreshBinaryInfo
+            | Message::InstalledVersionsLoaded { .. }
+            | Message::AvailableVersionsLoaded { .. }
+            | Message::SelectBitcoinVersion(_)
+            | Message::SelectElectrsVersion(_)
+            | Message::StartBuild(_)
+            | Message::BuildFinished { .. }
+            | Message::CancelBuild
+            | Message::ToggleBuildDetails
+            | Message::ToggleBuildAdvanced
+            | Message::BuildPerformanceChanged(_)
+            | Message::KeepSourceChanged(_)
+            | Message::CleanBuildChanged(_)
+            | Message::VerboseBuildOutputChanged(_)
+            | Message::RestoreBuildDefaults
+            | Message::CheckDependencies
+            | Message::DependenciesScanned { .. }
+            | Message::InstallDependencies
+            | Message::DependenciesInstalled { .. }
+            | Message::ToggleDependencyDetails) => self.handle_binary_message(message),
+            Message::StatusPollReceived(result) => self.apply_status_poll(*result),
+            Message::DismissOverlay => {
+                self.overlay_message = None;
                 Task::none()
             }
-            Message::OpenBinaries => {
-                self.page = Page::Binaries;
-                self.hovered_output_pane = None;
-                self.refresh_binaries_page()
+        };
+        let mut tasks = vec![task];
+        tasks.extend(self.sync_tor_manager());
+        self.refresh_connection_qr();
+        Task::batch(tasks)
+    }
+
+    fn pref(&mut self, message: PrefMsg) -> Task<Message> {
+        match message {
+            PrefMsg::SystemTheme(mode) => {
+                self.system_theme = mode;
+                Task::none()
             }
-            Message::RefreshBinaryInfo => self.refresh_binaries_page(),
+            PrefMsg::Theme(preference) => self
+                .update_ui_preferences("theme", move |config| config.theme_preference = preference),
+            PrefMsg::ConnectionMode(mode) => {
+                self.selected_connection_mode = mode;
+                self.copied_endpoint_at = None;
+                Task::none()
+            }
+            PrefMsg::TorAutoStart(enabled) => {
+                self.update_ui_preferences("Tor automatic startup", move |config| {
+                    config.tor_auto_start = enabled;
+                })
+            }
+        }
+    }
+
+    fn update_local_network_access(&mut self, enabled: bool) -> Task<Message> {
+        if self.electrs_handle.is_some() || self.electrs_shutdown.is_some() {
+            self.overlay_message = Some(
+                "Local network access cannot change while electrs is running or shutting down. Stop electrs first; the setting takes effect on its next launch."
+                    .to_owned(),
+            );
+            return Task::none();
+        }
+
+        let previous = self.config.local_network_access;
+        let task = self.update_ui_preferences("local network access", move |config| {
+            config.local_network_access = enabled;
+        });
+        if self.config.local_network_access != previous {
+            self.lan_address = None;
+        }
+        task
+    }
+
+    fn tor(&mut self, message: TorMsg) -> Task<Message> {
+        match message {
+            TorMsg::Enabled(enabled) => self.update_tor_enabled(enabled),
+            TorMsg::Start => self.start_tor(),
+            TorMsg::CopyEndpoint => self.copy_selected_endpoint(),
+            TorMsg::Retry => self.retry_tor(),
+            TorMsg::LanAddress(result) => self.apply_lan_address(result),
+            TorMsg::ManagerStarted(result) => self.apply_tor_manager_started(result),
+        }
+    }
+
+    fn update_tor_enabled(&mut self, enabled: bool) -> Task<Message> {
+        if enabled && self.tor_manager.is_none() && !self.tor_manager_starting {
+            self.tor_control_error = Some(
+                "The embedded Tor manager is unavailable; restart BitEngine before enabling Tor."
+                    .to_owned(),
+            );
+            return Task::none();
+        }
+
+        let previous_runtime_request = self.tor_runtime_requested;
+        let persist = self.update_ui_preferences("Tor access", move |config| {
+            config.tor_enabled = enabled;
+        });
+        if self.config.tor_enabled == enabled {
+            self.tor_runtime_requested = enabled;
+            self.tor_control_error = None;
+            if enabled {
+                self.tor_status = TorStatus::Starting;
+            }
+            let runtime = self.schedule_tor_runtime_command(enabled);
+            Task::batch([persist, runtime])
+        } else {
+            self.tor_runtime_requested = previous_runtime_request;
+            persist
+        }
+    }
+
+    fn start_tor(&mut self) -> Task<Message> {
+        if !self.config.tor_enabled {
+            Task::none()
+        } else if self.tor_manager.is_some() {
+            self.tor_runtime_requested = true;
+            self.tor_control_error = None;
+            self.tor_status = TorStatus::Starting;
+            self.schedule_tor_runtime_command(true)
+        } else {
+            self.tor_control_error = Some(
+                "The embedded Tor manager is not available yet. Try again in a moment.".to_owned(),
+            );
+            Task::none()
+        }
+    }
+
+    fn copy_selected_endpoint(&mut self) -> Task<Message> {
+        self.selected_connection_endpoint()
+            .map_or_else(Task::none, |endpoint| {
+                self.copied_endpoint_at = Some(Instant::now());
+                iced::clipboard::write(endpoint.payload())
+            })
+    }
+
+    fn retry_tor(&mut self) -> Task<Message> {
+        if !self.config.tor_enabled {
+            Task::none()
+        } else if let Some(manager) = self.tor_manager.clone() {
+            self.tor_runtime_requested = true;
+            self.tor_control_error = None;
+            self.tor_status = TorStatus::Starting;
+            retry_tor_task(manager)
+        } else {
+            self.tor_control_error = Some(
+                "The embedded Tor manager is unavailable; restart BitEngine to recreate it."
+                    .to_owned(),
+            );
+            Task::none()
+        }
+    }
+
+    fn apply_lan_address(&mut self, result: Result<IpAddr, String>) -> Task<Message> {
+        self.lan_address = Some(result.clone());
+        if !self.electrs_launch_pending_for_lan {
+            return Task::none();
+        }
+        self.electrs_launch_pending_for_lan = false;
+        match result {
+            Ok(_) => Task::done(Message::LaunchElectrs),
+            Err(error) => {
+                self.overlay_message = Some(format!(
+                    "Local network access could not be prepared:\n{error}\n\nNo electrs listener was started."
+                ));
+                Task::none()
+            }
+        }
+    }
+
+    fn apply_tor_manager_started(&mut self, result: Result<TorManager, String>) -> Task<Message> {
+        self.tor_manager_starting = false;
+        self.tor_runtime_command_in_flight = None;
+        match result {
+            Ok(manager) => {
+                let status = manager.status();
+                let reconcile_enabled =
+                    tor_runtime_reconciliation(&status, self.tor_runtime_requested);
+                self.tor_status = reconcile_enabled.map_or(status, |enabled| {
+                    if enabled {
+                        TorStatus::Starting
+                    } else {
+                        TorStatus::Disabled
+                    }
+                });
+                self.tor_status_subscription = Some(manager.subscribe());
+                self.tor_manager = Some(manager);
+                self.tor_control_error = None;
+                self.tor_electrs_sync_error = None;
+                self.tor_forwarded_electrs_state = None;
+                self.tor_failed_electrs_state = None;
+                self.tor_latest_sync_request = None;
+                reconcile_enabled.map_or_else(Task::none, |enabled| {
+                    self.schedule_tor_runtime_command(enabled)
+                })
+            }
+            Err(error) => {
+                self.tor_manager = None;
+                self.tor_status_subscription = None;
+                self.tor_forwarded_electrs_state = None;
+                self.tor_failed_electrs_state = None;
+                self.tor_latest_sync_request = None;
+                self.tor_electrs_sync_error = None;
+                self.tor_status = TorStatus::Error {
+                    message: error.clone(),
+                    retryable: false,
+                };
+                self.tor_control_error = Some(error);
+                Task::none()
+            }
+        }
+    }
+
+    fn apply_tor_command_finished(
+        &mut self,
+        operation: TorOperation,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        if let Some(completed_state) = operation.runtime_state() {
+            return self.finish_tor_runtime_command(completed_state, result);
+        }
+        match result {
+            Ok(()) => {
+                self.tor_control_error = None;
+                self.tor_forwarded_electrs_state = None;
+                self.tor_failed_electrs_state = None;
+                self.tor_electrs_sync_error = None;
+            }
+            Err(error) => self.tor_control_error = Some(error),
+        }
+        Task::none()
+    }
+
+    fn apply_tor_electrs_state_finished(
+        &mut self,
+        request_id: u64,
+        state: (ElectrsTorTarget, bool),
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        if self.tor_latest_sync_request == Some((request_id, state)) {
+            self.tor_latest_sync_request = None;
+            match result {
+                Ok(()) => {
+                    self.tor_forwarded_electrs_state = Some(state);
+                    self.tor_failed_electrs_state = None;
+                    self.tor_electrs_sync_error = None;
+                }
+                Err(error) => {
+                    self.tor_forwarded_electrs_state = None;
+                    self.tor_failed_electrs_state = Some(state);
+                    self.tor_electrs_sync_error = Some(error);
+                }
+            }
+        }
+        Task::none()
+    }
+
+    fn close_window(&mut self, window_id: iced::window::Id) -> Task<Message> {
+        if self.closing {
+            Task::none()
+        } else {
+            self.closing = true;
+            self.tor_status_subscription = None;
+            self.tor_manager.take().map_or_else(
+                || iced::window::close(window_id),
+                |manager| shutdown_tor_task(manager, window_id),
+            )
+        }
+    }
+
+    fn apply_tor_shutdown_finished(
+        &self,
+        window_id: iced::window::Id,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        if let Err(error) = result {
+            push_msg(
+                &self.electrs_queue,
+                &format!("Tor shutdown completed with a warning: {error}"),
+            );
+        }
+        iced::window::close(window_id)
+    }
+
+    fn update_output_viewport_state(
+        &mut self,
+        pane: OutputPane,
+        offset_y: f32,
+        viewport_height: f32,
+        content_height: f32,
+    ) -> Task<Message> {
+        self.output_viewports
+            .get_mut(pane)
+            .update(offset_y, viewport_height, content_height);
+        Task::none()
+    }
+
+    fn output(&mut self, message: OutMsg) -> Task<Message> {
+        match message {
+            OutMsg::PaneHoverChanged { pane, hovered } => {
+                if hovered {
+                    self.hovered_output_pane = Some(pane);
+                } else if self.hovered_output_pane == Some(pane) {
+                    self.hovered_output_pane = None;
+                }
+                Task::none()
+            }
+            OutMsg::FollowLatest(pane) => {
+                self.output_viewports.get_mut(pane).follow_output = true;
+                widget::operation::scroll_to(
+                    ui_render::output_scroll_id(pane),
+                    scrollable::AbsoluteOffset {
+                        x: 0.0,
+                        y: f32::MAX,
+                    },
+                )
+            }
+            OutMsg::PageUp => self.scroll_output_page(-1.0),
+            OutMsg::PageDown => self.scroll_output_page(1.0),
+        }
+    }
+
+    fn path(&mut self, message: PathMsg) -> Task<Message> {
+        match message {
+            PathMsg::BinariesChanged(path) => {
+                if self.paths_are_editable() {
+                    self.binaries_path_edit = path;
+                }
+                Task::none()
+            }
+            PathMsg::BitcoinDataChanged(path) => {
+                if self.paths_are_editable() {
+                    self.bitcoin_data_path_edit = path;
+                }
+                Task::none()
+            }
+            PathMsg::ElectrsDataChanged(path) => {
+                if self.paths_are_editable() {
+                    self.electrs_data_path_edit = path;
+                }
+                Task::none()
+            }
+            PathMsg::BrowseBinaries => {
+                self.browse_path("Select Binaries Folder", Message::BinariesBrowsed)
+            }
+            PathMsg::BrowseBitcoinData => {
+                self.browse_path("Select Bitcoin Data Directory", Message::BitcoinDataBrowsed)
+            }
+            PathMsg::BrowseElectrsData => {
+                self.browse_path("Select Electrs DB Directory", Message::ElectrsDataBrowsed)
+            }
+            PathMsg::BinariesBrowsed(path) => {
+                if let Some(path) = path.filter(|_| self.paths_are_editable()) {
+                    self.binaries_path_edit = path;
+                }
+                Task::none()
+            }
+            PathMsg::BitcoinDataBrowsed(path) => {
+                if let Some(path) = path.filter(|_| self.paths_are_editable()) {
+                    self.bitcoin_data_path_edit = path;
+                }
+                Task::none()
+            }
+            PathMsg::ElectrsDataBrowsed(path) => {
+                if let Some(path) = path.filter(|_| self.paths_are_editable()) {
+                    self.electrs_data_path_edit = path;
+                }
+                Task::none()
+            }
+            PathMsg::TogglePanel => {
+                self.paths_visible = !self.paths_visible;
+                Task::none()
+            }
+        }
+    }
+
+    fn browse_path(
+        &self,
+        title: &'static str,
+        map: fn(Option<String>) -> Message,
+    ) -> Task<Message> {
+        if self.paths_are_editable() {
+            Task::perform(async move { browse_folder(title).await }, map)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn handle_binary_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::OpenDashboard => self.navigation(NavMsg::OpenDashboard),
+            Message::OpenBinaries => self.navigation(NavMsg::OpenBinaries),
+            Message::RefreshBinaryInfo => self.navigation(NavMsg::RefreshBinaryInfo),
             Message::InstalledVersionsLoaded {
                 request_id,
                 versions,
-            } => {
-                if self.binary_page.inventory_request == Some(request_id) {
-                    self.binary_page.installed_load = InventoryLoad::Idle;
-                    self.binary_page.installed_versions = Some(versions);
-                }
-                Task::none()
-            }
+            } => self.apply_installed_versions(request_id, versions),
             Message::AvailableVersionsLoaded {
                 request_id,
                 versions,
-            } => {
-                if self.binary_page.inventory_request == Some(request_id) {
-                    self.apply_available_versions(versions);
-                }
-                Task::none()
-            }
-            Message::SelectBitcoinVersion(version) => {
-                self.binary_page.selected_bitcoin = Some(version);
-                Task::none()
-            }
-            Message::SelectElectrsVersion(version) => {
-                self.binary_page.selected_electrs = Some(version);
-                Task::none()
-            }
+            } => self.apply_available_versions_loaded(request_id, versions),
+            Message::SelectBitcoinVersion(version) => self.select_bitcoin_version(version),
+            Message::SelectElectrsVersion(version) => self.select_electrs_version(version),
             Message::StartBuild(kind) => self.start_build(kind),
             Message::BuildFinished {
                 operation_id,
                 result,
             } => self.apply_build_finished(operation_id, result),
-            Message::CancelBuild => {
-                if self.binary_page.can_cancel() && self.build_service.cancel_current() {
-                    self.binary_page.cancellation_requested = true;
-                }
-                Task::none()
-            }
-            Message::ToggleBuildDetails => {
-                self.binary_page.disclosures.build_details =
-                    !self.binary_page.disclosures.build_details;
-                if !self.binary_page.disclosures.build_details
-                    && self.hovered_output_pane == Some(OutputPane::Build)
-                {
-                    self.hovered_output_pane = None;
-                }
-                Task::none()
-            }
-            Message::ToggleBuildAdvanced => {
-                self.binary_page.disclosures.advanced = !self.binary_page.disclosures.advanced;
-                Task::none()
-            }
+            Message::CancelBuild => self.build_update(BuildMsg::Cancel),
+            Message::ToggleBuildDetails => self.build_update(BuildMsg::ToggleDetails),
+            Message::ToggleBuildAdvanced => self.build_update(BuildMsg::ToggleAdvanced),
             Message::BuildPerformanceChanged(performance) => {
                 self.update_build_settings(|settings| settings.performance = performance)
             }
@@ -1294,44 +1424,132 @@ impl App {
             Message::RestoreBuildDefaults => {
                 self.update_build_settings(|settings| *settings = BuildSettings::default())
             }
-            Message::CheckDependencies => self.check_dependencies(),
+            Message::CheckDependencies => self.dependency(DepMsg::Check),
             Message::DependenciesScanned { request_id, report } => {
-                if self.binary_page.dependency_request == Some(request_id) {
-                    self.binary_page.dependency_load = DependencyLoad::Idle;
-                    self.binary_page.dependency_report = Some(report);
-                    self.binary_page.dependency_request = None;
-                    self.binary_page.dependency_message = None;
-                }
-                Task::none()
+                self.apply_dependencies_scanned(request_id, report)
             }
-            Message::InstallDependencies => self.install_dependencies(),
+            Message::InstallDependencies => self.dependency(DepMsg::Install),
             Message::DependenciesInstalled {
                 request_id,
                 outcome,
-            } => {
-                if self.binary_page.dependency_request == Some(request_id) {
-                    self.binary_page.dependency_load = DependencyLoad::Idle;
-                    self.binary_page.dependency_report = Some(outcome.report);
-                    self.binary_page.dependency_request = None;
-                    self.binary_page.dependency_message = Some(outcome.message);
+            } => self.apply_dependencies_installed(request_id, outcome),
+            Message::ToggleDependencyDetails => self.dependency(DepMsg::ToggleDetails),
+            _ => Task::none(),
+        }
+    }
+
+    fn navigation(&mut self, message: NavMsg) -> Task<Message> {
+        match message {
+            NavMsg::OpenDashboard => {
+                self.page = Page::Dashboard;
+                self.hovered_output_pane = None;
+                Task::none()
+            }
+            NavMsg::OpenBinaries => {
+                self.page = Page::Binaries;
+                self.hovered_output_pane = None;
+                self.refresh_binaries_page()
+            }
+            NavMsg::RefreshBinaryInfo => self.refresh_binaries_page(),
+        }
+    }
+
+    fn apply_installed_versions(
+        &mut self,
+        request_id: u64,
+        versions: InstalledVersions,
+    ) -> Task<Message> {
+        if self.binary_page.inventory_request == Some(request_id) {
+            self.binary_page.installed_load = InventoryLoad::Idle;
+            self.binary_page.installed_versions = Some(versions);
+        }
+        Task::none()
+    }
+
+    fn apply_available_versions_loaded(
+        &mut self,
+        request_id: u64,
+        versions: AvailableVersions,
+    ) -> Task<Message> {
+        if self.binary_page.inventory_request == Some(request_id) {
+            self.apply_available_versions(versions);
+        }
+        Task::none()
+    }
+
+    fn select_bitcoin_version(&mut self, version: ReleaseVersion) -> Task<Message> {
+        self.binary_page.selected_bitcoin = Some(version);
+        Task::none()
+    }
+
+    fn select_electrs_version(&mut self, version: ReleaseVersion) -> Task<Message> {
+        self.binary_page.selected_electrs = Some(version);
+        Task::none()
+    }
+
+    fn build_update(&mut self, message: BuildMsg) -> Task<Message> {
+        match message {
+            BuildMsg::Cancel => {
+                if self.binary_page.can_cancel() && self.build_service.cancel_current() {
+                    self.binary_page.cancellation_requested = true;
                 }
                 Task::none()
             }
-            Message::ToggleDependencyDetails => {
+            BuildMsg::ToggleDetails => {
+                self.binary_page.disclosures.build_details =
+                    !self.binary_page.disclosures.build_details;
+                if !self.binary_page.disclosures.build_details
+                    && self.hovered_output_pane == Some(OutputPane::Build)
+                {
+                    self.hovered_output_pane = None;
+                }
+                Task::none()
+            }
+            BuildMsg::ToggleAdvanced => {
+                self.binary_page.disclosures.advanced = !self.binary_page.disclosures.advanced;
+                Task::none()
+            }
+        }
+    }
+
+    fn dependency(&mut self, message: DepMsg) -> Task<Message> {
+        match message {
+            DepMsg::Check => self.check_dependencies(),
+            DepMsg::Install => self.install_dependencies(),
+            DepMsg::ToggleDetails => {
                 self.binary_page.disclosures.dependency_details =
                     !self.binary_page.disclosures.dependency_details;
                 Task::none()
             }
-            Message::StatusPollReceived(result) => self.apply_status_poll(*result),
-            Message::DismissOverlay => {
-                self.overlay_message = None;
-                Task::none()
-            }
-        };
-        let mut tasks = vec![task];
-        tasks.extend(self.sync_tor_manager());
-        self.refresh_connection_qr();
-        Task::batch(tasks)
+        }
+    }
+
+    fn apply_dependencies_scanned(
+        &mut self,
+        request_id: u64,
+        report: DependencyReport,
+    ) -> Task<Message> {
+        if self.binary_page.dependency_request == Some(request_id) {
+            self.binary_page.dependency_load = DependencyLoad::Idle;
+            self.binary_page.dependency_report = Some(report);
+            self.binary_page.dependency_request = None;
+            self.binary_page.dependency_message = None;
+        }
+        Task::none()
+    }
+
+    fn apply_dependencies_installed(
+        &mut self,
+        request_id: u64,
+        outcome: DependencyInstallOutcome,
+    ) -> Task<Message> {
+        if self.binary_page.dependency_request == Some(request_id) {
+            self.binary_page.dependency_load = DependencyLoad::Idle;
+            self.binary_page.dependency_report = Some(outcome.report);
+            self.binary_page.dependency_request = None;
+            self.binary_page.dependency_message = Some(outcome.message);
+        }
+        Task::none()
     }
 
     fn handle_output_tick(&mut self) -> Task<Message> {

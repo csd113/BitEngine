@@ -40,7 +40,7 @@ pub enum IntroRequestError {
     /// The handshake (e.g. hs_ntor) in the Introduce2 message was invalid and
     /// could not be completed.
     #[error("Introduction handshake was invalid")]
-    InvalidHandshake(#[source] tor_proto::Error),
+    InvalidHandshake(#[source] Box<tor_proto::Error>),
 
     /// The decrypted payload of the Introduce2 message could not be parsed.
     #[error("Could not parse INTRODUCE2 payload")]
@@ -262,7 +262,7 @@ impl IntroRequest {
             req.encoded_header(),
             req.encrypted_body(),
         )
-        .map_err(E::InvalidHandshake)?;
+        .map_err(|error| E::InvalidHandshake(Box::new(error)))?;
 
         let intro_payload: IntroduceHandshakePayload = {
             let mut r = tor_bytes::Reader::from_slice(&msg_body);

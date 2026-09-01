@@ -623,11 +623,11 @@ impl<R: Runtime, M: Mockable<R>> IptManager<R, M> {
 
         let storage = state_handle
             .storage_handle("ipts")
-            .map_err(StartupError::StateDirectoryInaccessible)?;
+            .map_err(|error| StartupError::StateDirectoryInaccessible(Box::new(error)))?;
 
         let replay_log_dir = state_handle
             .raw_subdir("iptreplay")
-            .map_err(StartupError::StateDirectoryInaccessible)?;
+            .map_err(|error| StartupError::StateDirectoryInaccessible(Box::new(error)))?;
 
         let imm = Immutable {
             runtime,

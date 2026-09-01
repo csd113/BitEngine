@@ -3,7 +3,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -62,6 +62,19 @@ pub enum CommandError {
     LogUnavailable { program: String },
 }
 
+/// Complete specification for one cancellable child-process execution.
+pub struct RunSpec<'a> {
+    pub operation_id: BuildOperationId,
+    pub program: &'a str,
+    pub arguments: &'a [String],
+    pub working_directory: Option<&'a Path>,
+    pub environment: &'a BuildEnvironment,
+    pub event_tx: &'a mpsc::Sender<BuildEvent>,
+    pub log_tx: &'a mpsc::Sender<String>,
+    pub cancelled: &'a Arc<AtomicBool>,
+    pub verbose_output: bool,
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the operation identity and independent UI, durable-log, environment, and cancellation inputs are intentionally explicit"
@@ -77,7 +90,7 @@ pub async fn run(
     log_tx: &mpsc::Sender<String>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(), CommandError> {
-    run_with_ui_output(
+    run_with_ui_output(RunSpec {
         operation_id,
         program,
         arguments,
@@ -86,26 +99,23 @@ pub async fn run(
         event_tx,
         log_tx,
         cancelled,
-        true,
-    )
+        verbose_output: true,
+    })
     .await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the immutable output presentation choice joins the existing explicit command inputs"
-)]
-pub async fn run_with_ui_output(
-    operation_id: BuildOperationId,
-    program: &str,
-    arguments: &[String],
-    working_directory: Option<&Path>,
-    environment: &BuildEnvironment,
-    event_tx: &mpsc::Sender<BuildEvent>,
-    log_tx: &mpsc::Sender<String>,
-    cancelled: &Arc<AtomicBool>,
-    verbose_output: bool,
-) -> Result<(), CommandError> {
+pub async fn run_with_ui_output(spec: RunSpec<'_>) -> Result<(), CommandError> {
+    let RunSpec {
+        operation_id,
+        program,
+        arguments,
+        working_directory,
+        environment,
+        event_tx,
+        log_tx,
+        cancelled,
+        verbose_output,
+    } = spec;
     if cancelled.load(Ordering::Acquire) {
         return Err(CommandError::Cancelled);
     }
@@ -200,22 +210,28 @@ pub async fn run_with_ui_output(
         return Err(CommandError::Cancelled);
     }
 
+    command_result(&executable, status, logs_available)
+}
+
+fn command_result(
+    executable: &Path,
+    status: ExitStatus,
+    logs_available: bool,
+) -> Result<(), CommandError> {
     if !logs_available {
         return Err(CommandError::LogUnavailable {
             program: executable.display().to_string(),
         });
     }
-
     if status.success() {
-        Ok(())
-    } else {
-        Err(CommandError::Failed {
-            program: executable.display().to_string(),
-            status: status
-                .code()
-                .map_or_else(|| "a signal".to_owned(), |code| format!("status {code}")),
-        })
+        return Ok(());
     }
+    Err(CommandError::Failed {
+        program: executable.display().to_string(),
+        status: status
+            .code()
+            .map_or_else(|| "a signal".to_owned(), |code| format!("status {code}")),
+    })
 }
 
 pub async fn probe(
@@ -622,17 +638,17 @@ mod tests {
         let (log_tx, mut log_rx) = mpsc::channel(16);
         let cancelled = Arc::new(AtomicBool::new(false));
 
-        run_with_ui_output(
-            BuildOperationId(77),
-            "compiler-fixture",
-            &[],
-            None,
-            &environment,
-            &event_tx,
-            &log_tx,
-            &cancelled,
-            false,
-        )
+        run_with_ui_output(RunSpec {
+            operation_id: BuildOperationId(77),
+            program: "compiler-fixture",
+            arguments: &[],
+            working_directory: None,
+            environment: &environment,
+            event_tx: &event_tx,
+            log_tx: &log_tx,
+            cancelled: &cancelled,
+            verbose_output: false,
+        })
         .await?;
         drop(log_tx);
         drop(event_tx);

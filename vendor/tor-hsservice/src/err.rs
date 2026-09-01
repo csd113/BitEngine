@@ -31,11 +31,11 @@ pub enum StartupError {
     #[error("reading on-disk state")]
     // Not #[from] as that might allow call sites that were *storing* during startup
     // to accidentally use this variant.  (Such call sites probably shouldn't exist.)
-    LoadState(#[source] tor_persist::Error),
+    LoadState(#[source] Box<tor_persist::Error>),
 
     /// Unable to access on-disk state
     #[error("Unable to access on-disk state")]
-    StateDirectoryInaccessible(#[source] tor_persist::Error),
+    StateDirectoryInaccessible(#[source] Box<tor_persist::Error>),
 
     /// Unable to access on-disk state using underlying IO operations
     #[error("Unable to access on-disk state: {action} {}", path.display_lossy())]
@@ -159,7 +159,7 @@ const IPT_STORE_RETRY_MAX: Duration = Duration::from_secs(60);
 pub(crate) enum IptStoreError {
     /// Unable to store introduction points
     #[error("Unable to store introduction points")]
-    Store(#[from] tor_persist::Error),
+    Store(#[source] Box<tor_persist::Error>),
 
     /// Fatal error
     #[error("Fatal error")]
@@ -169,6 +169,12 @@ pub(crate) enum IptStoreError {
 impl From<Bug> for IptStoreError {
     fn from(bug: Bug) -> IptStoreError {
         FatalError::from(bug).into()
+    }
+}
+
+impl From<tor_persist::Error> for IptStoreError {
+    fn from(error: tor_persist::Error) -> Self {
+        Self::Store(Box::new(error))
     }
 }
 

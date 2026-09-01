@@ -495,7 +495,9 @@ impl PublishIptSet {
         storage: IptSetStorageHandle,
         runtime: &impl SleepProvider,
     ) -> Result<PublishIptSet, StartupError> {
-        let on_disk = storage.load().map_err(StartupError::LoadState)?;
+        let on_disk = storage
+            .load()
+            .map_err(|error| StartupError::LoadState(Box::new(error)))?;
         let last_descriptor_expiry_including_slop = on_disk
             .map(|record| {
                 // Throughout, we use exhaustive struct patterns on the data we got from disk,

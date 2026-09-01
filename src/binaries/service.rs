@@ -137,7 +137,7 @@ struct Coordinator {
 #[derive(Debug, Clone)]
 pub struct BuildService {
     coordinator: Arc<Coordinator>,
-    state_path: Arc<PathBuf>,
+    state_path: Arc<Path>,
     recovered: Arc<Option<PersistedBuild>>,
 }
 
@@ -147,7 +147,7 @@ impl BuildService {
         let recovered = recover_interrupted_job(&state_path);
         Self {
             coordinator: Arc::new(Coordinator::default()),
-            state_path: Arc::new(state_path),
+            state_path: state_path.into(),
             recovered: Arc::new(recovered),
         }
     }
@@ -497,7 +497,7 @@ struct Reporter {
     event_tx: mpsc::Sender<BuildEvent>,
     log_tx: mpsc::Sender<String>,
     log_failed: Arc<AtomicBool>,
-    state_path: Arc<PathBuf>,
+    state_path: Arc<Path>,
 }
 
 impl Reporter {
@@ -894,17 +894,17 @@ async fn prepare_source(
         request.kind.repository().to_owned(),
         partial.display().to_string(),
     ];
-    let result = process::run_with_ui_output(
-        request.operation_id,
-        "git",
-        &arguments,
-        Some(job_dir),
+    let result = process::run_with_ui_output(process::RunSpec {
+        operation_id: request.operation_id,
+        program: "git",
+        arguments: &arguments,
+        working_directory: Some(job_dir),
         environment,
-        &reporter.event_tx,
-        &reporter.log_tx,
+        event_tx: &reporter.event_tx,
+        log_tx: &reporter.log_tx,
         cancelled,
-        request.verbose_output,
-    )
+        verbose_output: request.verbose_output,
+    })
     .await;
     if let Err(error) = result {
         let _ = remove_job_entry(&source_root, &partial).await;
@@ -1403,17 +1403,17 @@ async fn build_bitcoin(
             "-DWITH_NATPMP=OFF".to_owned(),
         ]);
     }
-    process::run_with_ui_output(
-        request.operation_id,
-        "cmake",
-        &configure,
-        None,
-        &environment,
-        &reporter.event_tx,
-        &reporter.log_tx,
+    process::run_with_ui_output(process::RunSpec {
+        operation_id: request.operation_id,
+        program: "cmake",
+        arguments: &configure,
+        working_directory: None,
+        environment: &environment,
+        event_tx: &reporter.event_tx,
+        log_tx: &reporter.log_tx,
         cancelled,
-        request.verbose_output,
-    )
+        verbose_output: request.verbose_output,
+    })
     .await
     .context("CMake could not prepare the Bitcoin Core build")?;
     reporter.progress(0.34);
@@ -1425,17 +1425,17 @@ async fn build_bitcoin(
         "--parallel".to_owned(),
         request.cores.clamp(1, 64).to_string(),
     ];
-    process::run_with_ui_output(
-        request.operation_id,
-        "cmake",
-        &build,
-        None,
-        &environment,
-        &reporter.event_tx,
-        &reporter.log_tx,
+    process::run_with_ui_output(process::RunSpec {
+        operation_id: request.operation_id,
+        program: "cmake",
+        arguments: &build,
+        working_directory: None,
+        environment: &environment,
+        event_tx: &reporter.event_tx,
+        log_tx: &reporter.log_tx,
         cancelled,
-        request.verbose_output,
-    )
+        verbose_output: request.verbose_output,
+    })
     .await
     .context("Bitcoin Core compilation failed")?;
     reporter.progress(0.82);
@@ -1474,17 +1474,17 @@ async fn build_electrs(
         request.cores.clamp(1, 64).to_string(),
         "--locked".to_owned(),
     ];
-    process::run_with_ui_output(
-        request.operation_id,
-        "cargo",
-        &arguments,
-        Some(source),
-        &environment,
-        &reporter.event_tx,
-        &reporter.log_tx,
+    process::run_with_ui_output(process::RunSpec {
+        operation_id: request.operation_id,
+        program: "cargo",
+        arguments: &arguments,
+        working_directory: Some(source),
+        environment: &environment,
+        event_tx: &reporter.event_tx,
+        log_tx: &reporter.log_tx,
         cancelled,
-        request.verbose_output,
-    )
+        verbose_output: request.verbose_output,
+    })
     .await
     .context("electrs compilation failed")?;
     reporter.progress(0.82);
