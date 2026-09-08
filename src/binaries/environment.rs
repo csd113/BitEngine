@@ -96,13 +96,12 @@ fn build_environment_from(mut variable: impl FnMut(&str) -> Option<String>) -> B
     environment.insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
 
     if let Some(prefix) = llvm_prefix {
-        let library_path = prefix.join("lib").display().to_string();
-        environment.insert("LIBCLANG_PATH".to_owned(), library_path.clone());
-        if cfg!(target_os = "macos") {
-            environment.insert("DYLD_LIBRARY_PATH".to_owned(), library_path);
-        } else if cfg!(target_os = "linux") {
-            environment.insert("LD_LIBRARY_PATH".to_owned(), library_path);
-        }
+        // Locate libclang for bindgen without overriding the dynamic loader's
+        // search path: rustc must load its own compatible LLVM libraries.
+        environment.insert(
+            "LIBCLANG_PATH".to_owned(),
+            prefix.join("lib").display().to_string(),
+        );
     }
 
     environment
@@ -286,6 +285,8 @@ mod tests {
             ("RUSTFLAGS", "-C linker=/tmp/linker"),
             ("CMAKE_TOOLCHAIN_FILE", "/tmp/toolchain"),
             ("DYLD_INSERT_LIBRARIES", "/tmp/injected.dylib"),
+            ("DYLD_LIBRARY_PATH", "/tmp/injected-libraries"),
+            ("LD_LIBRARY_PATH", "/tmp/injected-libraries"),
             ("PATH", "/tmp/injected-build-tools"),
         ];
         let environment = build_environment_from(|name| {
@@ -308,6 +309,8 @@ mod tests {
             "RUSTFLAGS",
             "CMAKE_TOOLCHAIN_FILE",
             "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "LD_LIBRARY_PATH",
         ] {
             assert!(!environment.contains_key(name), "unexpected {name}");
         }
