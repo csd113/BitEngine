@@ -1,13 +1,13 @@
 # Vendored `tor-hsservice` patch
 
-This directory contains the crates.io `tor-hsservice` 0.45.0 package, checksum
-`3291bbf7641b457a16ef803db4d585334e669fa72fe194a276e4c6fc631f858d`,
+This directory contains the crates.io `tor-hsservice` 0.46.0 package, checksum
+`d61a6b5217c14780f54fa1c8610514b1349c93f657304dec98bd8e3083e1a09f`,
 published from Tor Project Arti commit
-`009354f78d1a61214a878d6f1712a50844e6c215`.
+`a71097fdf7b141b56d1eb3709628ee38d232c9d1`.
 
 BitEngine carries one behavioral correction in `src/ipt_mgr.rs`. Upstream's
 `expire_old_expiry_times` documentation says to delete publication records once
-their expiry has passed, but the 0.45.0 predicate does the inverse: it retains
+their expiry has passed, but the 0.46.0 predicate does the inverse: it retains
 expired records and deletes records that are still valid. That makes a restarted
 onion service forget introduction points which are still listed in live
 descriptors. The local patch retains records only while `expiry > now` and adds

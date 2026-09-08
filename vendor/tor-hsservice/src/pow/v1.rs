@@ -217,19 +217,13 @@ pub enum PowError {
     MissingKey,
     /// Error in the underlying storage layer.
     #[error(transparent)]
-    StorageError(Box<tor_persist::Error>),
+    StorageError(#[from] tor_persist::Error),
     /// Error from the ReplayLog.
     #[error(transparent)]
     OpenReplayLog(#[from] OpenReplayLogError),
     /// NetDirProvider has shut down
     #[error(transparent)]
     NetdirProviderShutdown(#[from] NetdirProviderShutdown),
-}
-
-impl From<tor_persist::Error> for PowError {
-    fn from(error: tor_persist::Error) -> Self {
-        Self::StorageError(Box::new(error))
-    }
 }
 
 impl<R: Runtime, Q: MockableRendRequest + Send + 'static> PowManagerGeneric<R, Q> {
@@ -247,7 +241,7 @@ impl<R: Runtime, Q: MockableRendRequest + Send + 'static> PowManagerGeneric<R, Q
     ) -> Result<NewPowManager<R>, StartupError> {
         let on_disk_state = storage_handle
             .load()
-            .map_err(|error| StartupError::LoadState(Box::new(error)))?
+            .map_err(StartupError::LoadState)?
             .unwrap_or(PowManagerStateRecord::default());
 
         let seeds: HashMap<TimePeriod, SeedsForTimePeriod> =
@@ -308,7 +302,7 @@ impl<R: Runtime, Q: MockableRendRequest + Send + 'static> PowManagerGeneric<R, Q
             keymgr,
             publisher_update_tx,
             verifiers,
-            suggested_effort,
+            suggested_effort: suggested_effort.clone(),
             runtime: runtime.clone(),
             storage_handle,
             rend_request_rx: rend_req_rx.clone(),
@@ -940,7 +934,7 @@ impl<R: Runtime, Q: MockableRendRequest + Send + 'static> RendRequestReceiver<R,
     ) {
         let receiver = self.clone();
         let runtime_clone = runtime.clone();
-        let _ = runtime.spawn_blocking(move || {
+        let _ = runtime.clone().spawn_blocking(move || {
             if let Err(err) =
                 receiver
                     .clone()
@@ -1020,8 +1014,7 @@ impl<R: Runtime, Q: MockableRendRequest + Send + 'static> RendRequestReceiver<R,
                     ));
                 } else {
                     let decay = num_enqueued_gte_suggested_f64 / theoretical_num_dequeued;
-                    let adjusted_decay = (1.0 - decay)
-                        .mul_add(decay_adjustment_fraction, decay);
+                    let adjusted_decay = decay + ((1.0 - decay) * decay_adjustment_fraction);
                     let new_suggested_effort =
                         u32::from_f64(f64::from(suggested_effort_inner) * adjusted_decay)
                             .expect("Conversion error");
@@ -1103,7 +1096,7 @@ impl<R: Runtime, Q: MockableRendRequest + Send + 'static> RendRequestReceiver<R,
                 let histogram_rendrequest_effort = metrics::histogram!(
                     description: "Histogram of effort values seen for incoming PoW requests.",
                     "arti_hss_pow_rendrequest_effort_hist",
-                    "nickname" => nickname
+                    "nickname" => nickname.clone()
                 );
             }
         }
@@ -1225,7 +1218,7 @@ impl<R: Runtime, Q: MockableRendRequest + Send + 'static> RendRequestReceiver<R,
 
         let nickname = self.0.lock().expect("Lock poisoned").nickname.to_string();
         #[cfg(feature = "metrics")]
-        let counter_rendrequest_expired = metrics::counter!("arti_hss_pow_rendrequest_expired_total", "nickname" => nickname);
+        let counter_rendrequest_expired = metrics::counter!("arti_hss_pow_rendrequest_expired_total", "nickname" => nickname.clone());
 
         loop {
             let inner = self.0.lock().expect("Lock poisoned");

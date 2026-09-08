@@ -71,11 +71,11 @@ pub(crate) enum IptEstablisherError {
 
     /// We encountered an error while building a circuit to an intro point.
     #[error("Unable to build circuit to introduction point")]
-    BuildCircuit(#[source] Box<tor_circmgr::Error>),
+    BuildCircuit(#[source] tor_circmgr::Error),
 
     /// We encountered an error while querying the circuit state.
     #[error("Unable to query circuit state")]
-    CircuitState(#[source] Box<tor_circmgr::Error>),
+    CircuitState(#[source] tor_circmgr::Error),
 
     /// We encountered an error while building and signing our establish_intro
     /// message.
@@ -89,7 +89,7 @@ pub(crate) enum IptEstablisherError {
     /// We encountered an error while sending our establish_intro
     /// message.
     #[error("Unable to send an ESTABLISH_INTRO message")]
-    SendEstablishIntro(#[source] Box<tor_circmgr::Error>),
+    SendEstablishIntro(#[source] tor_circmgr::Error),
 
     /// We did not receive an INTRO_ESTABLISHED message like we wanted; instead, the
     /// circuit was closed.
@@ -731,7 +731,7 @@ impl<R: Runtime> Reactor<R> {
                 .pool
                 .get_or_launch_svc_intro(netdir.as_ref(), circ_target)
                 .await
-                .map_err(|error| IptEstablisherError::BuildCircuit(Box::new(error)))?;
+                .map_err(IptEstablisherError::BuildCircuit)?;
             // note that netdir is dropped here, to avoid holding on to it any
             // longer than necessary.
             (protovers, tunnel, ipt_details)
@@ -751,8 +751,8 @@ impl<R: Runtime> Reactor<R> {
             let circuit_binding_key = tunnel
                 .binding_key(TargetHop::LastHop)
                 .await
-                .map_err(|error| IptEstablisherError::CircuitState(Box::new(error)))?
-                .ok_or_else(|| internal!("No binding key for introduction point!?"))?;
+                .map_err(IptEstablisherError::CircuitState)?
+                .ok_or(internal!("No binding key for introduction point!?"))?;
             let body: Vec<u8> = details
                 .sign_and_encode((*self.k_sid).as_ref(), circuit_binding_key.hs_mac())
                 .map_err(IptEstablisherError::CreateEstablishIntro)?;
@@ -796,7 +796,7 @@ impl<R: Runtime> Reactor<R> {
         let _conversation = tunnel
             .start_conversation(Some(establish_intro), handler, TargetHop::LastHop)
             .await
-            .map_err(|error| IptEstablisherError::SendEstablishIntro(Box::new(error)))?;
+            .map_err(IptEstablisherError::SendEstablishIntro)?;
         // At this point, we have `await`ed for the Conversation to exist, so we know
         // that the message was sent.  We have to wait for any actual `established`
         // message, though.

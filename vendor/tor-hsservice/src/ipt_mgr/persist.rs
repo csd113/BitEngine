@@ -97,9 +97,7 @@ pub(super) fn load<R: Runtime, M: Mockable<R>>(
     mockable: &mut M,
     publish_set: &PublishIptSet,
 ) -> Result<Vec<IptRelay>, StartupError> {
-    let on_disk = storage
-        .load()
-        .map_err(|error| StartupError::LoadState(Box::new(error)))?;
+    let on_disk = storage.load().map_err(StartupError::LoadState)?;
 
     let Some(on_disk) = on_disk else {
         return Ok(vec![]);

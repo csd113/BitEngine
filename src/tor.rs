@@ -482,7 +482,7 @@ trait AttemptFactory: Clone + Send + Sync + 'static {
 
 /// Production attempts share one Arti client for the supervisor's lifetime.
 ///
-/// Arti 0.45 does not expose a stable hard-shutdown operation for `TorClient`;
+/// Arti 0.46 does not expose a stable hard-shutdown operation for `TorClient`;
 /// dropping its public handle can leave spawned manager tasks holding storage
 /// locks. Keeping the client here and placing it in soft dormancy when the
 /// onion service stops makes repeated toggles deterministic and prevents a

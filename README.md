@@ -396,7 +396,7 @@ The Iced update loop is the only writer to UI state. The background threads only
 |---|---|---|
 | `iced` | 0.14 | GUI framework (native rendering, Elm/MVU) |
 | `tokio` | 1 | Async runtime (driven by iced's tokio feature) |
-| `arti-client` / `tor-hsservice` / `tor-hsrproxy` | 0.45 | Embedded Tor client and fixed v3 onion service |
+| `arti-client` / `tor-hsservice` | 0.46 | Embedded Tor client and fixed v3 onion service |
 | `fs-mistrust` | 0.15 | Private Arti storage permission validation |
 | `reqwest` | 0.13 | HTTP client for Bitcoin RPC (rustls, no OpenSSL) |
 | `serde` / `serde_json` | 1 | Config and RPC serialisation |

@@ -41,10 +41,10 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 
 # Embedded Tor client and v3 onion service with a BitEngine-owned fixed-port
-# proxy. Arti 0.45's MSRV is Rust 1.91, matching BitEngine's declared minimum.
+# proxy. Arti 0.46's MSRV is Rust 1.91, matching BitEngine's declared minimum.
+# Congestion control is always enabled as of Arti 0.46.
 # Use rustls so no system Tor daemon or native TLS installation is required.
-arti-client = { version = "0.45", default-features = false, features = [
-    "flowctl-cc",
+arti-client = { version = "0.46", default-features = false, features = [
     "onion-service-service",
     "rustls",
     "static-sqlite",
@@ -55,13 +55,12 @@ fs-mistrust = "0.15"
 futures = "0.3"
 futures-copy = "0.4"
 safelog = "0.9"
-tor-cell = "0.45"
-tor-hsservice = "0.45"
-tor-proto = { version = "0.45", default-features = false, features = [
-    "flowctl-cc",
+tor-cell = "0.46"
+tor-hsservice = "0.46"
+tor-proto = { version = "0.46", default-features = false, features = [
     "hs-service",
 ] }
-tor-rtcompat = { version = "0.45", default-features = false, features = [
+tor-rtcompat = { version = "0.46", default-features = false, features = [
     "rustls",
     "tokio",
 ] }
@@ -95,10 +94,10 @@ iced_runtime = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
-tor-keymgr = "0.45"
+tor-keymgr = "0.46"
 
 [patch.crates-io]
-# Arti 0.45.0 accidentally discards still-valid onion-service introduction-point
+# Arti 0.46.0 accidentally discards still-valid onion-service introduction-point
 # publication records and retains expired ones. Keep this exact release vendored
 # with the predicate corrected until the upstream crate publishes a fix.
 tor-hsservice = { path = "vendor/tor-hsservice" }

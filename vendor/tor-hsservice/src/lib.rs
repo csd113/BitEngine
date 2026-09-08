@@ -310,23 +310,23 @@ impl OnionService {
 
         let state_handle = state_dir
             .acquire_instance(&config.nickname)
-            .map_err(|error| StartupError::StateDirectoryInaccessible(Box::new(error)))?;
+            .map_err(StartupError::StateDirectoryInaccessible)?;
 
         // We pass the "cooked" handle, with the storage key embedded, to ipt_set,
         // since the ipt_set code doesn't otherwise have access to the HS nickname.
         let iptpub_storage_handle = state_handle
             .storage_handle("iptpub")
-            .map_err(|error| StartupError::StateDirectoryInaccessible(Box::new(error)))?;
+            .map_err(StartupError::StateDirectoryInaccessible)?;
 
         let status_tx = StatusSender::new(OnionServiceStatus::new_shutdown());
         let (config_tx, config_rx) = postage::watch::channel_with(Arc::new(config));
 
         let pow_manager_storage_handle = state_handle
             .storage_handle("pow_manager")
-            .map_err(|error| StartupError::StateDirectoryInaccessible(Box::new(error)))?;
+            .map_err(StartupError::StateDirectoryInaccessible)?;
         let pow_nonce_dir = state_handle
             .raw_subdir("pow_nonces")
-            .map_err(|error| StartupError::StateDirectoryInaccessible(Box::new(error)))?;
+            .map_err(StartupError::StateDirectoryInaccessible)?;
         let NewPowManager {
             pow_manager,
             rend_req_tx,
@@ -354,7 +354,7 @@ impl OnionService {
             nickname.clone(),
             config_rx.clone(),
             rend_req_tx,
-            shutdown_rx,
+            shutdown_rx.clone(),
             &state_handle,
             crate::ipt_mgr::Real {
                 circ_pool: circ_pool.clone(),

@@ -1348,7 +1348,7 @@ impl<R: Runtime, M: Mockable> Reactor<R, M> {
             Ok(authorized_clients) => authorized_clients,
             Err(e) => {
                 error_report!(e, "aborting upload");
-                self.imm.status_tx.send_broken(e);
+                self.imm.status_tx.send_broken(e.clone());
 
                 // Returning an error would shut down the reactor, so we have to return Ok here.
                 return Ok(());
