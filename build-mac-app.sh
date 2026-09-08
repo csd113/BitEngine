@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="BitEngine"
-BUNDLE_ID="com.yourname.bitengine"
+BUNDLE_ID="com.csd113.BitEngine"
 VERSION="1.0.0"
 TARGET="aarch64-apple-darwin"
 
@@ -11,6 +11,8 @@ BIN_NAME="bitengine"
 
 ICON_FILE="app-icon.icns"
 APP_DIR="${APP_NAME}.app"
+INFO_PLIST="${APP_DIR}/Contents/Info.plist"
+REMOVABLE_VOLUMES_USAGE_DESCRIPTION="BitEngine needs access to removable volumes containing your configured node binaries and data."
 
 cargo build --release --target "${TARGET}"
 
@@ -22,7 +24,7 @@ chmod +x "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
 cp "${ICON_FILE}" "${APP_DIR}/Contents/Resources/${ICON_FILE}"
 
-cat > "${APP_DIR}/Contents/Info.plist" <<EOF
+cat > "${INFO_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -53,9 +55,22 @@ cat > "${APP_DIR}/Contents/Info.plist" <<EOF
 
     <key>LSMinimumSystemVersion</key>
     <string>10.13</string>
+
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>${REMOVABLE_VOLUMES_USAGE_DESCRIPTION}</string>
 </dict>
 </plist>
 EOF
+
+plutil -lint "${INFO_PLIST}" >/dev/null
+if [[ "$(plutil -extract CFBundleIdentifier raw -o - "${INFO_PLIST}")" != "${BUNDLE_ID}" ]]; then
+    echo "Generated Info.plist has an unexpected bundle identifier" >&2
+    exit 1
+fi
+if [[ "$(plutil -extract NSRemovableVolumesUsageDescription raw -o - "${INFO_PLIST}")" != "${REMOVABLE_VOLUMES_USAGE_DESCRIPTION}" ]]; then
+    echo "Generated Info.plist is missing the removable-volume usage description" >&2
+    exit 1
+fi
 
 codesign --deep --force --verify --sign - "${APP_DIR}"
 

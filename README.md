@@ -10,7 +10,7 @@ Built with Rust · Iced · Native desktop rendering
 
 Current release: `1.0.0`
 
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%2Farm64-blue)](#supported-platforms)
 [![Architecture](https://img.shields.io/badge/macos-Apple%20Silicon%20only-lightgrey)](#supported-platforms)
@@ -27,9 +27,11 @@ BitEngine is a desktop application that lets you launch, monitor, and shut down 
 - Dual side-by-side terminal panels with live log streaming
 - Real-time block height display via JSON-RPC
 - Green/grey status indicators: **Running · Synced · Ready** for each node
+- Readiness-gated local or Tor wallet connection details with QR and copy controls
 - One-click shutdown (Bitcoin RPC stop first, then platform fallback)
 - Native Bitcoin Core and electrs source builds with version checks, progress, logs, and transactional installation
 - Fully configurable data paths, persisted across sessions
+- Persistent System / Light / Dark appearance
 - Single-binary distribution — no runtime, no WebView, no Electron
 
 Recent release work in `1.0.0`:
@@ -98,13 +100,20 @@ Three per node, updated automatically from the owned process and current lifecyc
 
 Readiness is deliberately separate from synchronization. In particular, Bitcoin can be ready for Electrs to connect while both services are still catching up. A listening TCP socket, metrics endpoint, or live process alone never marks either service ready.
 
+### Connect to your node
+The dashboard keeps a **Connect to your node** card visible throughout startup and synchronization. It explains the current blocker, includes reliable Bitcoin/electrs progress when available, and shows a usable endpoint only after Bitcoin Core is synchronized and the managed electrs generation passes its index, metrics, and Electrum-protocol checks.
+
+The Local / Tor selector presents one canonical Electrum TCP endpoint at a time. The address printed beside the QR is the same value encoded by the QR and copied to the clipboard. Loopback-only mode remains useful for a wallet on the same computer, but BitEngine deliberately suppresses a phone-facing `127.0.0.1` QR. **Local network access** must be enabled explicitly; electrs then binds one validated private interface address rather than a wildcard address, and a restart is required for the changed policy to take effect.
+
+Optional remote access uses an Arti v3 onion service embedded directly in BitEngine—no system Tor or Tor Browser is required. It exposes only Electrum TCP port `50001` and never proxies Bitcoin Core RPC, the RPC cookie, metrics, or arbitrary local services. The reverse proxy actively rejects streams until the exact managed electrs listener is ready. Its identity persists across ordinary app, node, and network restarts; disabling Tor stops publication while retaining that identity.
+
 ### Live block height
 Polls `getblockchaininfo` via JSON-RPC every 5 seconds and displays the current block height with comma formatting (e.g. `895,234`).
 
 ### Binaries and updates
 Click **Update Binaries** to open BitEngine's native binaries page. Installed versions are detected directly from `bitcoind --version` and `electrs --version` while stable upstream releases load separately. Each row tells you whether the binary is missing, current, or has an update available.
 
-Builds run in the background with clear download, source-authentication, preparation, compilation, binary-verification, installation, and completion stages. Detailed Git/CMake/Cargo output is hidden behind **Build Details** and each durable build log is capped at 64 MiB. Advanced controls allow a specific stable release to be selected without cluttering the normal update flow.
+Builds run in the background with clear download, source-authentication, preparation, compilation, binary-verification, installation, and completion stages. Detailed Git/CMake/Cargo output is hidden behind **Build Details** and each durable build log is capped at 64 MiB. The collapsed **Advanced** section contains release selection, four persistent build settings, and dependency status without cluttering the normal update flow.
 
 ### Graceful shutdown
 - **Electrs only**: graceful termination on Unix where available, then kill fallback
@@ -131,7 +140,7 @@ BitEngine derives default paths from the directory containing the executable. On
 │   ├── bitcoin-util
 │   ├── bitcoin-wallet
 │   └── electrs
-├── BitEngineBuilds/           ← private per-job sources/workspaces and bounded retained logs
+├── BitEngineBuilds/           ← private build cache, per-job workspaces, and bounded logs
 ├── BitcoinChain/
 │   └── bitcoin.conf         ← auto-created with sensible defaults if missing
 └── ElectrsDB/
@@ -158,7 +167,7 @@ rustup target add x86_64-unknown-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 ```
 
-> **Requires:** Rust 1.88+. macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
+> **Requires:** Rust 1.91 or newer (newer stable toolchains are supported). macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
 
 ### Development build
 
@@ -172,9 +181,10 @@ The GitHub Actions CI workflow runs:
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo test --workspace --all-features`
+- locked dependency resolution on the minimum supported Rust 1.91 toolchain
 - release build checks for macOS Apple Silicon, Linux x86_64, and Linux ARM64
 
-### Release build (optimised, ~5 MB)
+### Release build (optimised)
 
 ```bash
 cargo build --release --target aarch64-apple-darwin
@@ -191,7 +201,7 @@ cargo build --release --target aarch64-unknown-linux-gnu
 open BitEngine.app
 ```
 
-The script compiles, assembles the `.app` directory structure, writes `Info.plist`, copies the binary, and applies an ad-hoc codesign so Gatekeeper doesn't block local execution.
+The script compiles, assembles the `.app` directory structure, writes `Info.plist`, copies the binary, and applies an ad-hoc codesign so Gatekeeper doesn't block local execution. When configured paths are on removable storage, macOS may ask for permission the first time BitEngine accesses that volume.
 
 Tagged `v*` releases are built automatically in GitHub Actions. The macOS artifact is Apple Silicon only; no macOS Intel or universal artifact is produced.
 
@@ -236,11 +246,23 @@ Example:
 {
   "binaries_path":     "/path/to/BitEngine/Binaries",
   "bitcoin_data_path": "/path/to/BitEngine/BitcoinChain",
-  "electrs_data_path": "/path/to/BitEngine/ElectrsDB"
+  "electrs_data_path": "/path/to/BitEngine/ElectrsDB",
+  "theme_preference": "System",
+  "local_network_access": false,
+  "tor_enabled": false,
+  "tor_auto_start": false,
+  "build_settings": {
+    "performance": "Balanced",
+    "keep_source": false,
+    "clean_build": false,
+    "verbose_output": false
+  }
 }
 ```
 
 If no config exists on first launch, defaults are derived from the SSD root.
+
+Arti state, cache, and the persistent onion-service identity are application-owned under the platform config directory's `tor/` subdirectory. BitEngine validates this storage and fails closed on unsafe paths, symlinks, file types, ownership, or permissions. Onion identity material is not stored in `config.json`.
 
 ### `bitcoin.conf`
 
@@ -269,7 +291,7 @@ Managed Electrs is rejected with a setting-specific explanation when configurati
 
 1. Detect installed versions and fetch stable upstream releases
 2. Validate build tools and available disk space using the filesystem's native free-space information
-3. Clone the selected release into a fresh private per-job source directory
+3. Re-authenticate retained source when available, or clone the selected release into a fresh private per-job source directory
 4. Check the Git origin, selected tag/commit, signed tag, and pristine working tree
 5. Compile Bitcoin Core with the node-only CMake flags or electrs with Cargo `--locked`
 6. Run every discovered managed output and confirm that it reports the requested version
@@ -280,7 +302,7 @@ Bitcoin Core tags are accepted only when Git verifies them through GnuPG and the
 
 In-process coordination and cross-process workspace and destination locks prevent overlapping mutation. Builds can be cancelled before installation; BitEngine terminates the complete build process group and escalates to a kill if it does not exit. Installation itself is a short, non-cancellable transaction. A durable `Prepared`/`Committed` journal lets startup recovery either restore the entire old managed set or validate and finish the new set before the destination can be used again. Outputs absent from the new Bitcoin release are transactionally removed from the managed `bitcoind`, `bitcoin-cli`, `bitcoin`, `bitcoin-tx`, `bitcoin-util`, and `bitcoin-wallet` family rather than leaving mixed-version tools behind.
 
-Job stage, result, and log location are persisted to `build-job.json` in BitEngine's config directory. Each log is capped at 64 MiB, only the eight newest job directories/logs are retained, and private source and work trees are removed after the job. Existing binaries are not touched until source, compilation, and every-artifact verification have succeeded.
+Job stage, result, and log location are persisted to `build-job.json` in BitEngine's config directory. Each log is capped at 64 MiB and only the eight newest job directories/logs are retained. Binaries → Advanced offers Balanced/Low/Fastest performance presets, authenticated source retention, clean builds, verbose UI output, and dependency status/install actions. Retained source is re-authenticated on every reuse; disposable source and build trees are removed only after a successful committed installation. Existing binaries are not touched until source, compilation, and every-artifact verification have succeeded.
 
 See [Native binary build architecture](docs/binaries.md) for the module map, safety model, and former BitForge boundary.
 
@@ -314,6 +336,14 @@ src/
 │                      · Two OS reader threads per process → Arc<Mutex<VecDeque>>
 │                      · Platform termination request → 10 s grace period → kill
 │
+├── connection.rs      Readiness gating and validated Electrum endpoints
+│                      · Exact loopback/private-interface listener policy
+│                      · Canonical local/onion QR and clipboard payloads
+│
+├── tor.rs             Embedded Arti onion-service supervisor
+│                      · Private persistent state and stable v3 identity
+│                      · Fixed-port, readiness-gated reverse proxy and recovery
+│
 ├── binaries/          Native binary build/update service
 │   ├── mod.rs         Versions, release discovery, installed detection, shared types
 │   ├── environment.rs PATH, pkg-config, Cargo, and LLVM environment setup
@@ -346,6 +376,11 @@ Native build task (at most one)
    │    └─ stderr reader task ─┴→ progress UI + durable build log
    └─ verified staging → transactional install or rollback
 
+Embedded Tor supervisor (optional)
+   ├─ Arti bootstrap and onion descriptor publication
+   ├─ fixed electrs reverse-proxy readiness updates
+   └─ bounded retry/recovery and graceful asynchronous shutdown
+
 Per-process background threads (2 per running node)
    ├─ stdout reader  ─┐
    └─ stderr reader  ─┴→ push lines into Arc<Mutex<VecDeque<String>>>
@@ -361,6 +396,8 @@ The Iced update loop is the only writer to UI state. The background threads only
 |---|---|---|
 | `iced` | 0.14 | GUI framework (native rendering, Elm/MVU) |
 | `tokio` | 1 | Async runtime (driven by iced's tokio feature) |
+| `arti-client` / `tor-hsservice` | 0.46 | Embedded Tor client and fixed v3 onion service |
+| `fs-mistrust` | 0.15 | Private Arti storage permission validation |
 | `reqwest` | 0.13 | HTTP client for Bitcoin RPC (rustls, no OpenSSL) |
 | `serde` / `serde_json` | 1 | Config and RPC serialisation |
 | `anyhow` | 1 | Ergonomic error propagation |
@@ -378,7 +415,7 @@ The Iced update loop is the only writer to UI state. The background threads only
 |---|---|---|
 | Language | Interpreted | Native compiled |
 | Startup time | ~1–2 s | <100 ms |
-| Bundle size | 40+ MB (Python + tkinter) | ~5 MB |
+| Distribution | Python runtime plus tkinter | Self-contained native executable |
 | Threading | GIL limits true parallelism | Real OS threads |
 | Terminal memory | Unbounded growth | Hard cap: 5 000 lines per panel |
 | UI blocking | `messagebox` blocks event loop | Overlay widget, never blocks |

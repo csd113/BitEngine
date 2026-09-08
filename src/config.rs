@@ -14,18 +14,90 @@ use anyhow::{Context as _, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::binaries::BinaryKind;
+
 const LEGACY_APP_NAME: &str = "BitcoinNodeManager";
 const CONFIG_FILENAME: &str = "config.json";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 static TEMPORARY_FILE_ID: AtomicU64 = AtomicU64::new(0);
 pub const DEFAULT_ELECTRS_METRICS_ADDR: &str = "127.0.0.1:4224";
-pub const DEFAULT_ELECTRUM_ADDR: &str = "127.0.0.1:50001";
+
+/// User-facing parallelism presets for native source builds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuildPerformance {
+    Low,
+    #[default]
+    Balanced,
+    Fastest,
+}
+
+impl BuildPerformance {
+    /// Map a friendly preset to the worker count accepted by `CMake` or Cargo.
+    #[must_use]
+    pub fn jobs(self, kind: BinaryKind, available: usize) -> usize {
+        let available = available.clamp(1, 64);
+        match self {
+            Self::Low => (available / 4).clamp(1, 4),
+            Self::Balanced => match kind {
+                BinaryKind::BitcoinCore => available.saturating_sub(1).clamp(1, 8),
+                BinaryKind::Electrs => available.saturating_sub(1).clamp(1, 12),
+            },
+            Self::Fastest => available,
+        }
+    }
+}
+
+impl std::fmt::Display for BuildPerformance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Low => "Low",
+            Self::Balanced => "Balanced",
+            Self::Fastest => "Fastest",
+        })
+    }
+}
+
+/// Persistent settings exposed by Binaries → Advanced.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildSettings {
+    #[serde(default)]
+    pub performance: BuildPerformance,
+    #[serde(default)]
+    pub keep_source: bool,
+    #[serde(default)]
+    pub clean_build: bool,
+    #[serde(default)]
+    pub verbose_output: bool,
+}
+
+/// User-selectable application color scheme.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThemePreference {
+    /// Follow the operating system appearance.
+    #[default]
+    System,
+    /// Always use the light appearance.
+    Light,
+    /// Always use the dark appearance.
+    Dark,
+}
+
+impl ThemePreference {
+    /// Values displayed by the compact theme selector.
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+}
+
+impl std::fmt::Display for ThemePreference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        })
+    }
+}
 
 /// All persisted settings for the node manager.
-#[expect(
-    clippy::struct_field_names,
-    reason = "persisted fields mirror the stored config keys"
-)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Directory containing `bitcoind`, `bitcoin-cli`, `electrs`, etc.
@@ -34,6 +106,21 @@ pub struct Config {
     pub bitcoin_data_path: PathBuf,
     /// Electrs database directory.
     pub electrs_data_path: PathBuf,
+    /// Advanced native build settings.
+    #[serde(default)]
+    pub build_settings: BuildSettings,
+    /// Application appearance; defaults to the operating system preference.
+    #[serde(default)]
+    pub theme_preference: ThemePreference,
+    /// Allow electrs to accept deliberately configured local-network clients.
+    #[serde(default)]
+    pub local_network_access: bool,
+    /// Publish the electrs endpoint through `BitEngine`'s embedded Tor service.
+    #[serde(default)]
+    pub tor_enabled: bool,
+    /// Start an enabled Tor service when `BitEngine` launches.
+    #[serde(default)]
+    pub tor_auto_start: bool,
 }
 
 impl Config {
@@ -77,6 +164,19 @@ impl Config {
     /// Persist the current config to disk.
     pub fn save(&self) -> Result<()> {
         self.validate_paths()?;
+        self.save_after_path_validation()
+    }
+
+    /// Persist preference-only changes without repeating live filesystem path
+    /// probes on the UI thread. The path strings still receive the same lexical
+    /// validation, while startup/path changes perform full live validation in a
+    /// background recovery worker before any configured destination is used.
+    pub(crate) fn save_preferences(&self) -> Result<()> {
+        self.validate_paths_lexically()?;
+        self.save_after_path_validation()
+    }
+
+    fn save_after_path_validation(&self) -> Result<()> {
         let path = Self::config_file_path();
         if let Some(parent) = path.parent() {
             prepare_config_directory(parent)?;
@@ -88,22 +188,17 @@ impl Config {
     /// Validate persisted paths before they can drive directory creation,
     /// source cleanup, or binary installation.
     pub fn validate_paths(&self) -> Result<()> {
+        self.validate_paths_lexically()?;
         for (label, path) in [
             ("binaries", &self.binaries_path),
             ("Bitcoin data", &self.bitcoin_data_path),
             ("electrs data", &self.electrs_data_path),
         ] {
-            validate_directory_path(label, path)?;
+            validate_directory_path_live(label, path)?;
         }
 
         let workspace = crate::binaries::workspace_for(&self.binaries_path);
-        validate_directory_path("build workspace", &workspace)?;
-        validate_disjoint_paths(&[
-            ("binaries", self.binaries_path.as_path()),
-            ("build workspace", workspace.as_path()),
-            ("Bitcoin data", self.bitcoin_data_path.as_path()),
-            ("electrs data", self.electrs_data_path.as_path()),
-        ])?;
+        validate_directory_path_live("build workspace", &workspace)?;
 
         let resolved_binaries = resolve_for_comparison(&self.binaries_path)?;
         let resolved_bitcoin_data = resolve_for_comparison(&self.bitcoin_data_path)?;
@@ -114,6 +209,27 @@ impl Config {
             ("build workspace", resolved_workspace.as_path()),
             ("Bitcoin data", resolved_bitcoin_data.as_path()),
             ("electrs data", resolved_electrs_data.as_path()),
+        ])
+    }
+
+    /// Validate path syntax and lexical separation without touching configured
+    /// storage. This is safe during pre-window config parsing.
+    pub(crate) fn validate_paths_lexically(&self) -> Result<()> {
+        for (label, path) in [
+            ("binaries", &self.binaries_path),
+            ("Bitcoin data", &self.bitcoin_data_path),
+            ("electrs data", &self.electrs_data_path),
+        ] {
+            validate_directory_path_lexically(label, path)?;
+        }
+
+        let workspace = crate::binaries::workspace_for(&self.binaries_path);
+        validate_directory_path_lexically("build workspace", &workspace)?;
+        validate_disjoint_paths(&[
+            ("binaries", self.binaries_path.as_path()),
+            ("build workspace", workspace.as_path()),
+            ("Bitcoin data", self.bitcoin_data_path.as_path()),
+            ("electrs data", self.electrs_data_path.as_path()),
         ])
     }
 
@@ -141,10 +257,6 @@ impl Config {
         format!("http://{DEFAULT_ELECTRS_METRICS_ADDR}/metrics")
     }
 
-    pub const fn electrum_addr() -> &'static str {
-        DEFAULT_ELECTRUM_ADDR
-    }
-
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     pub(crate) fn defaults(ssd_root: &Path) -> Self {
@@ -152,6 +264,11 @@ impl Config {
             binaries_path: ssd_root.join("Binaries"),
             bitcoin_data_path: ssd_root.join("BitcoinChain"),
             electrs_data_path: ssd_root.join("ElectrsDB"),
+            build_settings: BuildSettings::default(),
+            theme_preference: ThemePreference::default(),
+            local_network_access: false,
+            tor_enabled: false,
+            tor_auto_start: false,
         }
     }
 
@@ -189,12 +306,12 @@ impl Config {
             anyhow::bail!("config is unexpectedly large: {}", path.display());
         }
         let config = serde_json::from_slice::<Self>(&bytes).context("parse config JSON")?;
-        config.validate_paths()?;
+        config.validate_paths_lexically()?;
         Ok(config)
     }
 }
 
-fn validate_directory_path(label: &str, path: &Path) -> Result<()> {
+fn validate_directory_path_lexically(label: &str, path: &Path) -> Result<()> {
     if !path.is_absolute() {
         anyhow::bail!("{label} path must be absolute: {}", path.display());
     }
@@ -216,6 +333,10 @@ fn validate_directory_path(label: &str, path: &Path) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn validate_directory_path_live(label: &str, path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             anyhow::bail!(
@@ -391,11 +512,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn build_settings_default_and_parallelism_mapping_are_stable() {
+        let defaults = BuildSettings::default();
+        assert_eq!(defaults.performance, BuildPerformance::Balanced);
+        assert!(!defaults.keep_source);
+        assert!(!defaults.clean_build);
+        assert!(!defaults.verbose_output);
+
+        assert_eq!(BuildPerformance::Low.jobs(BinaryKind::BitcoinCore, 16), 4);
+        assert_eq!(BuildPerformance::Low.jobs(BinaryKind::Electrs, 8), 2);
+        assert_eq!(
+            BuildPerformance::Balanced.jobs(BinaryKind::BitcoinCore, 16),
+            8
+        );
+        assert_eq!(BuildPerformance::Balanced.jobs(BinaryKind::Electrs, 16), 12);
+        assert_eq!(
+            BuildPerformance::Fastest.jobs(BinaryKind::BitcoinCore, 16),
+            16
+        );
+        assert_eq!(BuildPerformance::Fastest.jobs(BinaryKind::Electrs, 16), 16);
+    }
+
+    #[test]
+    fn restore_build_defaults_resets_all_four_settings() {
+        let mut settings = BuildSettings {
+            performance: BuildPerformance::Fastest,
+            keep_source: true,
+            clean_build: true,
+            verbose_output: true,
+        };
+        assert_ne!(settings, BuildSettings::default());
+
+        settings = BuildSettings::default();
+
+        assert_eq!(settings.performance, BuildPerformance::Balanced);
+        assert!(!settings.keep_source);
+        assert!(!settings.clean_build);
+        assert!(!settings.verbose_output);
+    }
+
+    #[test]
+    fn old_config_defaults_new_settings_and_preferences_survive_reload() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("config.json");
+        let root = temporary.path().join("storage");
+        let old_json = serde_json::json!({
+            "binaries_path": root.join("Binaries"),
+            "bitcoin_data_path": root.join("BitcoinChain"),
+            "electrs_data_path": root.join("ElectrsDB"),
+        });
+        write_atomically(&path, &serde_json::to_vec_pretty(&old_json)?)?;
+        let mut config = Config::load_from_file(&path)?;
+        assert_eq!(config.build_settings, BuildSettings::default());
+        assert_eq!(config.theme_preference, ThemePreference::System);
+        assert!(!config.local_network_access);
+        assert!(!config.tor_enabled);
+        assert!(!config.tor_auto_start);
+
+        config.build_settings = BuildSettings {
+            performance: BuildPerformance::Fastest,
+            keep_source: true,
+            clean_build: true,
+            verbose_output: true,
+        };
+        config.theme_preference = ThemePreference::Dark;
+        config.local_network_access = true;
+        config.tor_enabled = true;
+        config.tor_auto_start = true;
+        write_atomically(&path, &serde_json::to_vec_pretty(&config)?)?;
+        let reloaded = Config::load_from_file(&path)?;
+        assert_eq!(reloaded.build_settings, config.build_settings);
+        assert_eq!(reloaded.theme_preference, ThemePreference::Dark);
+        assert!(reloaded.local_network_access);
+        assert!(reloaded.tor_enabled);
+        assert!(reloaded.tor_auto_start);
+
+        let mut restored = reloaded;
+        restored.build_settings = BuildSettings::default();
+        assert_eq!(
+            restored.build_settings.performance,
+            BuildPerformance::Balanced
+        );
+        assert!(!restored.build_settings.keep_source);
+        assert!(!restored.build_settings.clean_build);
+        assert!(!restored.build_settings.verbose_output);
+        Ok(())
+    }
+
+    #[test]
     fn build_and_data_paths_must_be_absolute_and_disjoint() {
         let valid = Config {
             binaries_path: PathBuf::from("/tmp/bitengine-root/Binaries"),
             bitcoin_data_path: PathBuf::from("/tmp/bitengine-root/BitcoinChain"),
             electrs_data_path: PathBuf::from("/tmp/bitengine-root/ElectrsDB"),
+            build_settings: BuildSettings::default(),
+            theme_preference: ThemePreference::default(),
+            local_network_access: false,
+            tor_enabled: false,
+            tor_auto_start: false,
         };
         valid
             .validate_paths()
@@ -416,6 +630,11 @@ mod tests {
             binaries_path: PathBuf::from("/tmp/bitengine-root/BitEngineBuilds"),
             bitcoin_data_path: PathBuf::from("/tmp/bitengine-root/BitcoinChain"),
             electrs_data_path: PathBuf::from("/tmp/bitengine-root/ElectrsDB"),
+            build_settings: BuildSettings::default(),
+            theme_preference: ThemePreference::default(),
+            local_network_access: false,
+            tor_enabled: false,
+            tor_auto_start: false,
         };
         assert!(config.validate_paths().is_err());
     }
@@ -434,8 +653,42 @@ mod tests {
             binaries_path: alias.join("Binaries"),
             bitcoin_data_path: real.join("Binaries").join("chain"),
             electrs_data_path: real.join("ElectrsDB"),
+            build_settings: BuildSettings::default(),
+            theme_preference: ThemePreference::default(),
+            local_network_access: false,
+            tor_enabled: false,
+            tor_auto_start: false,
         };
         assert!(config.validate_paths().is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_parse_defers_live_path_checks_until_post_window_validation() -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir()?;
+        let real_binaries = temporary.path().join("real-binaries");
+        std::fs::create_dir(&real_binaries)?;
+        let alias_binaries = temporary.path().join("alias-binaries");
+        symlink(&real_binaries, &alias_binaries)?;
+        let config = Config {
+            binaries_path: alias_binaries,
+            bitcoin_data_path: temporary.path().join("BitcoinChain"),
+            electrs_data_path: temporary.path().join("ElectrsDB"),
+            build_settings: BuildSettings::default(),
+            theme_preference: ThemePreference::default(),
+            local_network_access: false,
+            tor_enabled: false,
+            tor_auto_start: false,
+        };
+        let config_path = temporary.path().join("config.json");
+        std::fs::write(&config_path, serde_json::to_vec(&config)?)?;
+
+        let parsed = Config::load_from_file(&config_path)?;
+        assert_eq!(parsed.binaries_path, config.binaries_path);
+        assert!(parsed.validate_paths().is_err());
         Ok(())
     }
 

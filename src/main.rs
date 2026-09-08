@@ -7,17 +7,19 @@
 
 #![expect(
     clippy::multiple_crate_versions,
-    reason = "Iced, rfd, and their platform backends currently pull duplicate transitive crate versions"
+    reason = "Iced, rfd, Arti, and their platform backends currently pull duplicate transitive crate versions"
 )]
 
 mod binaries;
 mod bitcoin_config;
 mod bitcoin_status;
 mod config;
+mod connection;
 mod electrs_status;
 mod platform;
 mod process_manager;
 mod rpc;
+mod tor;
 mod ui;
 
 use std::{path::PathBuf, process};
@@ -41,14 +43,16 @@ fn main() -> iced::Result {
     iced::application(
         move || {
             let app = ui::App::new(&ssd_root);
-            (app, Task::none())
+            let detect_theme = iced::system::theme().map(ui::Message::SystemThemeChanged);
+            let start_tor_manager = app.initial_task();
+            (app, Task::batch([detect_theme, start_tor_manager]))
         },
         ui::App::update,
         ui::App::view,
     )
     .title("BitEngine")
     .subscription(ui::App::subscription)
-    .theme(app_theme)
+    .theme(ui::App::theme)
     .window(window::Settings {
         size: Size::new(1440.0, 960.0),
         min_size: Some(Size::new(900.0, 700.0)),
@@ -56,11 +60,8 @@ fn main() -> iced::Result {
         decorations: true,
         ..Default::default()
     })
+    .exit_on_close_request(false)
     .run()
-}
-
-const fn app_theme(_: &ui::App) -> iced::Theme {
-    iced::Theme::Dark
 }
 
 /// Determine the default working root directory.
@@ -74,14 +75,14 @@ const fn app_theme(_: &ui::App) -> iced::Theme {
 fn resolve_ssd_root() -> PathBuf {
     if let Ok(env_root) = std::env::var("BITENGINE_ROOT") {
         let p = PathBuf::from(env_root);
-        if p.is_dir() {
+        if safe_root_override(&p) {
             return p;
         }
     }
 
     if let Ok(env_root) = std::env::var("BITCOIN_NODE_MANAGER_ROOT") {
         let p = PathBuf::from(env_root);
-        if p.is_dir() {
+        if safe_root_override(&p) {
             return p;
         }
     }
@@ -106,4 +107,24 @@ fn resolve_ssd_root() -> PathBuf {
     }
 
     exe_dir.to_path_buf()
+}
+
+fn safe_root_override(path: &std::path::Path) -> bool {
+    path.is_absolute()
+        && path
+            .components()
+            .any(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_override_is_accepted_lexically_without_requiring_existence() {
+        let missing = PathBuf::from("/definitely-not-mounted/bitengine-root");
+        assert!(safe_root_override(&missing));
+        assert!(!safe_root_override(std::path::Path::new("relative/root")));
+        assert!(!safe_root_override(std::path::Path::new("/")));
+    }
 }
