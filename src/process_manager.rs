@@ -713,9 +713,11 @@ mod tests {
 
     #[cfg(unix)]
     fn argument_capture_script(marker: &Path) -> String {
+        // Publish after the complete argument list is written; existence is
+        // the readiness signal used by the launch tests.
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'READY\\n'\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
-            marker.display()
+            "#!/bin/sh\nset -e\nprintf '%s\\n' \"$@\" > '{marker}.tmp'\nmv '{marker}.tmp' '{marker}'\nprintf 'READY\\n'\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
+            marker = marker.display()
         )
     }
 

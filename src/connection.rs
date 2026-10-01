@@ -852,7 +852,7 @@ mod tests {
             readiness(None, None, &electrs),
         ] {
             assert!(!state.is_ready());
-            assert!(!state.message().trim().is_empty());
+            assert_ne!(state.message().trim(), "");
         }
     }
 

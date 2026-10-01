@@ -1493,7 +1493,6 @@ impl App {
                 if self.binary_page.can_cancel() && self.build_service.cancel_current() {
                     self.binary_page.cancellation_requested = true;
                 }
-                Task::none()
             }
             BuildMsg::ToggleDetails => {
                 self.binary_page.disclosures.build_details =
@@ -1503,13 +1502,12 @@ impl App {
                 {
                     self.hovered_output_pane = None;
                 }
-                Task::none()
             }
             BuildMsg::ToggleAdvanced => {
                 self.binary_page.disclosures.advanced = !self.binary_page.disclosures.advanced;
-                Task::none()
             }
         }
+        Task::none()
     }
 
     fn dependency(&mut self, message: DepMsg) -> Task<Message> {
@@ -6205,7 +6203,7 @@ mod tests {
         assert_eq!(app.binary_page.active_kind, Some(BinaryKind::Electrs));
         assert_eq!(app.binary_page.stage, Some(BuildStage::Compiling));
         assert!((app.binary_page.progress - 0.6).abs() < f32::EPSILON);
-        assert!(app.binary_page.log_lines.is_empty());
+        assert_eq!(app.binary_page.log_lines, Vec::<String>::new());
         assert!(app.binary_page.error.is_none());
         Ok(())
     }

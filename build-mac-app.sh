@@ -14,7 +14,7 @@ APP_DIR="${APP_NAME}.app"
 INFO_PLIST="${APP_DIR}/Contents/Info.plist"
 REMOVABLE_VOLUMES_USAGE_DESCRIPTION="BitEngine needs access to removable volumes containing your configured node binaries and data."
 
-cargo build --release --target "${TARGET}"
+cargo build --locked --release --target "${TARGET}"
 
 mkdir -p "${APP_DIR}/Contents/MacOS"
 mkdir -p "${APP_DIR}/Contents/Resources"

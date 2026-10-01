@@ -167,6 +167,8 @@ rustup target add x86_64-unknown-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 ```
 
+Development and release builds use the Rust 1.99.0 pin in `rust-toolchain.toml`. CI also checks the latest `stable` compiler so future compiler and Clippy changes are reviewed before updating the release pin. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` keeps Rust 1.91 as the minimum supported Rust version (MSRV); it is a compatibility floor, not the build compiler pin. Existing toolchains and the global rustup default need no changes.
+
 > **Requires:** Rust 1.91 or newer (newer stable toolchains are supported). macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
 
 ### Development build

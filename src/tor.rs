@@ -2107,16 +2107,24 @@ mod tests {
             let mut control = self.control.subscribe();
             self.starts.fetch_add(1, Ordering::AcqRel);
             let _stop_guard = FakeStopGuard(Arc::clone(&self.stops));
-            if self
-                .failures_remaining
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return Err(AttemptFailure::transient(
-                    "scripted onion descriptor startup failure",
-                ));
+            // Reserve a scripted failure atomically without underflow. The
+            // explicit CAS loop works on the MSRV and avoids fetch_update,
+            // deprecated in Rust 1.99 in favor of a newer try_update API.
+            let mut remaining = self.failures_remaining.load(Ordering::Acquire);
+            while let Some(next) = remaining.checked_sub(1) {
+                match self.failures_remaining.compare_exchange_weak(
+                    remaining,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        return Err(AttemptFailure::transient(
+                            "scripted onion descriptor startup failure",
+                        ));
+                    }
+                    Err(current) => remaining = current,
+                }
             }
 
             let initial_proxy_state = *proxy_state.borrow();
