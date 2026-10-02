@@ -5,6 +5,7 @@
 
 # Rust build and profiling output
 /target/
+/vendor/tor-hsservice/target/
 *.profraw
 
 # Local release-packaging output
@@ -14,3 +15,6 @@
 # Local development helpers
 dev-check.sh
 clippy.sh
+
+# Private Codex guidance
+/rules.md

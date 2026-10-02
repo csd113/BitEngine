@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Added an always-visible, readiness-gated wallet connection card with validated local/LAN endpoints, matching QR/copy data, and actionable synchronization or failure detail
+- Added an embedded Arti v3 onion service that exposes only the managed electrs port, persists its identity in validated private storage, rejects traffic while electrs is unavailable, and shuts down asynchronously
+- Corrected Arti 0.45 introduction-point publication expiry bookkeeping so rapid onion-service restarts retain still-valid descriptors and discard expired records
+- Added persistent System / Light / Dark themes and a restrained dashboard, binaries, controls, status, and error-state polish pass
+- Added a collapsed Binaries → Advanced settings panel with persisted performance, source-retention, clean-build, and verbose-output controls
+- Added version-aware macOS/Homebrew and Debian/Ubuntu apt dependency checks and narrowly scoped installation with Rust installation-method detection
+- Raised the minimum supported Rust version to 1.91 and added an explicit MSRV CI check
+- Added authenticated source reuse and clean compilation-cache handling without changing transactional installation or rollback guarantees
+
 ## 1.0.0 - 2026-08-09
 
 - Bumped the crate and release version to `1.0.0`

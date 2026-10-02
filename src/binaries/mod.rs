@@ -23,6 +23,10 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+pub use dependencies::{
+    install_required as install_build_dependencies, scan_all as scan_build_dependencies,
+    DependencyInstallOutcome, DependencyReport, DependencyState,
+};
 pub use service::{
     BuildFailure, BuildRequest, BuildService, BuildSummary, PersistedBuild, PersistedBuildStatus,
 };
