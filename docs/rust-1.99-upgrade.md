@@ -1,4 +1,39 @@
-# Rust 1.99 compiler upgrade — 2026-10-01
+# Rust 1.99 compiler upgrade
+
+## Dependency refresh — 2026-10-04
+
+The declared MSRV, CI compatibility job, and in-app Rust dependency checks now
+require Rust 1.99. The exact 1.99.0 development/release pin already matched this
+version. Direct dependencies are updated to their latest stable releases and
+the application lockfile is refreshed to the newest versions allowed by the
+upstream dependency requirements. This includes Arti 0.47, fs-mistrust 0.16,
+futures-copy 0.5, safelog 0.10, and qrcode 0.14.1.
+
+The vendored tor-hsservice source is rebased on 0.47.0. This upstream release
+still has the inverted publication-expiry predicate, so the existing fix and
+regression test remain. Its shipped manifest and lockfile are retained with
+updated package provenance in vendor/tor-hsservice/PATCH.md.
+
+Three transitive packages remain behind newer releases because upstream
+requirements constrain them: derive-deftly and derive-deftly-macros use the
+Arti-required 1.12 series, and crypto-common pins generic-array to 0.14.7.
+
+Validation passed on macOS Apple Silicon with Rust 1.99.0:
+
+- `cargo fmt --all --check`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo`
+- `cargo test --workspace --all-features`: 284 passed, four existing optional tests ignored.
+- `cargo test --manifest-path vendor/tor-hsservice/Cargo.toml --locked --features full publication_expiry_retains_only_still_valid_records`: one passed.
+- `cargo upgrade --dry-run --incompatible --verbose --verbose`: all 25 direct dependencies at their latest stable releases.
+- `cargo update --dry-run --verbose`: no further resolvable application lockfile updates.
+- `git diff --check`
+
+The vendored source was compared with the published 0.47.0 crate: the only
+source deviation is the existing expiry correction and regression test.
+Linux builds and live Tor-network behavior were not exercised in this refresh.
+No commits or releases were created.
+
+## Original compiler upgrade — 2026-10-01
 
 Development and release builds now pin exact Rust 1.99.0 instead of floating
 stable. CI also explicitly selects latest stable for formatting, strict Clippy

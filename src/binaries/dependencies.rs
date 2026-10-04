@@ -22,7 +22,7 @@ use super::{
     process, BinaryKind, ReleaseVersion,
 };
 
-pub const MINIMUM_RUST: [u64; 3] = [1, 91, 0];
+pub const MINIMUM_RUST: [u64; 3] = [1, 99, 0];
 const MINIMUM_CLANG: [u64; 3] = [17, 0, 0];
 const MINIMUM_GCC: [u64; 3] = [12, 1, 0];
 const MINIMUM_CMAKE: [u64; 3] = [3, 22, 0];
@@ -1053,7 +1053,7 @@ async fn install_macos(
                     select_brew_formula(item, "rust", &brew, environment, &mut install, &mut upgrade, &mut blockers).await;
                 }
                 RustManager::Apt | RustManager::Manual => blockers.push(
-                    "The outdated Rust toolchain is not managed by Homebrew or rustup; upgrade that existing installation to Rust 1.91+ to avoid a duplicate toolchain.".to_owned(),
+                    "The outdated Rust toolchain is not managed by Homebrew or rustup; upgrade that existing installation to Rust 1.99+ to avoid a duplicate toolchain.".to_owned(),
                 ),
             }
             continue;
@@ -1168,7 +1168,7 @@ async fn install_apt(
                         packages.extend(["cargo".to_owned(), "rustc".to_owned()]);
                     } else {
                         blockers.push(
-                            "The installed distro Rust is outdated and the configured apt candidate is below 1.91. Upgrade that distro-managed toolchain rather than adding a conflicting second installation."
+                            "The installed distro Rust is outdated and the configured apt candidate is below 1.99. Upgrade that distro-managed toolchain rather than adding a conflicting second installation."
                                 .to_owned(),
                         );
                     }
@@ -1185,7 +1185,7 @@ async fn install_apt(
                     }
                 }
                 RustManager::Homebrew | RustManager::Manual => blockers.push(
-                    "The outdated Rust toolchain is not managed by apt or rustup; upgrade that existing installation to Rust 1.91+ to avoid a duplicate toolchain.".to_owned(),
+                    "The outdated Rust toolchain is not managed by apt or rustup; upgrade that existing installation to Rust 1.99+ to avoid a duplicate toolchain.".to_owned(),
                 ),
             }
             continue;
@@ -1332,7 +1332,7 @@ async fn install_rustup_stable(environment: &BuildEnvironment) -> Result<()> {
     }
 
     let curl = find_in_path("curl", environment).context(
-        "the apt Rust candidate is below 1.91 and curl is unavailable; install current stable Rust from https://rustup.rs, then check dependencies again",
+        "the apt Rust candidate is below 1.99 and curl is unavailable; install current stable Rust from https://rustup.rs, then check dependencies again",
     )?;
     let shell = find_in_path("sh", environment).context("a POSIX shell is unavailable")?;
     let temporary = create_install_temporary_directory()?;
@@ -1580,14 +1580,14 @@ mod tests {
 
     #[test]
     fn version_parser_accepts_newer_and_rejects_unstructured_output() {
-        let (minimum, _) = extract_numeric_version("rustc 1.91.0 (hash date)")
+        let (minimum, _) = extract_numeric_version("rustc 1.99.0 (hash date)")
             .expect("minimum version should parse");
         let (newer, _) =
             extract_numeric_version("rustc 1.104.3").expect("newer version should parse");
         assert!(minimum.is_at_least(MINIMUM_RUST));
         assert!(newer.is_at_least(MINIMUM_RUST));
         assert!(extract_numeric_version("rustc nightly").is_none());
-        assert!(parse_apt_rust_candidate("  Candidate: 1.91.0+dfsg")
+        assert!(parse_apt_rust_candidate("  Candidate: 1.99.0+dfsg")
             .is_some_and(|version| version.is_at_least(MINIMUM_RUST)));
     }
 
@@ -1707,8 +1707,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         for (version, expected) in [
-            ("1.90.9", DependencyState::Outdated),
-            ("1.91.0", DependencyState::Ready),
+            ("1.98.9", DependencyState::Outdated),
+            ("1.91.0", DependencyState::Outdated),
+            ("1.99.0", DependencyState::Ready),
             ("1.104.1", DependencyState::Ready),
         ] {
             let temporary = tempfile::tempdir()?;

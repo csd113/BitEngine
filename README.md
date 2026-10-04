@@ -10,7 +10,7 @@ Built with Rust · Iced · Native desktop rendering
 
 Current release: `1.0.0`
 
-[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.99%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%2Farm64-blue)](#supported-platforms)
 [![Architecture](https://img.shields.io/badge/macos-Apple%20Silicon%20only-lightgrey)](#supported-platforms)
@@ -167,9 +167,9 @@ rustup target add x86_64-unknown-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 ```
 
-Development and release builds use the Rust 1.99.0 pin in `rust-toolchain.toml`. CI also checks the latest `stable` compiler so future compiler and Clippy changes are reviewed before updating the release pin. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` keeps Rust 1.91 as the minimum supported Rust version (MSRV); it is a compatibility floor, not the build compiler pin. Existing toolchains and the global rustup default need no changes.
+Development and release builds use the Rust 1.99.0 pin in `rust-toolchain.toml`. CI also checks the latest `stable` compiler so future compiler and Clippy changes are reviewed before updating the release pin. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` also declares Rust 1.99 as the minimum supported Rust version (MSRV). Existing toolchains and the global rustup default need no changes.
 
-> **Requires:** Rust 1.91 or newer (newer stable toolchains are supported). macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
+> **Requires:** Rust 1.99 or newer (newer stable toolchains are supported). macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
 
 ### Development build
 
@@ -183,7 +183,7 @@ The GitHub Actions CI workflow runs:
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo test --workspace --all-features`
-- locked dependency resolution on the minimum supported Rust 1.91 toolchain
+- locked dependency resolution on the minimum supported Rust 1.99 toolchain
 - release build checks for macOS Apple Silicon, Linux x86_64, and Linux ARM64
 
 ### Release build (optimised)
@@ -398,8 +398,8 @@ The Iced update loop is the only writer to UI state. The background threads only
 |---|---|---|
 | `iced` | 0.14 | GUI framework (native rendering, Elm/MVU) |
 | `tokio` | 1 | Async runtime (driven by iced's tokio feature) |
-| `arti-client` / `tor-hsservice` | 0.46 | Embedded Tor client and fixed v3 onion service |
-| `fs-mistrust` | 0.15 | Private Arti storage permission validation |
+| `arti-client` / `tor-hsservice` | 0.47 | Embedded Tor client and fixed v3 onion service |
+| `fs-mistrust` | 0.16 | Private Arti storage permission validation |
 | `reqwest` | 0.13 | HTTP client for Bitcoin RPC (rustls, no OpenSSL) |
 | `serde` / `serde_json` | 1 | Config and RPC serialisation |
 | `anyhow` | 1 | Ergonomic error propagation |

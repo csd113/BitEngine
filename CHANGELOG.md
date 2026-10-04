@@ -8,7 +8,8 @@
 - Added persistent System / Light / Dark themes and a restrained dashboard, binaries, controls, status, and error-state polish pass
 - Added a collapsed Binaries → Advanced settings panel with persisted performance, source-retention, clean-build, and verbose-output controls
 - Added version-aware macOS/Homebrew and Debian/Ubuntu apt dependency checks and narrowly scoped installation with Rust installation-method detection
-- Raised the minimum supported Rust version to 1.91 and added an explicit MSRV CI check
+- Raised the minimum supported Rust version and dependency checks to 1.99 and aligned the MSRV CI job
+- Updated direct and transitive Cargo dependencies to the latest available releases, retaining the onion-service expiry fix on Arti 0.47
 - Added authenticated source reuse and clean compilation-cache handling without changing transactional installation or rollback guarantees
 
 ## 1.0.0 - 2026-08-09
