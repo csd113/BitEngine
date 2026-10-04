@@ -2,7 +2,7 @@
 name = "bitengine"
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.97.1"
+rust-version = "1.99"
 description = "BitEngine GUI for Bitcoin Core and Electrs"
 license = "MIT"
 repository = "https://github.com/csd113/BitEngine"
@@ -30,8 +30,40 @@ iced = { version = "0.14", default-features = false, features = [
     "x11",
 ] }
 
+# Encode connection QR matrices directly. Iced's canvas-backed QR widget does
+# not render with the Tiny-Skia backend used by BitEngine on macOS; drawing the
+# encoded cells as ordinary renderer quads keeps the software-rendered UI
+# scannable without adding another package to the dependency graph.
+qrcode = { version = "0.14", default-features = false }
+
 # Async runtime (iced tokio feature drives the executor)
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# Embedded Tor client and v3 onion service with a BitEngine-owned fixed-port
+# proxy. Arti 0.47 requires Rust 1.92; BitEngine builds with Rust 1.99.
+# Congestion control is always enabled.
+# Use rustls so no system Tor daemon or native TLS installation is required.
+arti-client = { version = "0.47", default-features = false, features = [
+    "onion-service-service",
+    "rustls",
+    "static-sqlite",
+    "tokio",
+    "vanguards",
+] }
+fs-mistrust = "0.16"
+futures = "0.3"
+futures-copy = "0.5"
+safelog = "0.10"
+tor-cell = "0.47"
+tor-hsservice = "0.47"
+tor-proto = { version = "0.47", default-features = false, features = [
+    "hs-service",
+] }
+tor-rtcompat = { version = "0.47", default-features = false, features = [
+    "rustls",
+    "tokio",
+] }
 
 # HTTP client for Bitcoin JSON-RPC calls
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
@@ -62,6 +94,13 @@ iced_runtime = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
+tor-keymgr = "0.47"
+
+[patch.crates-io]
+# Arti 0.47.0 accidentally discards still-valid onion-service introduction-point
+# publication records and retains expired ones. Keep this exact release vendored
+# with the predicate corrected until the upstream crate publishes a fix.
+tor-hsservice = { path = "vendor/tor-hsservice" }
 
 [profile.release]
 opt-level     = 3

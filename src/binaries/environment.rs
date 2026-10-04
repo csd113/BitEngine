@@ -77,6 +77,16 @@ fn build_environment_from(mut variable: impl FnMut(&str) -> Option<String>) -> B
         push_existing_path(&mut paths, path);
     }
 
+    // Honor additional PATH-visible manual installations only when the
+    // directory itself is absolute, real, owned by root/current user, and not
+    // writable by group or everyone. Known system paths stay ahead of these
+    // entries, so launcher-provided PATH data cannot substitute build tools.
+    if let Some(inherited_path) = variable("PATH") {
+        for path in std::env::split_paths(&inherited_path) {
+            push_safe_inherited_path(&mut paths, &path);
+        }
+    }
+
     let mut seen = HashSet::with_capacity(paths.len());
     paths.retain(|path| !path.is_empty() && seen.insert(path.clone()));
     environment.insert("PATH".to_owned(), paths.join(":"));
@@ -86,13 +96,12 @@ fn build_environment_from(mut variable: impl FnMut(&str) -> Option<String>) -> B
     environment.insert("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned());
 
     if let Some(prefix) = llvm_prefix {
-        let library_path = prefix.join("lib").display().to_string();
-        environment.insert("LIBCLANG_PATH".to_owned(), library_path.clone());
-        if cfg!(target_os = "macos") {
-            environment.insert("DYLD_LIBRARY_PATH".to_owned(), library_path);
-        } else if cfg!(target_os = "linux") {
-            environment.insert("LD_LIBRARY_PATH".to_owned(), library_path);
-        }
+        // Locate libclang for bindgen without overriding the dynamic loader's
+        // search path: rustc must load its own compatible LLVM libraries.
+        environment.insert(
+            "LIBCLANG_PATH".to_owned(),
+            prefix.join("lib").display().to_string(),
+        );
     }
 
     environment
@@ -104,8 +113,10 @@ pub fn bitcoin_environment(base: &BuildEnvironment) -> BuildEnvironment {
     let mut pkg_config_paths = [
         "/opt/homebrew/lib/pkgconfig",
         "/opt/homebrew/share/pkgconfig",
+        "/opt/homebrew/opt/libevent/lib/pkgconfig",
         "/usr/local/lib/pkgconfig",
         "/usr/local/share/pkgconfig",
+        "/usr/local/opt/libevent/lib/pkgconfig",
         "/usr/lib/pkgconfig",
         "/usr/share/pkgconfig",
         "/usr/lib64/pkgconfig",
@@ -196,9 +207,40 @@ fn push_existing_path(paths: &mut Vec<String>, path: impl AsRef<Path>) {
     }
 }
 
+fn push_safe_inherited_path(paths: &mut Vec<String>, path: &Path) {
+    if !path.is_absolute() {
+        return;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let owner = metadata.uid();
+        // SAFETY: `geteuid` has no arguments or memory-safety preconditions.
+        let current_user = unsafe { libc::geteuid() };
+        if metadata.permissions().mode() & 0o022 != 0 || (owner != 0 && owner != current_user) {
+            return;
+        }
+    }
+
+    if let Ok(canonical) = path.canonicalize() {
+        paths.push(canonical.display().to_string());
+    }
+}
+
 fn llvm_candidates() -> Vec<PathBuf> {
     if cfg!(target_os = "macos") {
-        vec![PathBuf::from("/opt/homebrew/opt/llvm")]
+        vec![
+            PathBuf::from("/opt/homebrew/opt/llvm"),
+            PathBuf::from("/usr/local/opt/llvm"),
+        ]
     } else {
         [
             "/usr/lib/llvm",
@@ -243,6 +285,8 @@ mod tests {
             ("RUSTFLAGS", "-C linker=/tmp/linker"),
             ("CMAKE_TOOLCHAIN_FILE", "/tmp/toolchain"),
             ("DYLD_INSERT_LIBRARIES", "/tmp/injected.dylib"),
+            ("DYLD_LIBRARY_PATH", "/tmp/injected-libraries"),
+            ("LD_LIBRARY_PATH", "/tmp/injected-libraries"),
             ("PATH", "/tmp/injected-build-tools"),
         ];
         let environment = build_environment_from(|name| {
@@ -265,6 +309,8 @@ mod tests {
             "RUSTFLAGS",
             "CMAKE_TOOLCHAIN_FILE",
             "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "LD_LIBRARY_PATH",
         ] {
             assert!(!environment.contains_key(name), "unexpected {name}");
         }
@@ -282,6 +328,37 @@ mod tests {
             environment.get("CARGO_INCREMENTAL").map(String::as_str),
             Some("0")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_absolute_inherited_path_supports_manual_tool_installations() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir()?;
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))?;
+        let tool = temporary.path().join("manual-rustc");
+        std::fs::write(&tool, "#!/bin/sh\n")?;
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))?;
+        let inherited = temporary.path().display().to_string();
+
+        let environment =
+            build_environment_from(|name| (name == "PATH").then(|| inherited.clone()));
+
+        assert_eq!(
+            find_in_path("manual-rustc", &environment),
+            Some(tool.canonicalize()?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn macos_llvm_candidates_cover_apple_silicon_and_intel_homebrew() {
+        if cfg!(target_os = "macos") {
+            let candidates = llvm_candidates();
+            assert!(candidates.contains(&PathBuf::from("/opt/homebrew/opt/llvm")));
+            assert!(candidates.contains(&PathBuf::from("/usr/local/opt/llvm")));
+        }
     }
 
     #[cfg(unix)]
