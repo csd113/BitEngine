@@ -17,7 +17,7 @@ use tokio::time::timeout;
 
 use crate::{electrs_status::ElectrsStatus, rpc::BlockchainInfo};
 
-pub const DEFAULT_ELECTRUM_PORT: u16 = 50_001;
+pub(super) const DEFAULT_ELECTRUM_PORT: u16 = 50_001;
 const LAN_DISCOVERY_ROUTE: &str = "192.0.2.1:9";
 const LAN_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -26,7 +26,7 @@ const LAN_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// `Default` is deliberately loopback-only. LAN exposure must always be named
 /// at the process launch call site.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ElectrsBindPolicy {
+pub(super) enum ElectrsBindPolicy {
     #[default]
     LoopbackOnly,
     LocalNetwork,
@@ -44,7 +44,7 @@ impl From<bool> for ElectrsBindPolicy {
 
 impl ElectrsBindPolicy {
     #[must_use]
-    pub(crate) const fn requires_lan_address(self) -> bool {
+    pub(super) const fn requires_lan_address(self) -> bool {
         matches!(self, Self::LocalNetwork)
     }
 }
@@ -52,7 +52,7 @@ impl ElectrsBindPolicy {
 /// The concrete, validated listener passed to one managed electrs generation.
 /// A LAN policy cannot be represented without naming one private interface IP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ElectrsListenAddr {
+pub(super) struct ElectrsListenAddr {
     policy: ElectrsBindPolicy,
     socket: SocketAddr,
 }
@@ -64,7 +64,7 @@ impl ElectrsListenAddr {
     ///
     /// LAN access requires a discovered RFC1918 or IPv6 ULA address. Wildcard,
     /// public, link-local, loopback, and multicast addresses fail closed.
-    pub(crate) fn for_policy(
+    pub(super) fn for_policy(
         policy: ElectrsBindPolicy,
         lan_ip: Option<IpAddr>,
         port: u16,
@@ -85,38 +85,38 @@ impl ElectrsListenAddr {
     }
 
     #[must_use]
-    pub(crate) const fn policy(self) -> ElectrsBindPolicy {
+    pub(super) const fn policy(self) -> ElectrsBindPolicy {
         self.policy
     }
 
     #[must_use]
-    pub(crate) const fn socket_addr(self) -> SocketAddr {
+    pub(super) const fn socket_addr(self) -> SocketAddr {
         self.socket
     }
 }
 
 /// Service facts from the current managed Bitcoin generation.
 #[derive(Debug, Clone, Copy)]
-pub struct BitcoinReadiness<'a> {
-    pub(crate) process_running: bool,
-    pub(crate) blockchain_info: Option<&'a BlockchainInfo>,
+pub(super) struct BitcoinReadiness<'a> {
+    pub(super) process_running: bool,
+    pub(super) blockchain_info: Option<&'a BlockchainInfo>,
     /// Fatal process, compatibility, or RPC diagnostic from the lifecycle.
-    pub(crate) error: Option<&'a str>,
+    pub(super) error: Option<&'a str>,
     /// P2P readiness can fail briefly while a running Core process warms up.
-    pub(crate) p2p_error: Option<&'a str>,
+    pub(super) p2p_error: Option<&'a str>,
 }
 
 /// Service facts from the current managed electrs generation.
 #[derive(Debug, Clone, Copy)]
-pub struct ElectrsReadiness<'a> {
-    pub(crate) status: &'a ElectrsStatus,
+pub(super) struct ElectrsReadiness<'a> {
+    pub(super) status: &'a ElectrsStatus,
     /// Unexpected child-exit or launch diagnostic retained by the lifecycle.
-    pub(crate) process_error: Option<&'a str>,
+    pub(super) process_error: Option<&'a str>,
 }
 
 /// Why a wallet endpoint is, or is not, currently usable.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ConnectionReadiness {
+pub(super) enum ConnectionReadiness {
     ServicesStopped,
     BitcoinStarting,
     BitcoinFailed {
@@ -143,7 +143,7 @@ pub enum ConnectionReadiness {
 impl ConnectionReadiness {
     /// Interpret the latest nonblocking status-poll results.
     #[must_use]
-    pub(crate) fn evaluate(bitcoin: BitcoinReadiness<'_>, electrs: ElectrsReadiness<'_>) -> Self {
+    pub(super) fn evaluate(bitcoin: BitcoinReadiness<'_>, electrs: ElectrsReadiness<'_>) -> Self {
         if let Some(error) = nonempty(bitcoin.error) {
             return Self::BitcoinFailed {
                 reason: error.to_owned(),
@@ -202,13 +202,13 @@ impl ConnectionReadiness {
     }
 
     #[must_use]
-    pub(crate) const fn is_ready(&self) -> bool {
+    pub(super) const fn is_ready(&self) -> bool {
         matches!(self, Self::Ready)
     }
 
     /// Human-readable explanation for the always-visible Connect card.
     #[must_use]
-    pub(crate) fn message(&self) -> String {
+    pub(super) fn message(&self) -> String {
         match self {
             Self::ServicesStopped => "Node services are stopped. Start Bitcoin Core to begin."
                 .to_owned(),
@@ -298,7 +298,7 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
 
 /// Whether an endpoint is intended for this computer, its LAN, or Tor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EndpointKind {
+pub(super) enum EndpointKind {
     SameMachine,
     LocalNetwork,
     Tor,
@@ -307,7 +307,7 @@ pub enum EndpointKind {
 /// A validated Electrum TCP endpoint that cannot contain credentials, paths,
 /// queries, cookies, or unrelated application state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ElectrumEndpoint {
+pub(super) struct ElectrumEndpoint {
     kind: EndpointKind,
     host: EndpointHost,
     port: NonZeroU16,
@@ -315,7 +315,7 @@ pub struct ElectrumEndpoint {
 
 impl ElectrumEndpoint {
     /// Construct the loopback endpoint intended only for a wallet on this host.
-    pub(crate) fn same_machine(port: u16) -> Result<Self, EndpointError> {
+    pub(super) fn same_machine(port: u16) -> Result<Self, EndpointError> {
         Ok(Self {
             kind: EndpointKind::SameMachine,
             host: EndpointHost::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -329,7 +329,7 @@ impl ElectrumEndpoint {
     ///
     /// Rejects addresses that cannot name a remote LAN client target, including
     /// wildcard, loopback, multicast, and scope-dependent IPv6 link-local IPs.
-    pub(crate) fn local_network(ip: IpAddr, port: u16) -> Result<Self, EndpointError> {
+    pub(super) fn local_network(ip: IpAddr, port: u16) -> Result<Self, EndpointError> {
         validate_lan_ip(ip)?;
         Ok(Self {
             kind: EndpointKind::LocalNetwork,
@@ -343,7 +343,7 @@ impl ElectrumEndpoint {
     /// # Errors
     ///
     /// Rejects anything other than a canonical lowercase v3 onion hostname.
-    pub(crate) fn onion(host: &str, port: u16) -> Result<Self, EndpointError> {
+    pub(super) fn onion(host: &str, port: u16) -> Result<Self, EndpointError> {
         validate_v3_onion(host)?;
         Ok(Self {
             kind: EndpointKind::Tor,
@@ -354,23 +354,23 @@ impl ElectrumEndpoint {
 
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn kind(&self) -> EndpointKind {
+    pub(super) const fn kind(&self) -> EndpointKind {
         self.kind
     }
 
     #[must_use]
-    pub(crate) fn host(&self) -> String {
+    pub(super) fn host(&self) -> String {
         self.host.to_string()
     }
 
     #[must_use]
-    pub(crate) const fn port(&self) -> u16 {
+    pub(super) const fn port(&self) -> u16 {
         self.port.get()
     }
 
     /// Host and port exactly as shown beside the QR code.
     #[must_use]
-    pub(crate) fn authority(&self) -> String {
+    pub(super) fn authority(&self) -> String {
         match self.host {
             EndpointHost::Ip(IpAddr::V6(ip)) => format!("[{ip}]:{}", self.port),
             _ => format!("{}:{}", self.host, self.port),
@@ -379,12 +379,12 @@ impl ElectrumEndpoint {
 
     /// Canonical QR and clipboard payload accepted by compatible wallets.
     #[must_use]
-    pub(crate) fn payload(&self) -> String {
+    pub(super) fn payload(&self) -> String {
         format!("tcp://{}", self.authority())
     }
 
     #[must_use]
-    pub(crate) const fn protocol_label(&self) -> &'static str {
+    pub(super) const fn protocol_label(&self) -> &'static str {
         match self.kind {
             EndpointKind::SameMachine | EndpointKind::LocalNetwork => "Electrum TCP",
             EndpointKind::Tor => "Electrum TCP over Tor",
@@ -411,7 +411,7 @@ impl fmt::Display for EndpointHost {
 /// actually running are kept separate so a toggle never claims exposure that
 /// has not taken effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LocalEndpointState {
+pub(super) enum LocalEndpointState {
     ServiceNotRunning,
     RestartRequired {
         configured: ElectrsBindPolicy,
@@ -433,7 +433,7 @@ impl LocalEndpointState {
     /// electrs bind. The active listener is already a validated snapshot of the
     /// exact interface used by this process generation.
     #[must_use]
-    pub(crate) fn resolve(
+    pub(super) fn resolve(
         configured: ElectrsBindPolicy,
         active: Option<ElectrsListenAddr>,
     ) -> Self {
@@ -471,7 +471,7 @@ impl LocalEndpointState {
     }
 
     #[must_use]
-    pub(crate) const fn endpoint(&self) -> Option<&ElectrumEndpoint> {
+    pub(super) const fn endpoint(&self) -> Option<&ElectrumEndpoint> {
         match self {
             Self::SameMachineOnly { endpoint } | Self::Available { endpoint } => Some(endpoint),
             Self::ServiceNotRunning
@@ -481,12 +481,12 @@ impl LocalEndpointState {
     }
 
     #[must_use]
-    pub(crate) const fn is_lan_reachable(&self) -> bool {
+    pub(super) const fn is_lan_reachable(&self) -> bool {
         matches!(self, Self::Available { .. })
     }
 
     #[must_use]
-    pub(crate) fn message(&self) -> Option<String> {
+    pub(super) fn message(&self) -> Option<String> {
         match self {
             Self::ServiceNotRunning => Some(
                 "electrs is not running, so no local endpoint is listening.".to_owned(),
@@ -514,7 +514,7 @@ impl LocalEndpointState {
 /// Determine the source address chosen by the operating system's IPv4 default
 /// route without sending application data. Run this from an Iced `Task`; all
 /// socket work is asynchronous and bounded.
-pub async fn discover_lan_address() -> Result<IpAddr, EndpointError> {
+pub(super) async fn discover_lan_address() -> Result<IpAddr, EndpointError> {
     timeout(LAN_DISCOVERY_TIMEOUT, async {
         let socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
             .await
@@ -540,7 +540,9 @@ pub async fn discover_lan_address() -> Result<IpAddr, EndpointError> {
 /// Loopback listeners need no route discovery. A LAN listener fails closed on
 /// discovery failure or address change; callers must keep that failure sticky
 /// for the lifetime of the managed electrs generation.
-pub async fn revalidate_active_listener(listener: ElectrsListenAddr) -> Result<(), EndpointError> {
+pub(super) async fn revalidate_active_listener(
+    listener: ElectrsListenAddr,
+) -> Result<(), EndpointError> {
     if listener.policy() == ElectrsBindPolicy::LoopbackOnly {
         return Ok(());
     }
@@ -594,7 +596,7 @@ fn nonzero_port(port: u16) -> Result<NonZeroU16, EndpointError> {
 }
 
 #[derive(Debug, Error)]
-pub enum EndpointError {
+pub(super) enum EndpointError {
     #[error("electrum endpoint port must not be zero")]
     ZeroPort,
     #[error("local-network access requires a validated private interface address")]

@@ -34,7 +34,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
-pub enum CommandError {
+pub(super) enum CommandError {
     #[error("build cancelled")]
     Cancelled,
     #[error("could not find executable {program} in the build PATH")]
@@ -63,16 +63,16 @@ pub enum CommandError {
 }
 
 /// Complete specification for one cancellable child-process execution.
-pub struct RunSpec<'a> {
-    pub operation_id: BuildOperationId,
-    pub program: &'a str,
-    pub arguments: &'a [String],
-    pub working_directory: Option<&'a Path>,
-    pub environment: &'a BuildEnvironment,
-    pub event_tx: &'a mpsc::Sender<BuildEvent>,
-    pub log_tx: &'a mpsc::Sender<String>,
-    pub cancelled: &'a Arc<AtomicBool>,
-    pub verbose_output: bool,
+pub(super) struct RunSpec<'a> {
+    pub(super) operation_id: BuildOperationId,
+    pub(super) program: &'a str,
+    pub(super) arguments: &'a [String],
+    pub(super) working_directory: Option<&'a Path>,
+    pub(super) environment: &'a BuildEnvironment,
+    pub(super) event_tx: &'a mpsc::Sender<BuildEvent>,
+    pub(super) log_tx: &'a mpsc::Sender<String>,
+    pub(super) cancelled: &'a Arc<AtomicBool>,
+    pub(super) verbose_output: bool,
 }
 
 #[expect(
@@ -80,7 +80,7 @@ pub struct RunSpec<'a> {
     reason = "the operation identity and independent UI, durable-log, environment, and cancellation inputs are intentionally explicit"
 )]
 #[cfg(test)]
-pub async fn run(
+pub(super) async fn run(
     operation_id: BuildOperationId,
     program: &str,
     arguments: &[String],
@@ -104,7 +104,7 @@ pub async fn run(
     .await
 }
 
-pub async fn run_with_ui_output(spec: RunSpec<'_>) -> Result<(), CommandError> {
+pub(super) async fn run_with_ui_output(spec: RunSpec<'_>) -> Result<(), CommandError> {
     let RunSpec {
         operation_id,
         program,
@@ -234,7 +234,7 @@ fn command_result(
     })
 }
 
-pub async fn probe(
+pub(super) async fn probe(
     program: &str,
     arguments: &[&str],
     working_directory: Option<&Path>,
@@ -252,7 +252,7 @@ pub async fn probe(
     .await
 }
 
-pub async fn probe_stderr(
+pub(super) async fn probe_stderr(
     program: &str,
     arguments: &[&str],
     working_directory: Option<&Path>,
@@ -422,10 +422,16 @@ impl ProcessGroupGuard {
         let Some(process_group_id) = self.process_group_id.filter(|_| self.armed) else {
             return Ok(());
         };
+        let target = process_group_id.checked_neg().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid build process group",
+            )
+        })?;
         // SAFETY: `process_group_id` comes from a successfully spawned child
         // placed in its own process group. Passing its negation targets that
         // group and does not dereference any pointer or access shared memory.
-        let result = unsafe { libc::kill(-process_group_id, signal) };
+        let result = unsafe { libc::kill(target, signal) };
         if result == 0 {
             return Ok(());
         }
@@ -445,9 +451,13 @@ impl ProcessGroupGuard {
         let Some(process_group_id) = self.process_group_id else {
             return false;
         };
+        let Some(target) = process_group_id.checked_neg() else {
+            // An unrepresentable target must still require cleanup.
+            return true;
+        };
         // SAFETY: signal zero only queries whether the child-owned process
         // group exists; it does not deliver a signal or access memory.
-        let result = unsafe { libc::kill(-process_group_id, 0) };
+        let result = unsafe { libc::kill(target, 0) };
         if result == 0 {
             return true;
         }
@@ -480,8 +490,9 @@ async fn terminate_child(child: &mut Child, process_group: &mut ProcessGroupGuar
     #[cfg(unix)]
     {
         let _ = process_group.signal(libc::SIGTERM);
-        let deadline = Instant::now() + TERMINATION_GRACE_PERIOD;
-        while process_group.is_alive() && Instant::now() < deadline {
+        let deadline = Instant::now().checked_add(TERMINATION_GRACE_PERIOD);
+        while process_group.is_alive() && deadline.is_some_and(|deadline| Instant::now() < deadline)
+        {
             let _ = child.try_wait();
             tokio::time::sleep(PROCESS_GROUP_POLL_INTERVAL).await;
         }
@@ -545,7 +556,17 @@ where
         match reader.read(&mut buffer).await {
             Ok(0) => return true,
             Ok(read) => {
-                let text = String::from_utf8_lossy(&buffer[..read]);
+                let Some(received) = buffer.get(..read) else {
+                    let _ = emit_log(
+                        operation_id,
+                        &event_tx,
+                        &log_tx,
+                        format!("\nBuild {stream_name} read exceeded its output buffer.\n"),
+                    )
+                    .await;
+                    return false;
+                };
+                let text = String::from_utf8_lossy(received);
                 if !emit_process_output(
                     operation_id,
                     &event_tx,
@@ -572,7 +593,7 @@ where
     }
 }
 
-pub async fn emit_log(
+pub(super) async fn emit_log(
     operation_id: BuildOperationId,
     event_tx: &mpsc::Sender<BuildEvent>,
     log_tx: &mpsc::Sender<String>,
@@ -699,7 +720,9 @@ mod tests {
 
     #[cfg(unix)]
     async fn assert_process_exits(process_id: i32) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(3))
+            .expect("test deadline should be representable");
         while process_exists(process_id) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

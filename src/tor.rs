@@ -5,10 +5,8 @@
 //! validated local address on the same fixed port.  In particular, Bitcoin
 //! Core RPC, metrics, and `BitEngine` UI/admin endpoints are not representable.
 
-#![expect(
-    clippy::redundant_pub_crate,
-    reason = "crate-only visibility is intentional even while the root tor module remains private"
-)]
+// Sizes, counters, protocol values, and timeouts require explicit arithmetic.
+#![deny(clippy::arithmetic_side_effects)]
 
 use std::{
     future::Future,
@@ -39,7 +37,7 @@ use tor_proto::stream::IncomingStreamRequest;
 use tor_rtcompat::{NetStreamProvider as _, PreferredRuntime};
 
 /// The sole virtual and target port exposed by `BitEngine`'s onion service.
-pub const ELECTRUM_ONION_PORT: u16 = crate::connection::DEFAULT_ELECTRUM_PORT;
+pub(super) const ELECTRUM_ONION_PORT: u16 = crate::connection::DEFAULT_ELECTRUM_PORT;
 
 const SERVICE_NICKNAME: &str = "bitengine-electrs";
 const STORAGE_DIRECTORY_NAME: &str = "tor";
@@ -60,11 +58,11 @@ const MAX_DIAGNOSTIC_CHARS: usize = 600;
 /// RFC1918/IPv6-ULA interface when the separate LAN setting deliberately
 /// enables that same managed Electrum service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ElectrsTorTarget(SocketAddr);
+pub(super) struct ElectrsTorTarget(SocketAddr);
 
 impl ElectrsTorTarget {
     /// Validate an application-selected managed Electrum listener.
-    pub(crate) const fn new(address: SocketAddr) -> Result<Self, TorConfigError> {
+    pub(super) const fn new(address: SocketAddr) -> Result<Self, TorConfigError> {
         if address.port() != ELECTRUM_ONION_PORT {
             return Err(TorConfigError::UnexpectedTargetPort {
                 port: address.port(),
@@ -115,7 +113,7 @@ const fn is_unique_local_v6(address: Ipv6Addr) -> bool {
 
 /// Validated, immutable inputs for one embedded Tor supervisor.
 #[derive(Debug, Clone)]
-pub(crate) struct TorManagerConfig {
+pub(super) struct TorManagerConfig {
     storage_root: PathBuf,
     target: ElectrsTorTarget,
     initially_enabled: bool,
@@ -127,7 +125,10 @@ impl TorManagerConfig {
     ///
     /// Production integration should prefer [`Self::for_bitengine_config`];
     /// this constructor also supports isolated temporary directories in tests.
-    pub(crate) fn new(
+    ///
+    /// # Errors
+    /// Rejects relative, root, or traversing storage paths before filesystem access.
+    pub(super) fn new(
         storage_root: PathBuf,
         target: ElectrsTorTarget,
     ) -> Result<Self, TorConfigError> {
@@ -145,7 +146,10 @@ impl TorManagerConfig {
     /// For the normal platform config path this yields
     /// `<BitEngine config directory>/tor/{state,cache}`. The Tor path is not a
     /// persisted/user-configurable setting.
-    pub(crate) fn for_bitengine_config(
+    ///
+    /// # Errors
+    /// Rejects config paths without a parent or an unsafe derived storage root.
+    pub(super) fn for_bitengine_config(
         config_file: &Path,
         target: ElectrsTorTarget,
     ) -> Result<Self, TorConfigError> {
@@ -159,14 +163,14 @@ impl TorManagerConfig {
 
     /// Set whether the supervisor should start Arti immediately.
     #[must_use]
-    pub(crate) const fn initially_enabled(mut self, enabled: bool) -> Self {
+    pub(super) const fn initially_enabled(mut self, enabled: bool) -> Self {
         self.initially_enabled = enabled;
         self
     }
 
     /// Set the initial readiness of the managed electrs service.
     #[must_use]
-    pub(crate) const fn initially_electrs_ready(mut self, ready: bool) -> Self {
+    pub(super) const fn initially_electrs_ready(mut self, ready: bool) -> Self {
         self.initially_electrs_ready = ready;
         self
     }
@@ -180,7 +184,7 @@ impl TorManagerConfig {
 /// Failures detected before a Tor worker can safely start.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub(crate) enum TorConfigError {
+pub(super) enum TorConfigError {
     /// The selected target is not a local/private managed listener.
     #[error(
         "Tor may only target an exact loopback or private managed electrs address, not {address}"
@@ -200,7 +204,7 @@ pub(crate) enum TorConfigError {
 /// The latest user-facing state of the embedded Tor service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub(crate) enum TorStatus {
+pub(super) enum TorStatus {
     /// Tor is disabled.  Existing identity material remains on disk.
     Disabled,
     /// Private storage and the embedded Arti client are being initialized.
@@ -229,7 +233,7 @@ pub(crate) enum TorStatus {
 impl TorStatus {
     /// Return the complete public v3 hostname when one is known.
     #[must_use]
-    pub(crate) fn onion_host(&self) -> Option<&str> {
+    pub(super) fn onion_host(&self) -> Option<&str> {
         match self {
             Self::Publishing { onion_host }
             | Self::WaitingForElectrs { onion_host }
@@ -250,7 +254,7 @@ impl TorStatus {
 
     /// Whether the displayed endpoint is currently usable.
     #[must_use]
-    pub(crate) const fn is_available(&self) -> bool {
+    pub(super) const fn is_available(&self) -> bool {
         matches!(self, Self::Available { .. })
     }
 }
@@ -261,7 +265,7 @@ impl TorStatus {
 /// joined application shutdown; dropping the final clone initiates cooperative
 /// cancellation without blocking the GUI thread.
 #[derive(Debug, Clone)]
-pub(crate) struct TorManager {
+pub(super) struct TorManager {
     inner: Arc<TorManagerInner>,
 }
 
@@ -289,7 +293,10 @@ impl TorManager {
     ///
     /// In Iced this should be invoked from a `Task::perform` future so a Tokio
     /// runtime context is guaranteed.
-    pub(crate) fn spawn(config: TorManagerConfig) -> Result<Self, TorConfigError> {
+    ///
+    /// # Errors
+    /// Returns `RuntimeUnavailable` when no Tokio runtime owns the caller.
+    pub(super) fn spawn(config: TorManagerConfig) -> Result<Self, TorConfigError> {
         tokio::runtime::Handle::try_current().map_err(|_| TorConfigError::RuntimeUnavailable)?;
         Self::spawn_with_factory(
             config,
@@ -335,13 +342,13 @@ impl TorManager {
 
     /// Return the latest status without waiting.
     #[must_use]
-    pub(crate) fn status(&self) -> TorStatus {
+    pub(super) fn status(&self) -> TorStatus {
         self.inner.status.borrow().clone()
     }
 
     /// Subscribe to coalesced latest-value status updates.
     #[must_use]
-    pub(crate) fn subscribe(&self) -> watch::Receiver<TorStatus> {
+    pub(super) fn subscribe(&self) -> watch::Receiver<TorStatus> {
         self.inner.status.clone()
     }
 
@@ -350,7 +357,10 @@ impl TorManager {
     /// Disabling stops onion publication, makes the shared client dormant, and
     /// never deletes identity/state. Reusing one client for the manager's
     /// lifetime avoids competing Arti instances retaining the same state locks.
-    pub(crate) async fn set_enabled(&self, enabled: bool) -> Result<(), TorControlError> {
+    ///
+    /// # Errors
+    /// Returns worker-channel or acknowledged lifecycle/teardown failures.
+    pub(super) async fn set_enabled(&self, enabled: bool) -> Result<(), TorControlError> {
         self.send_acknowledged(|acknowledged| Command::SetEnabled {
             enabled,
             acknowledged,
@@ -363,7 +373,10 @@ impl TorManager {
     /// A not-ready snapshot actively rejects new onion streams. While Tor is
     /// active, success means the reverse proxy applied the complete snapshot;
     /// reconfiguration never relaunches or rotates the onion identity.
-    pub(crate) async fn set_electrs_state(
+    ///
+    /// # Errors
+    /// Returns worker-channel or proxy snapshot application failures.
+    pub(super) async fn set_electrs_state(
         &self,
         target: ElectrsTorTarget,
         ready: bool,
@@ -377,13 +390,19 @@ impl TorManager {
     }
 
     /// Cancel the current attempt/backoff and retry immediately with the same storage.
-    pub(crate) async fn retry(&self) -> Result<(), TorControlError> {
+    ///
+    /// # Errors
+    /// Returns worker-channel or acknowledged retry/teardown failures.
+    pub(super) async fn retry(&self) -> Result<(), TorControlError> {
         self.send_acknowledged(|acknowledged| Command::Retry { acknowledged })
             .await
     }
 
     /// Stop publication and wait for the supervisor to exit.
-    pub(crate) async fn shutdown(&self) -> Result<(), TorControlError> {
+    ///
+    /// # Errors
+    /// Returns command acknowledgement, poisoned task ownership, or worker join failures.
+    pub(super) async fn shutdown(&self) -> Result<(), TorControlError> {
         let command_result = self
             .send_acknowledged(|acknowledged| Command::Shutdown { acknowledged })
             .await;
@@ -425,7 +444,7 @@ impl TorManager {
 /// Errors sending a lifecycle command or joining the supervisor.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub(crate) enum TorControlError {
+pub(super) enum TorControlError {
     /// The worker has already exited and cannot accept the command.
     #[error("the embedded Tor worker is no longer running")]
     WorkerStopped,
@@ -1907,6 +1926,7 @@ enum StorageError {
 }
 
 #[expect(
+    clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "the value is explicitly clamped to the inclusive u8 percentage range"

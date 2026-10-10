@@ -308,7 +308,7 @@ fn view_dashboard_workspace(app: &App, size: Size) -> Element<'_, Message> {
     let connection = container(view_connect_to_node(app)).width(Length::FillPortion(3));
     let paths = container(view_paths_panel(app)).width(Length::FillPortion(2));
 
-    let overview: Element<Message> = if size.width >= DASHBOARD_OVERVIEW_BREAKPOINT {
+    let overview: Element<'_, Message> = if size.width >= DASHBOARD_OVERVIEW_BREAKPOINT {
         row![connection, paths]
             .spacing(DASHBOARD_SECTION_SPACING)
             .width(Length::Fill)
@@ -356,7 +356,7 @@ fn view_binaries_page(app: &App) -> Element<'_, Message> {
         ..Default::default()
     });
 
-    let mut sections: Vec<Element<Message>> = Vec::new();
+    let mut sections: Vec<Element<'_, Message>> = Vec::new();
     if let Some(notice) = installation_recovery_notice(app) {
         sections.push(notice);
     }
@@ -507,7 +507,7 @@ fn binary_row(app: &App, kind: BinaryKind) -> Element<'_, Message> {
         action_button,
     ]
     .align_y(Alignment::Center);
-    let mut content: Vec<Element<Message>> = vec![summary.into()];
+    let mut content: Vec<Element<'_, Message>> = vec![summary.into()];
     if let Some(error) = inventory_error {
         content.push(build_notice(error, MAC_RED));
     }
@@ -740,7 +740,7 @@ fn view_binary_build_status(app: &App) -> Element<'_, Message> {
             },
         });
 
-    let mut content: Vec<Element<Message>> = vec![
+    let mut content: Vec<Element<'_, Message>> = vec![
         heading.into(),
         progress.into(),
         build_stage_track(app.binary_page.stage),
@@ -986,7 +986,7 @@ fn installation_recovery_notice(app: &App) -> Option<Element<'_, Message>> {
 }
 
 fn build_details(app: &App) -> Element<'_, Message> {
-    let terminal_content: Element<Message> = if app.binary_page.log_lines.is_empty() {
+    let terminal_content: Element<'_, Message> = if app.binary_page.log_lines.is_empty() {
         text(app.binary_page.last_log_path.as_ref().map_or_else(
             || "No build output yet.".to_owned(),
             |path| format!("Detailed log: {}", path.display()),
@@ -1056,7 +1056,7 @@ fn view_binary_advanced(app: &App) -> Element<'_, Message> {
     ]
     .align_y(Alignment::Center);
 
-    let mut content: Vec<Element<Message>> = vec![header.into()];
+    let mut content: Vec<Element<'_, Message>> = vec![header.into()];
     if app.binary_page.disclosures.advanced {
         content.push(horizontal_rule());
         content.push(
@@ -1214,7 +1214,7 @@ fn build_dependencies_card(app: &App) -> Element<'_, Message> {
     } else {
         "Check Dependencies"
     };
-    let mut content: Vec<Element<Message>> = vec![row![
+    let mut content: Vec<Element<'_, Message>> = vec![row![
         column![
             text("Build Dependencies").size(12).font(Font {
                 weight: iced::font::Weight::Bold,
@@ -1345,7 +1345,7 @@ fn release_picker(app: &App, kind: BinaryKind) -> Element<'_, Message> {
             app.binary_page.selected_electrs.as_ref(),
         ),
     };
-    let picker: Element<Message> = options.map_or_else(
+    let picker: Element<'_, Message> = options.map_or_else(
         || {
             text("Release list unavailable")
                 .size(11)
@@ -1694,7 +1694,7 @@ fn view_local_connection<'a>(
         connection_placeholder(title, detail)
     };
 
-    let mut details: Vec<Element<Message>> = vec![connection_readiness_detail(readiness)];
+    let mut details: Vec<Element<'_, Message>> = vec![connection_readiness_detail(readiness)];
     if readiness.is_ready() {
         if app.connection_endpoint.is_some() {
             details.push(endpoint_details(
@@ -1744,7 +1744,7 @@ fn view_tor_connection<'a>(app: &'a App, readiness: &ConnectionReadiness) -> Ele
             presentation.visual_detail.clone(),
         )
     };
-    let mut details: Vec<Element<Message>> = vec![connection_readiness_detail(readiness)];
+    let mut details: Vec<Element<'_, Message>> = vec![connection_readiness_detail(readiness)];
     if endpoint_ready {
         details.push(endpoint_details(app, "Available over Tor", true));
     } else {
@@ -1950,7 +1950,7 @@ fn tor_status_presentation(
 fn tor_controls<'a>(app: &'a App, action: Option<(&'static str, Message)>) -> Element<'a, Message> {
     let enable_control_available = tor_enable_control_available(app);
     let config_editable = app.config_updates_are_editable();
-    let action: Element<Message> = action.map_or_else(
+    let action: Element<'_, Message> = action.map_or_else(
         || Space::new().width(0).into(),
         |(label, message)| {
             styled_button(label, ButtonStyle::Primary)
@@ -2028,7 +2028,7 @@ fn connection_readiness_detail(readiness: &ConnectionReadiness) -> Element<'stat
         | ConnectionReadiness::ElectrsUnavailable { .. }
         | ConnectionReadiness::Ready => None,
     };
-    let mut content: Vec<Element<Message>> = vec![text(message)
+    let mut content: Vec<Element<'_, Message>> = vec![text(message)
         .size(12)
         .font(Font {
             weight: iced::font::Weight::Semibold,
@@ -2059,6 +2059,7 @@ fn connection_readiness_detail(readiness: &ConnectionReadiness) -> Element<'stat
 }
 
 #[expect(
+    clippy::as_conversions,
     clippy::cast_possible_truncation,
     reason = "Iced progress bars use f32; readiness percentages are bounded display-only f64 values"
 )]
@@ -2257,17 +2258,11 @@ fn for_each_connection_qr_dark_run(qr: &ConnectionQr, mut visit: impl FnMut(usiz
 
     for (row, cells) in qr.cells.chunks_exact(qr.width).enumerate() {
         let mut column = 0;
-        while column < cells.len() {
-            if !cells[column] {
-                column += 1;
-                continue;
+        for run in cells.chunk_by(|left, right| left == right) {
+            if run.first() == Some(&true) {
+                visit(row, column, run.len());
             }
-
-            let start = column;
-            while column < cells.len() && cells[column] {
-                column += 1;
-            }
-            visit(row, start, column - start);
+            column = column.saturating_add(run.len());
         }
     }
 }
@@ -3272,7 +3267,7 @@ fn terminal_container<'a>(
     } else {
         MAC_ORG
     };
-    let mut header_actions: Vec<Element<Message>> = vec![
+    let mut header_actions: Vec<Element<'_, Message>> = vec![
         text("●").size(11).color(activity_color).into(),
         text(activity).size(9).color(TERM_DIM).into(),
     ];
@@ -3310,7 +3305,7 @@ fn terminal_container<'a>(
         ..Default::default()
     });
 
-    let terminal_lines: Vec<Element<Message>> = if lines.is_empty() {
+    let terminal_lines: Vec<Element<'_, Message>> = if lines.is_empty() {
         vec![empty_terminal_state(running)]
     } else {
         lines

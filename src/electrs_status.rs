@@ -1,3 +1,6 @@
+// Sizes, counters, protocol values, and timeouts require explicit arithmetic.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context as _, Result};
@@ -33,18 +36,18 @@ const ELECTRUM_PROBE_REQUEST: &str = concat!(
     clippy::struct_excessive_bools,
     reason = "process, dependency connection, index synchronization, and service readiness are independent protocol invariants"
 )]
-pub struct ElectrsStatus {
-    pub running: bool,
-    pub connected: bool,
-    pub synced: bool,
-    pub ready: bool,
-    pub electrs_height: Option<u64>,
-    pub bitcoin_blocks: Option<u64>,
-    pub bitcoin_headers: Option<u64>,
-    pub sync_percent: Option<f64>,
-    pub metrics_error: Option<String>,
-    pub bitcoin_error: Option<String>,
-    pub connect_error: Option<String>,
+pub(super) struct ElectrsStatus {
+    pub(super) running: bool,
+    pub(super) connected: bool,
+    pub(super) synced: bool,
+    pub(super) ready: bool,
+    pub(super) electrs_height: Option<u64>,
+    pub(super) bitcoin_blocks: Option<u64>,
+    pub(super) bitcoin_headers: Option<u64>,
+    pub(super) sync_percent: Option<f64>,
+    pub(super) metrics_error: Option<String>,
+    pub(super) bitcoin_error: Option<String>,
+    pub(super) connect_error: Option<String>,
 }
 
 impl ElectrsStatus {
@@ -52,7 +55,7 @@ impl ElectrsStatus {
     /// wallet. Protocol availability alone is insufficient while its index or
     /// Bitcoin Core is still catching up.
     #[must_use]
-    pub const fn is_connection_ready(&self) -> bool {
+    pub(super) const fn is_connection_ready(&self) -> bool {
         self.running
             && self.connected
             && self.synced
@@ -63,7 +66,7 @@ impl ElectrsStatus {
     }
 }
 
-pub async fn probe(
+pub(super) async fn probe(
     process_running: bool,
     managed_bitcoin_rpc: Option<(PathBuf, SocketAddr)>,
     managed_listener: Option<ElectrsListenAddr>,
@@ -207,7 +210,7 @@ fn build_status(
     }
 }
 
-pub fn parse_tip_height(metrics: &str) -> Result<u64, String> {
+pub(super) fn parse_tip_height(metrics: &str) -> Result<u64, String> {
     let mut matching_lines = metrics
         .lines()
         .filter(|line| line.starts_with("electrs_index_height{") && line.contains("type=\"tip\""));
@@ -269,14 +272,21 @@ async fn read_bounded_protocol_response(stream: &mut TcpStream) -> Result<Vec<u8
             anyhow::bail!("Electrum server closed before a newline-delimited response");
         }
 
-        let newline = buffer[..bytes_read].iter().position(|byte| *byte == b'\n');
+        let received = buffer
+            .get(..bytes_read)
+            .context("Electrum read exceeded its buffer")?;
+        let newline = received.iter().position(|byte| *byte == b'\n');
         let response_bytes = newline.unwrap_or(bytes_read);
         if response.len().saturating_add(response_bytes) > MAX_ELECTRUM_RESPONSE_BYTES {
             anyhow::bail!(
                 "Electrum protocol response exceeded {MAX_ELECTRUM_RESPONSE_BYTES} bytes"
             );
         }
-        response.extend_from_slice(&buffer[..response_bytes]);
+        response.extend_from_slice(
+            received
+                .get(..response_bytes)
+                .context("Electrum line exceeded its received bytes")?,
+        );
 
         if newline.is_some() {
             return Ok(response);

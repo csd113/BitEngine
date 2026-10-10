@@ -5,6 +5,9 @@
 //! detection, dependency checks, source builds, progress/log reporting, and
 //! safe installation into `BitEngine`'s configured binaries directory.
 
+// Sizes, counters, protocol values, and timeouts require explicit arithmetic.
+#![deny(clippy::arithmetic_side_effects)]
+
 mod dependencies;
 mod environment;
 mod install;
@@ -23,11 +26,11 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-pub use dependencies::{
+pub(super) use dependencies::{
     install_required as install_build_dependencies, scan_all as scan_build_dependencies,
     DependencyInstallOutcome, DependencyReport, DependencyState,
 };
-pub use service::{
+pub(super) use service::{
     BuildFailure, BuildRequest, BuildService, BuildSummary, PersistedBuild, PersistedBuildStatus,
 };
 
@@ -53,7 +56,7 @@ static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(||
 
 /// A buildable binary family managed by `BitEngine`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BinaryKind {
+pub(super) enum BinaryKind {
     BitcoinCore,
     Electrs,
 }
@@ -61,11 +64,11 @@ pub enum BinaryKind {
 /// UI-generated identity used to correlate every event and terminal result
 /// belonging to one build request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BuildOperationId(pub u64);
+pub(super) struct BuildOperationId(pub(super) u64);
 
 impl BinaryKind {
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::BitcoinCore => "Bitcoin Core",
             Self::Electrs => "electrs",
@@ -73,14 +76,14 @@ impl BinaryKind {
     }
 
     #[must_use]
-    pub const fn slug(self) -> &'static str {
+    pub(super) const fn slug(self) -> &'static str {
         match self {
             Self::BitcoinCore => "bitcoin",
             Self::Electrs => "electrs",
         }
     }
 
-    pub(crate) const fn repository(self) -> &'static str {
+    pub(super) const fn repository(self) -> &'static str {
         match self {
             Self::BitcoinCore => "https://github.com/bitcoin/bitcoin.git",
             Self::Electrs => "https://github.com/romanz/electrs.git",
@@ -90,7 +93,7 @@ impl BinaryKind {
 
 /// A validated stable release tag and its comparable numeric version.
 #[derive(Debug, Clone, Eq, Serialize)]
-pub struct ReleaseVersion {
+pub(super) struct ReleaseVersion {
     tag: String,
     parts: [u64; 3],
 }
@@ -136,17 +139,17 @@ impl<'de> Deserialize<'de> for ReleaseVersion {
 
 impl ReleaseVersion {
     #[must_use]
-    pub fn tag(&self) -> &str {
+    pub(super) fn tag(&self) -> &str {
         &self.tag
     }
 
     #[must_use]
-    pub fn display(&self) -> &str {
+    pub(super) fn display(&self) -> &str {
         self.tag.strip_prefix('v').unwrap_or(&self.tag)
     }
 
     #[must_use]
-    pub(crate) const fn is_at_least(&self, parts: [u64; 3]) -> bool {
+    pub(super) const fn is_at_least(&self, parts: [u64; 3]) -> bool {
         let [major, minor, patch] = self.parts;
         let [minimum_major, minimum_minor, minimum_patch] = parts;
         major > minimum_major
@@ -155,7 +158,7 @@ impl ReleaseVersion {
     }
 
     #[must_use]
-    pub(crate) const fn is_exactly(&self, parts: [u64; 3]) -> bool {
+    pub(super) const fn is_exactly(&self, parts: [u64; 3]) -> bool {
         self.parts[0] == parts[0] && self.parts[1] == parts[1] && self.parts[2] == parts[2]
     }
 }
@@ -165,21 +168,28 @@ impl FromStr for ReleaseVersion {
 
     fn from_str(tag: &str) -> Result<Self, Self::Err> {
         let clean = tag.strip_prefix('v').unwrap_or(tag);
-        let components = clean.split('.').collect::<Vec<_>>();
-        if !(2..=3).contains(&components.len())
-            || components.iter().any(|component| {
-                component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit())
-            })
+        let mut components = clean.split('.');
+        let (Some(major), Some(minor), patch, None) = (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ) else {
+            return Err(format!("unsupported release tag: {tag:?}"));
+        };
+        if [Some(major), Some(minor), patch]
+            .into_iter()
+            .flatten()
+            .any(|component| component.is_empty() || !component.bytes().all(|b| b.is_ascii_digit()))
         {
             return Err(format!("unsupported release tag: {tag:?}"));
         }
-
-        let mut parts = [0_u64; 3];
-        for (index, component) in components.into_iter().enumerate() {
-            parts[index] = component
+        let parse = |component: &str| {
+            component
                 .parse::<u64>()
-                .map_err(|_| format!("release number is too large: {tag:?}"))?;
-        }
+                .map_err(|_| format!("release number is too large: {tag:?}"))
+        };
+        let parts = [parse(major)?, parse(minor)?, patch.map_or(Ok(0), parse)?];
 
         Ok(Self {
             tag: tag.to_owned(),
@@ -214,7 +224,7 @@ impl Ord for ReleaseVersion {
 
 /// Human-readable build stages shown by the binaries page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BuildStage {
+pub(super) enum BuildStage {
     CheckingRequirements,
     DownloadingSource,
     VerifyingSource,
@@ -227,7 +237,7 @@ pub enum BuildStage {
 
 impl BuildStage {
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::CheckingRequirements => "Checking requirements",
             Self::DownloadingSource => "Downloading source",
@@ -241,7 +251,7 @@ impl BuildStage {
     }
 
     #[must_use]
-    pub const fn progress(self) -> f32 {
+    pub(super) const fn progress(self) -> f32 {
         match self {
             Self::CheckingRequirements => 0.03,
             Self::DownloadingSource => 0.10,
@@ -257,7 +267,7 @@ impl BuildStage {
 
 /// Events streamed from a background build into `BitEngine`'s update loop.
 #[derive(Debug, Clone)]
-pub enum BuildEvent {
+pub(super) enum BuildEvent {
     Stage {
         operation_id: BuildOperationId,
         kind: BinaryKind,
@@ -275,14 +285,14 @@ pub enum BuildEvent {
 
 /// Installed versions detected from `BitEngine`'s configured binaries directory.
 #[derive(Debug, Clone)]
-pub struct InstalledVersions {
-    pub bitcoin: Result<Option<ReleaseVersion>, String>,
-    pub electrs: Result<Option<ReleaseVersion>, String>,
+pub(super) struct InstalledVersions {
+    pub(super) bitcoin: Result<Option<ReleaseVersion>, String>,
+    pub(super) electrs: Result<Option<ReleaseVersion>, String>,
 }
 
 impl InstalledVersions {
     /// Probe both installed binaries without waiting for the upstream service.
-    pub async fn detect(binaries_dir: &Path) -> Self {
+    pub(super) async fn detect(binaries_dir: &Path) -> Self {
         let bitcoin_path = binaries_dir.join("bitcoind");
         let electrs_path = binaries_dir.join("electrs");
         let (bitcoin, electrs) = tokio::join!(
@@ -298,14 +308,14 @@ impl InstalledVersions {
 
 /// Stable releases currently available from both upstream projects.
 #[derive(Debug, Clone)]
-pub struct AvailableVersions {
-    pub bitcoin: Result<Vec<ReleaseVersion>, String>,
-    pub electrs: Result<Vec<ReleaseVersion>, String>,
+pub(super) struct AvailableVersions {
+    pub(super) bitcoin: Result<Vec<ReleaseVersion>, String>,
+    pub(super) electrs: Result<Vec<ReleaseVersion>, String>,
 }
 
 impl AvailableVersions {
     /// Fetch both upstream release lists concurrently.
-    pub async fn fetch() -> Self {
+    pub(super) async fn fetch() -> Self {
         let (bitcoin, electrs) = tokio::join!(
             fetch_releases(BinaryKind::BitcoinCore),
             fetch_releases(BinaryKind::Electrs),
@@ -443,17 +453,13 @@ fn parse_version_output(kind: BinaryKind, output: &str) -> Result<ReleaseVersion
         .filter(|line| !line.is_empty())
         .context("version output is empty")?;
     let version = match kind {
-        BinaryKind::BitcoinCore => {
-            let tokens = first_line
-                .strip_prefix("Bitcoin Core ")
-                .context("version output does not identify Bitcoin Core")?
-                .split_whitespace()
-                .collect::<Vec<_>>();
-            tokens
-                .windows(2)
-                .find_map(|pair| (pair[0] == "version").then_some(pair[1]))
-                .context("Bitcoin Core output has no version field")?
-        }
+        BinaryKind::BitcoinCore => first_line
+            .strip_prefix("Bitcoin Core ")
+            .context("version output does not identify Bitcoin Core")?
+            .split_whitespace()
+            .skip_while(|word| *word != "version")
+            .nth(1)
+            .context("Bitcoin Core output has no version field")?,
         BinaryKind::Electrs => first_line
             .strip_prefix("electrs ")
             .unwrap_or(first_line)
@@ -469,7 +475,7 @@ fn parse_version_output(kind: BinaryKind, output: &str) -> Result<ReleaseVersion
 /// Derive `BitEngine`'s private build workspace from its authoritative binaries
 /// path. This avoids a second, drifting output-path configuration.
 #[must_use]
-pub fn workspace_for(binaries_dir: &Path) -> PathBuf {
+pub(super) fn workspace_for(binaries_dir: &Path) -> PathBuf {
     binaries_dir
         .parent()
         .unwrap_or(binaries_dir)
@@ -505,6 +511,12 @@ mod tests {
         assert_eq!(older.display(), "29.2");
         assert!("v30.0-rc1".parse::<ReleaseVersion>().is_err());
         assert!("30".parse::<ReleaseVersion>().is_err());
+        for invalid in ["1..2", "1.2.3.4", "1.2.18446744073709551616", "é.2", "1.2."] {
+            assert!(
+                invalid.parse::<ReleaseVersion>().is_err(),
+                "accepted {invalid:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,8 @@
 //! Protocol-level health checks for the managed Bitcoin P2P service.
 
+// Sizes, counters, protocol values, and timeouts require explicit arithmetic.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::{
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -39,7 +42,7 @@ const DEFAULT_TIMEOUTS: ProbeTimeouts = ProbeTimeouts {
 
 /// Return the first configured endpoint that completes a bounded mainnet
 /// `version`/`verack` exchange in deterministic candidate order.
-pub async fn probe_p2p_candidates(candidates: &[SocketAddr]) -> Result<SocketAddr> {
+pub(super) async fn probe_p2p_candidates(candidates: &[SocketAddr]) -> Result<SocketAddr> {
     probe_p2p_candidates_with_timeouts(candidates, DEFAULT_TIMEOUTS).await
 }
 
@@ -81,7 +84,9 @@ async fn probe_p2p(candidate: SocketAddr, timeouts: ProbeTimeouts) -> Result<()>
         .await
         .context("connected, failed to send version")?;
 
-    let deadline = Instant::now() + timeouts.handshake;
+    let deadline = Instant::now()
+        .checked_add(timeouts.handshake)
+        .context("Bitcoin P2P handshake deadline overflowed")?;
     let mut saw_version = false;
     let mut saw_verack = false;
     for _ in 0..MAX_HANDSHAKE_MESSAGES {
@@ -133,7 +138,9 @@ fn validate_version(payload: &[u8]) -> Result<()> {
             payload.len()
         );
     }
-    let version_bytes: [u8; 4] = payload[..4].try_into().context("read protocol version")?;
+    let version_bytes = *payload
+        .first_chunk::<4>()
+        .context("read protocol version")?;
     let version = i32::from_le_bytes(version_bytes);
     if version < MINIMUM_SUPPORTED_PROTOCOL_VERSION {
         bail!("protocol version {version} is unsupported");
@@ -205,10 +212,15 @@ fn bitcoin_message(command: &str, payload: &[u8], magic: [u8; 4]) -> Result<Vec<
         bail!("invalid Bitcoin P2P command {command:?}");
     }
     let payload_len = u32::try_from(payload.len()).context("Bitcoin P2P payload is too large")?;
-    let mut result = Vec::with_capacity(MESSAGE_HEADER_BYTES + payload.len());
+    let capacity = MESSAGE_HEADER_BYTES
+        .checked_add(payload.len())
+        .context("Bitcoin P2P message is too large")?;
+    let mut result = Vec::with_capacity(capacity);
     result.extend_from_slice(&magic);
     let mut command_bytes = [0_u8; 12];
-    command_bytes[..command.len()].copy_from_slice(command.as_bytes());
+    for (destination, byte) in command_bytes.iter_mut().zip(command.bytes()) {
+        *destination = byte;
+    }
     result.extend_from_slice(&command_bytes);
     result.extend_from_slice(&payload_len.to_le_bytes());
     result.extend_from_slice(&payload_checksum(payload));
@@ -236,15 +248,16 @@ async fn read_message(stream: &mut TcpStream) -> Result<P2pMessage> {
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(12);
-    if command_end == 0
-        || !command_field[..command_end]
-            .iter()
-            .all(u8::is_ascii_graphic)
-        || command_field[command_end..].iter().any(|byte| *byte != 0)
+    let (command_text, padding) = command_field
+        .split_at_checked(command_end)
+        .context("response command length exceeded its field")?;
+    if command_text.is_empty()
+        || !command_text.iter().all(u8::is_ascii_graphic)
+        || padding.iter().any(|byte| *byte != 0)
     {
         bail!("response contained an invalid command field");
     }
-    let command = std::str::from_utf8(&header[4..4 + command_end])
+    let command = std::str::from_utf8(command_text)
         .context("response command was not UTF-8")?
         .to_owned();
     let payload_len_bytes: [u8; 4] = header[16..20]
@@ -276,7 +289,9 @@ fn payload_checksum(payload: &[u8]) -> [u8; 4] {
     let second = digest(&SHA256, first.as_ref());
     let mut checksum = [0_u8; 4];
     // `ring`'s SHA-256 implementation always returns a 32-byte digest.
-    checksum.copy_from_slice(&second.as_ref()[..4]);
+    for (destination, byte) in checksum.iter_mut().zip(second.as_ref()) {
+        *destination = *byte;
+    }
     checksum
 }
 
@@ -539,12 +554,19 @@ mod tests {
                 )?)
                 .await?;
             let _ = read_message(&mut stream).await?;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Withhold verack until the probe times out and closes. A separate
+            // short fixture sleep can close the peer first on a busy runner.
+            let mut unexpected = [0_u8; 1];
+            if stream.read(&mut unexpected).await? != 0 {
+                bail!("probe sent unexpected data while waiting for verack");
+            }
             Result::<()>::Ok(())
         });
         let timeouts = ProbeTimeouts {
-            handshake: Duration::from_millis(20),
-            ..TEST_TIMEOUTS
+            // Allow scheduling of the successful version exchange even under
+            // CPU emulation; only the missing verack should cause this failure.
+            handshake: Duration::from_secs(1),
+            ..DEFAULT_TIMEOUTS
         };
 
         let error = probe_p2p_candidates_with_timeouts(&[endpoint], timeouts)
@@ -577,10 +599,7 @@ mod tests {
         drop(refused_listener);
         let (valid, server) = spawn_valid_server("127.0.0.1:0").await?;
 
-        assert_eq!(
-            probe_p2p_candidates_with_timeouts(&[refused, valid], TEST_TIMEOUTS).await?,
-            valid
-        );
+        assert_eq!(probe_p2p_candidates(&[refused, valid]).await?, valid);
         server.await.context("join fallback server")??;
         Ok(())
     }

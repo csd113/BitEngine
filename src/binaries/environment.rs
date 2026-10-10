@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub type BuildEnvironment = HashMap<String, String>;
+pub(super) type BuildEnvironment = HashMap<String, String>;
 
 const PASSTHROUGH_VARIABLES: &[&str] = &[
     "HOME",
@@ -26,7 +26,7 @@ const PASSTHROUGH_VARIABLES: &[&str] = &[
 ];
 
 #[must_use]
-pub fn build_environment() -> BuildEnvironment {
+pub(super) fn build_environment() -> BuildEnvironment {
     build_environment_from(|name| std::env::var(name).ok())
 }
 
@@ -108,7 +108,7 @@ fn build_environment_from(mut variable: impl FnMut(&str) -> Option<String>) -> B
 }
 
 #[must_use]
-pub fn bitcoin_environment(base: &BuildEnvironment) -> BuildEnvironment {
+pub(super) fn bitcoin_environment(base: &BuildEnvironment) -> BuildEnvironment {
     let mut environment = base.clone();
     let mut pkg_config_paths = [
         "/opt/homebrew/lib/pkgconfig",
@@ -143,7 +143,7 @@ pub fn bitcoin_environment(base: &BuildEnvironment) -> BuildEnvironment {
 }
 
 #[must_use]
-pub fn cargo_environment(base: &BuildEnvironment, target_dir: &Path) -> BuildEnvironment {
+pub(super) fn cargo_environment(base: &BuildEnvironment, target_dir: &Path) -> BuildEnvironment {
     let mut environment = base.clone();
     set_plain_output(&mut environment);
     environment.insert("TERM".to_owned(), "dumb".to_owned());
@@ -162,7 +162,7 @@ pub fn cargo_environment(base: &BuildEnvironment, target_dir: &Path) -> BuildEnv
 }
 
 #[must_use]
-pub fn find_in_path(tool: &str, environment: &BuildEnvironment) -> Option<PathBuf> {
+pub(super) fn find_in_path(tool: &str, environment: &BuildEnvironment) -> Option<PathBuf> {
     environment
         .get("PATH")?
         .split(':')

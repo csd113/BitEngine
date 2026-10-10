@@ -10,7 +10,7 @@ Built with Rust · Iced · Native desktop rendering
 
 Current release: `1.0.0`
 
-[![Rust](https://img.shields.io/badge/rust-1.99%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.99.0-orange?logo=rust)](https://www.rust-lang.org/)
 [![CI](https://github.com/csd113/BitEngine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/BitEngine/actions/workflows/ci.yml)
 [![Platform](https://img.shields.io/badge/platform-macOS%20arm64%20%7C%20Linux%20x64%2Farm64-blue)](#supported-platforms)
 [![Architecture](https://img.shields.io/badge/macos-Apple%20Silicon%20only-lightgrey)](#supported-platforms)
@@ -160,6 +160,7 @@ The Bitcoin utility entries above are the complete managed filename family; the 
 # Install Rust (skip if already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
+rustup toolchain install 1.99.0 --profile minimal --component clippy --component rustfmt
 
 # Supported release targets
 rustup target add aarch64-apple-darwin
@@ -167,32 +168,40 @@ rustup target add x86_64-unknown-linux-gnu
 rustup target add aarch64-unknown-linux-gnu
 ```
 
-Development and release builds use the Rust 1.99.0 pin in `rust-toolchain.toml`. CI also checks the latest `stable` compiler so future compiler and Clippy changes are reviewed before updating the release pin. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` also declares Rust 1.99 as the minimum supported Rust version (MSRV). Existing toolchains and the global rustup default need no changes.
+Development, quality gates, and release builds use exact Rust 1.99.0 from `rust-toolchain.toml`; `Cargo.toml` declares the same MSRV. The gate prints and verifies both compiler and Cargo versions, including environment overrides. CI additionally checks future `stable` compatibility. Advance the toolchain, MSRV, scripts, CI, release pins, and documentation together only after the complete gate passes. Existing toolchains and the global rustup default need no changes.
 
-> **Requires:** Rust 1.99 or newer (newer stable toolchains are supported). macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, Wayland/EGL, GTK 3).
+> **Requires:** Rust 1.99.0 for development validation and release packaging. macOS releases require Apple Silicon and macOS 12 Monterey or later. Linux builds need the native GUI development libraries used by `iced`/`rfd` (`libx11`, `libxkbcommon`, `libxkbcommon-x11`, Wayland/EGL, GTK 3). The X11 backend dynamically loads `libxkbcommon-x11` at runtime, so it must also be present on systems running the Linux release.
 
 ### Development build
 
 ```bash
-cargo build
+cargo build --locked
 ./target/debug/bitengine
 ```
 
-The GitHub Actions CI workflow runs:
+Contributors and coding agents must follow [the development standards](CONTRIBUTING.md)
+and [permanent lint policy](docs/lint-policy.md). Run the shared quality gate:
 
-- `cargo fmt --all --check`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace --all-features`
-- locked dependency resolution on the minimum supported Rust 1.99 toolchain
-- release build checks for macOS Apple Silicon, Linux x86_64, and Linux ARM64
+```bash
+./scripts/quality-gate.sh
+```
+
+It checks formatting, all targets/features, strict Clippy, tests, documentation
+with warnings denied, and a locked release build. CI and release packaging run
+the complete gate on macOS Apple Silicon, Linux x86_64, and Linux ARM64. Cargo
+also denies the configured compiler/Clippy diagnostics during ordinary local
+development; enforcement does not depend on remembering command-line flags.
 
 ### Release build (optimised)
 
 ```bash
-cargo build --release --target aarch64-apple-darwin
-cargo build --release --target x86_64-unknown-linux-gnu
-cargo build --release --target aarch64-unknown-linux-gnu
+cargo build --locked --release --target aarch64-apple-darwin
+cargo build --locked --release --target x86_64-unknown-linux-gnu
+cargo build --locked --release --target aarch64-unknown-linux-gnu
 ```
+
+Run the matching command on its native platform with GUI development libraries
+installed; adding a Rust target alone does not configure a cross-linker/sysroot.
 
 ### Bundle as a `.app`
 

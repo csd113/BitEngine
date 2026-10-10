@@ -9,6 +9,10 @@
     clippy::multiple_crate_versions,
     reason = "Iced, rfd, Arti, and their platform backends currently pull duplicate transitive crate versions"
 )]
+#![expect(
+    clippy::redundant_pub_crate,
+    reason = "unreachable_pub requires explicit internal API boundaries in this binary; Clippy otherwise suggests conflicting unrestricted pub visibility"
+)]
 
 mod binaries;
 mod bitcoin_config;
@@ -22,7 +26,7 @@ mod rpc;
 mod tor;
 mod ui;
 
-use std::{path::PathBuf, process};
+use std::path::PathBuf;
 
 use iced::{window, Size, Task};
 
@@ -30,7 +34,7 @@ fn main() -> iced::Result {
     // ── Single-instance guard ────────────────────────────────────────────────
     let Some(_lock) = platform::SingleInstanceGuard::acquire() else {
         // Another instance is already running — exit silently.
-        process::exit(0);
+        return Ok(());
     };
 
     // ── Resolve SSD / working root ───────────────────────────────────────────

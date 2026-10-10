@@ -65,38 +65,40 @@ const ELECTRS_LEGACY_OPENPGP_SIGNERS: &[&str] = &["15C8C3574AE4F1E25F3F35C587CAE
 
 /// Immutable inputs for one source build and installation.
 #[derive(Debug, Clone)]
-pub struct BuildRequest {
-    pub operation_id: BuildOperationId,
-    pub kind: BinaryKind,
-    pub version: ReleaseVersion,
-    pub binaries_dir: PathBuf,
-    pub workspace: PathBuf,
-    pub cores: usize,
-    pub keep_source: bool,
-    pub clean_build: bool,
-    pub verbose_output: bool,
+pub(crate) struct BuildRequest {
+    pub(crate) operation_id: BuildOperationId,
+    pub(crate) kind: BinaryKind,
+    pub(crate) version: ReleaseVersion,
+    pub(crate) binaries_dir: PathBuf,
+    pub(crate) workspace: PathBuf,
+    pub(crate) cores: usize,
+    pub(crate) keep_source: bool,
+    pub(crate) clean_build: bool,
+    pub(crate) verbose_output: bool,
 }
 
 /// Successful installation summary returned to the UI.
 #[derive(Debug, Clone)]
-pub struct BuildSummary {
-    pub kind: BinaryKind,
-    pub version: ReleaseVersion,
-    pub installed: Vec<String>,
-    pub log_path: PathBuf,
+pub(crate) struct BuildSummary {
+    pub(crate) kind: BinaryKind,
+    pub(crate) version: ReleaseVersion,
+    pub(crate) installed: Vec<String>,
+    pub(crate) log_path: PathBuf,
+    /// A post-installation diagnostic that does not invalidate the committed set.
+    pub(crate) warning: Option<String>,
 }
 
 /// A user-safe failure returned by a managed build.
 #[derive(Debug, Clone)]
-pub struct BuildFailure {
-    pub message: String,
-    pub cancelled: bool,
-    pub conflict: bool,
+pub(crate) struct BuildFailure {
+    pub(crate) message: String,
+    pub(crate) cancelled: bool,
+    pub(crate) conflict: bool,
 }
 
 /// Durable status stored in `BitEngine`'s configuration directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PersistedBuildStatus {
+pub(crate) enum PersistedBuildStatus {
     Running,
     Complete,
     Failed,
@@ -104,21 +106,23 @@ pub enum PersistedBuildStatus {
     Interrupted,
 }
 
-/// Durable state for the most recent build. Active jobs are converted to
-/// `Interrupted` when `BitEngine` starts again. A separate installation journal
+/// Durable state for the most recent build.
+///
+/// Active jobs are converted to `Interrupted` when `BitEngine` starts again.
+/// A separate installation journal
 /// then restores an uncommitted old set or finalizes a committed new set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedBuild {
-    pub id: String,
-    pub kind: BinaryKind,
-    pub version: ReleaseVersion,
-    pub stage: BuildStage,
-    pub status: PersistedBuildStatus,
-    pub started_at: u64,
-    pub updated_at: u64,
-    pub log_path: PathBuf,
-    pub error: Option<String>,
-    pub installed: Vec<String>,
+pub(crate) struct PersistedBuild {
+    pub(crate) id: String,
+    pub(crate) kind: BinaryKind,
+    pub(crate) version: ReleaseVersion,
+    pub(crate) stage: BuildStage,
+    pub(crate) status: PersistedBuildStatus,
+    pub(crate) started_at: u64,
+    pub(crate) updated_at: u64,
+    pub(crate) log_path: PathBuf,
+    pub(crate) error: Option<String>,
+    pub(crate) installed: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +139,7 @@ struct Coordinator {
 
 /// Cloneable backend handle used by the Iced update loop and build task.
 #[derive(Debug, Clone)]
-pub struct BuildService {
+pub(crate) struct BuildService {
     coordinator: Arc<Coordinator>,
     state_path: Arc<Path>,
     recovered: Arc<Option<PersistedBuild>>,
@@ -143,7 +147,7 @@ pub struct BuildService {
 
 impl BuildService {
     #[must_use]
-    pub fn new(state_path: PathBuf) -> Self {
+    pub(crate) fn new(state_path: PathBuf) -> Self {
         let recovered = recover_interrupted_job(&state_path);
         Self {
             coordinator: Arc::new(Coordinator::default()),
@@ -153,13 +157,19 @@ impl BuildService {
     }
 
     #[must_use]
-    pub fn recovered(&self) -> Option<PersistedBuild> {
+    pub(crate) fn recovered(&self) -> Option<PersistedBuild> {
         self.recovered.as_ref().clone()
     }
 
     /// Complete or roll back a durable binary transaction before inventory or
     /// node launch. Callers must block use of the destination if this fails.
-    pub fn ensure_installation_recovered(destination: &Path) -> std::result::Result<(), String> {
+    ///
+    /// # Errors
+    /// Returns the complete installation recovery diagnostic when safety checks,
+    /// destination locking, recovery, or durability operations fail.
+    pub(crate) fn ensure_installation_recovered(
+        destination: &Path,
+    ) -> std::result::Result<(), String> {
         recover_destination_installation(destination)
             .map(|_| ())
             .map_err(|error| format!("{error:#}"))
@@ -167,7 +177,7 @@ impl BuildService {
 
     /// Request safe cancellation of the active child process.
     #[must_use]
-    pub fn cancel_current(&self) -> bool {
+    pub(crate) fn cancel_current(&self) -> bool {
         self.coordinator
             .active
             .lock()
@@ -181,11 +191,16 @@ impl BuildService {
 
     /// Start exactly one build. The coordinator rejects any overlapping
     /// Bitcoin Core/electrs request before it can mutate the workspace.
+    ///
+    /// # Errors
+    /// Returns a classified conflict, cancellation, or build/install failure.
+    /// Failure after the transaction boundary is never reported as an unchanged
+    /// cancellation; successful installs retain post-commit log warnings.
     #[expect(
         clippy::too_many_lines,
         reason = "the build lifetime keeps preflight, durable status, cleanup, and terminal outcome ordering visible in one place"
     )]
-    pub async fn run(
+    pub(crate) async fn run(
         &self,
         mut request: BuildRequest,
         event_tx: mpsc::Sender<BuildEvent>,
@@ -297,7 +312,7 @@ impl BuildService {
             cleanup_current_job(&job_dir, &reporter).await;
         }
 
-        let outcome = match pipeline {
+        let mut outcome = match pipeline {
             Ok(installed) => {
                 persisted.status = PersistedBuildStatus::Complete;
                 persisted.stage = BuildStage::Complete;
@@ -323,6 +338,7 @@ impl BuildService {
                     version: request.version,
                     installed,
                     log_path,
+                    warning: None,
                 })
             }
             Err(error) => {
@@ -363,11 +379,10 @@ impl BuildService {
         };
 
         drop(reporter);
-        if let Ok(Err(error)) = log_writer.await {
-            // Installation is already complete or definitively failed at this
-            // point, so do not misreport it as rolled back. The next run will
-            // expose the retained state and bounded log path.
-            eprintln!("BitEngine build log could not be finalized: {error:#}");
+        match log_writer.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => record_log_failure(&mut outcome, &format!("{error:#}")),
+            Err(error) => record_log_failure(&mut outcome, &error.to_string()),
         }
         outcome
     }
@@ -400,6 +415,15 @@ impl BuildService {
             coordinator: Arc::clone(&self.coordinator),
         };
         Ok((active, permit))
+    }
+}
+
+/// Report a failed log finalization without misrepresenting a committed install.
+fn record_log_failure(outcome: &mut Result<BuildSummary, BuildFailure>, error: &str) {
+    let warning = format!("Build log could not be finalized: {error}");
+    match outcome {
+        Ok(summary) => summary.warning = Some(warning),
+        Err(failure) => failure.message = format!("{}\n{warning}", failure.message),
     }
 }
 
@@ -1367,7 +1391,6 @@ fn write_electrs_allowed_signers(job_dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn build_bitcoin(
     request: &BuildRequest,
     source: &Path,
@@ -1454,7 +1477,6 @@ async fn build_bitcoin(
     Ok(artifacts)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn build_electrs(
     request: &BuildRequest,
     source: &Path,
@@ -1823,8 +1845,15 @@ async fn write_build_log_with_limit(
             .unwrap_or(usize::MAX)
             .min(bytes.len());
         if accepted > 0 {
-            file.write_all(&bytes[..accepted]).await?;
-            written = written.saturating_add(accepted as u64);
+            file.write_all(
+                bytes
+                    .get(..accepted)
+                    .context("build log slice exceeded its message")?,
+            )
+            .await?;
+            written = written
+                .checked_add(u64::try_from(accepted).context("build log length exceeded u64")?)
+                .context("build log byte count overflowed")?;
         }
         if accepted < bytes.len() || written == data_limit {
             file.write_all(MARKER).await?;
@@ -2152,6 +2181,36 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("further output was discarded"));
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         Ok(())
+    }
+
+    #[test]
+    fn log_finalization_failure_preserves_the_installation_outcome() {
+        let mut success = Ok(BuildSummary {
+            kind: BinaryKind::Electrs,
+            version: "0.11.1".parse().expect("fixture release"),
+            installed: vec!["electrs".to_owned()],
+            log_path: PathBuf::from("/fixture/build.log"),
+            warning: None,
+        });
+        record_log_failure(&mut success, "fixture fsync failure");
+        let summary = success.expect("committed installation must remain successful");
+        assert_eq!(summary.installed, ["electrs"]);
+        assert!(summary
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("fixture fsync failure")));
+
+        let mut failure = Err(BuildFailure {
+            message: "Build cancelled".to_owned(),
+            cancelled: true,
+            conflict: false,
+        });
+        record_log_failure(&mut failure, "fixture writer join failure");
+        let failure = failure.expect_err("failed installation must remain failed");
+        assert!(failure.cancelled);
+        assert!(!failure.conflict);
+        assert!(failure.message.starts_with("Build cancelled\n"));
+        assert!(failure.message.contains("fixture writer join failure"));
     }
 
     #[tokio::test]

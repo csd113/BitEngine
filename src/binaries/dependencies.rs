@@ -22,7 +22,7 @@ use super::{
     process, BinaryKind, ReleaseVersion,
 };
 
-pub const MINIMUM_RUST: [u64; 3] = [1, 99, 0];
+pub(crate) const MINIMUM_RUST: [u64; 3] = [1, 99, 0];
 const MINIMUM_CLANG: [u64; 3] = [17, 0, 0];
 const MINIMUM_GCC: [u64; 3] = [12, 1, 0];
 const MINIMUM_CMAKE: [u64; 3] = [3, 22, 0];
@@ -36,7 +36,7 @@ const RUSTUP_INSTALLER_URL: &str = "https://sh.rustup.rs";
 static INSTALL_TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DependencyId {
+pub(crate) enum DependencyId {
     XcodeTools,
     Git,
     GnuPg,
@@ -73,7 +73,7 @@ impl DependencyId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DependencyState {
+pub(crate) enum DependencyState {
     Ready,
     Missing,
     Outdated,
@@ -81,7 +81,7 @@ pub enum DependencyState {
 
 impl DependencyState {
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Ready => "Ready",
             Self::Missing => "Missing",
@@ -91,13 +91,13 @@ impl DependencyState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DependencyItem {
-    pub id: DependencyId,
-    pub name: &'static str,
-    pub detected_version: Option<String>,
-    pub path: Option<PathBuf>,
-    pub state: DependencyState,
-    pub detail: Option<String>,
+pub(crate) struct DependencyItem {
+    pub(crate) id: DependencyId,
+    pub(crate) name: &'static str,
+    pub(crate) detected_version: Option<String>,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) state: DependencyState,
+    pub(crate) detail: Option<String>,
 }
 
 impl DependencyItem {
@@ -146,7 +146,7 @@ impl DependencyItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DependencyPlatform {
+pub(crate) enum DependencyPlatform {
     MacOs,
     Debian,
     Ubuntu,
@@ -156,12 +156,12 @@ pub enum DependencyPlatform {
 
 impl DependencyPlatform {
     #[must_use]
-    pub const fn supports_installation(&self) -> bool {
+    pub(crate) const fn supports_installation(&self) -> bool {
         matches!(self, Self::MacOs | Self::Debian | Self::Ubuntu)
     }
 
     #[must_use]
-    pub fn label(&self) -> &str {
+    pub(crate) fn label(&self) -> &str {
         match self {
             Self::MacOs => "macOS",
             Self::Debian => "Debian",
@@ -172,22 +172,22 @@ impl DependencyPlatform {
 }
 
 #[derive(Debug, Clone)]
-pub struct DependencyReport {
-    pub platform: DependencyPlatform,
-    pub items: Vec<DependencyItem>,
-    pub guidance: String,
+pub(crate) struct DependencyReport {
+    pub(crate) platform: DependencyPlatform,
+    pub(crate) items: Vec<DependencyItem>,
+    pub(crate) guidance: String,
 }
 
 impl DependencyReport {
     #[must_use]
-    pub fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         self.items
             .iter()
             .all(|item| item.state == DependencyState::Ready)
     }
 
     #[must_use]
-    pub fn issue_count(&self) -> usize {
+    pub(crate) fn issue_count(&self) -> usize {
         self.items
             .iter()
             .filter(|item| item.state != DependencyState::Ready)
@@ -195,7 +195,7 @@ impl DependencyReport {
     }
 
     #[must_use]
-    pub fn issue_summary(&self) -> String {
+    pub(crate) fn issue_summary(&self) -> String {
         self.items
             .iter()
             .filter(|item| item.state != DependencyState::Ready)
@@ -211,9 +211,9 @@ impl DependencyReport {
 }
 
 #[derive(Debug, Clone)]
-pub struct DependencyInstallOutcome {
-    pub report: DependencyReport,
-    pub message: String,
+pub(crate) struct DependencyInstallOutcome {
+    pub(crate) report: DependencyReport,
+    pub(crate) message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -244,7 +244,7 @@ enum RustManager {
     Missing,
 }
 
-pub async fn scan_all() -> DependencyReport {
+pub(crate) async fn scan_all() -> DependencyReport {
     let base_environment = environment::build_environment();
     let environment = environment::bitcoin_environment(&base_environment);
     let platform = current_platform();
@@ -252,7 +252,7 @@ pub async fn scan_all() -> DependencyReport {
     scan_selected(platform, &environment, &ids).await
 }
 
-pub async fn check(
+pub(crate) async fn check(
     kind: BinaryKind,
     version: &ReleaseVersion,
     environment: &BuildEnvironment,
@@ -269,7 +269,7 @@ pub async fn check(
     scan_selected(platform, environment, &ids).await
 }
 
-pub async fn install_required() -> DependencyInstallOutcome {
+pub(crate) async fn install_required() -> DependencyInstallOutcome {
     install_required_with(scan_all, attempt_install).await
 }
 

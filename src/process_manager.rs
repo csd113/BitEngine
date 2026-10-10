@@ -8,6 +8,9 @@
 //! interval so cleanup cannot be held open by an inherited writer. The UI
 //! drains the queues on a 100 ms timer (see `ui.rs`).
 
+// Sizes, counters, protocol values, and timeouts require explicit arithmetic.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::{
     collections::VecDeque,
     net::SocketAddr,
@@ -37,9 +40,9 @@ const MAX_BUFFERED_OUTPUT_BYTES: usize = 64 * 1024;
 // ── Thread-safe output queue ─────────────────────────────────────────────────
 
 /// Lines produced by a child process, drained by the UI every 100 ms.
-pub type OutputQueue = Arc<Mutex<VecDeque<String>>>;
+pub(super) type OutputQueue = Arc<Mutex<VecDeque<String>>>;
 
-pub fn new_queue() -> OutputQueue {
+pub(super) fn new_queue() -> OutputQueue {
     Arc::new(Mutex::new(VecDeque::new()))
 }
 
@@ -56,7 +59,7 @@ fn push_line(queue: &OutputQueue, line: String) {
 // ── ProcessHandle ────────────────────────────────────────────────────────────
 
 /// Owns a managed child process, its process group, and both output readers.
-pub struct ProcessHandle {
+pub(super) struct ProcessHandle {
     child: Option<Child>,
     process_group_id: Option<libc::pid_t>,
     stdout_reader: Option<JoinHandle<()>>,
@@ -79,7 +82,7 @@ impl ProcessHandle {
     }
 
     /// Returns `true` if the process is still alive.
-    pub fn is_running(&mut self) -> bool {
+    pub(super) fn is_running(&mut self) -> bool {
         let Some(child) = self.child.as_mut() else {
             return false;
         };
@@ -106,17 +109,17 @@ impl ProcessHandle {
 
     /// Take the bounded diagnostic retained after an unexpected child exit or
     /// supervision failure. Expected shutdown paths may ignore this value.
-    pub const fn take_exit_diagnostic(&mut self) -> Option<String> {
+    pub(super) const fn take_exit_diagnostic(&mut self) -> Option<String> {
         self.exit_diagnostic.take()
     }
 
     /// Gracefully terminate unless `force` requests immediate kill and reap.
-    pub fn terminate_interruptibly(&mut self, force: &AtomicBool) {
+    pub(super) fn terminate_interruptibly(&mut self, force: &AtomicBool) {
         self.terminate_with_grace_until(TERMINATION_GRACE_PERIOD, || force.load(Ordering::Acquire));
     }
 
     /// Immediately kill the owned process group and reap the direct child.
-    pub fn force_terminate(&mut self) {
+    pub(super) fn force_terminate(&mut self) {
         self.force_cleanup();
     }
 
@@ -146,7 +149,10 @@ impl ProcessHandle {
             platform::terminate_child(child);
         }
 
-        let deadline = Instant::now() + grace_period;
+        let Some(deadline) = Instant::now().checked_add(grace_period) else {
+            self.force_cleanup();
+            return;
+        };
         while Instant::now() < deadline {
             if should_force() {
                 self.force_cleanup();
@@ -176,9 +182,15 @@ impl ProcessHandle {
         let Some(process_group_id) = self.process_group_id else {
             return Ok(());
         };
+        let target = process_group_id.checked_neg().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid managed process group",
+            )
+        })?;
         // SAFETY: the id comes from a child successfully spawned into its own
         // process group. Negating it targets that complete owned group.
-        let result = unsafe { libc::kill(-process_group_id, signal) };
+        let result = unsafe { libc::kill(target, signal) };
         if result == 0 {
             return Ok(());
         }
@@ -206,10 +218,14 @@ impl ProcessHandle {
 
         // Take/disarm the group before signaling so Drop or another cleanup
         // call can never signal the same (potentially reused) id again.
-        if let Some(process_group_id) = self.process_group_id.take() {
+        if let Some(target) = self
+            .process_group_id
+            .take()
+            .and_then(libc::pid_t::checked_neg)
+        {
             // SAFETY: the id was captured from the managed child at spawn and
             // is consumed here exactly once.
-            let _ = unsafe { libc::kill(-process_group_id, libc::SIGKILL) };
+            let _ = unsafe { libc::kill(target, libc::SIGKILL) };
         }
 
         if let Some(mut child) = self.child.take() {
@@ -231,8 +247,8 @@ impl ProcessHandle {
     }
 
     fn join_readers(&mut self) {
-        let deadline = Instant::now() + READER_DRAIN_GRACE_PERIOD;
-        while Instant::now() < deadline
+        let deadline = Instant::now().checked_add(READER_DRAIN_GRACE_PERIOD);
+        while deadline.is_some_and(|deadline| Instant::now() < deadline)
             && [self.stdout_reader.as_ref(), self.stderr_reader.as_ref()]
                 .into_iter()
                 .flatten()
@@ -290,9 +306,12 @@ fn child_has_exited(child: &Child) -> std::io::Result<bool> {
         }
     }
 
-    // SAFETY: a successful `waitid` initialized `status`; si_pid is zero when
-    // WNOHANG found no waitable state change.
-    Ok(unsafe { status.assume_init().si_pid() } != 0)
+    // SAFETY: zeroed siginfo_t storage is valid, and successful waitid has
+    // completed before this value is read.
+    let status = unsafe { status.assume_init() };
+    // SAFETY: waitid reports a SIGCHLD layout; si_pid is zero when WNOHANG
+    // found no waitable state change.
+    Ok(unsafe { status.si_pid() } != 0)
 }
 
 impl Drop for ProcessHandle {
@@ -308,7 +327,11 @@ impl Drop for ProcessHandle {
 /// Launch `bitcoind` and stream its output into `queue`.
 ///
 /// Returns a handle to the spawned process and starts background reader threads.
-pub fn launch_bitcoind(
+///
+/// # Errors
+/// Rejects unsafe executable/data paths and reports spawn or reader creation
+/// failures. A partially constructed handle cleans up its owned process group.
+pub(super) fn launch_bitcoind(
     binaries_path: &Path,
     data_dir: &Path,
     rpc_port: u16,
@@ -365,15 +388,15 @@ pub fn launch_bitcoind(
 
 /// Bitcoin Core connection snapshot passed to one managed Electrs launch.
 #[derive(Clone, Copy)]
-pub struct ElectrsBitcoinConnection<'a> {
-    pub rpc_addr: SocketAddr,
-    pub p2p_addr: SocketAddr,
-    pub cookie_file: &'a Path,
+pub(super) struct ElectrsBitcoinConnection<'a> {
+    pub(super) rpc_addr: SocketAddr,
+    pub(super) p2p_addr: SocketAddr,
+    pub(super) cookie_file: &'a Path,
 }
 
 /// Launch `electrs` and stream its output into `queue`.
 #[cfg(test)]
-pub fn launch_electrs(
+pub(super) fn launch_electrs(
     binaries_path: &Path,
     bitcoin_data_dir: &Path,
     electrs_db_dir: &Path,
@@ -405,7 +428,11 @@ pub fn launch_electrs(
 ///
 /// LAN exposure cannot be requested with a wildcard or public address because
 /// [`ElectrsListenAddr`] is the only accepted boundary type.
-pub fn launch_electrs_with_listener(
+///
+/// # Errors
+/// Rejects unsafe executable or data paths and reports process/reader creation
+/// failures, cleaning up any partially constructed owned process.
+pub(super) fn launch_electrs_with_listener(
     binaries_path: &Path,
     bitcoin_data_dir: &Path,
     electrs_db_dir: &Path,
@@ -567,7 +594,11 @@ fn drain_output(
         match reader.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => {
-                buffered.extend_from_slice(&chunk[..read]);
+                let Some(received) = chunk.get(..read) else {
+                    push_line(queue, "Node output read exceeded its buffer.".to_owned());
+                    break;
+                };
+                buffered.extend_from_slice(received);
                 emit_complete_lines(&mut buffered, queue);
             }
             Err(error)
@@ -580,7 +611,7 @@ fn drain_output(
     }
 
     if !buffered.is_empty() {
-        push_line(queue, String::from_utf8_lossy(&buffered).into_owned());
+        push_line(queue, String::from_utf8_lossy_owned(buffered));
     }
 }
 
@@ -610,12 +641,28 @@ fn emit_output_prefix(
     if line.last() == Some(&b'\r') {
         line.pop();
     }
-    push_line(queue, String::from_utf8_lossy(&line).into_owned());
+    push_line(queue, String::from_utf8_lossy_owned(line));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_output_decoding_preserves_utf8_replacement_and_crlf() -> Result<()> {
+        let queue = new_queue();
+        let mut bytes = vec![b'a', b'\n', 0xff, b'\r', b'\n'];
+        emit_complete_lines(&mut bytes, &queue);
+        let lines = queue
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture output lock poisoned"))?;
+        assert_eq!(
+            lines.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["a", "\u{fffd}"]
+        );
+        assert_eq!(bytes, [0_u8; 0]);
+        Ok(())
+    }
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) -> Result<()> {
@@ -662,7 +709,9 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_process_exits(process_id: libc::pid_t) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(3))
+            .context("test deadline overflowed")?;
         while process_exists(process_id) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }
@@ -687,7 +736,9 @@ mod tests {
 
     #[cfg(unix)]
     fn wait_for_queue_line(queue: &OutputQueue, prefix: &str) -> Result<String> {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(3))
+            .context("test deadline overflowed")?;
         while Instant::now() < deadline {
             if let Ok(lines) = queue.lock() {
                 if let Some(line) = lines.iter().find(|line| line.starts_with(prefix)) {
@@ -701,7 +752,9 @@ mod tests {
 
     #[cfg(unix)]
     fn wait_for_file(path: &Path) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(3))
+            .context("test deadline overflowed")?;
         while !path.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }
@@ -801,7 +854,9 @@ mod tests {
     fn natural_exit_is_reaped_and_readers_are_joined() -> Result<()> {
         let (mut handle, queue) = spawn_shell("printf 'NATURAL_EXIT\\n'")?;
         let process_id = child_process_id(&handle)?;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(3))
+            .context("test deadline overflowed")?;
 
         while handle.is_running() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
@@ -821,7 +876,9 @@ mod tests {
     #[test]
     fn unexpected_exit_retains_a_bounded_actionable_diagnostic() -> Result<()> {
         let (mut handle, _) = spawn_shell("exit 7")?;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(3))
+            .context("test deadline overflowed")?;
         while handle.is_running() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
         }

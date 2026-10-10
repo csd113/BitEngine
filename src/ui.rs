@@ -75,11 +75,7 @@ const PENDING_PATH_SAVE_SETTINGS_MESSAGE: &str =
 // ── Message ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-#[expect(
-    private_interfaces,
-    reason = "Iced requires the application message type to be public, while Tor command payloads remain an internal implementation detail"
-)]
-pub enum Message {
+pub(super) enum Message {
     // ── Timer ticks ──────────────────────────────────────────────────────────
     /// 500 ms — drain process output queues into terminal buffers.
     OutputTick,
@@ -270,14 +266,14 @@ enum Page {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ConnectionMode {
+pub(super) enum ConnectionMode {
     #[default]
     Local,
     Tor,
 }
 
 impl ConnectionMode {
-    pub const ALL: [Self; 2] = [Self::Local, Self::Tor];
+    pub(super) const ALL: [Self; 2] = [Self::Local, Self::Tor];
 }
 
 impl std::fmt::Display for ConnectionMode {
@@ -290,7 +286,7 @@ impl std::fmt::Display for ConnectionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TorOperation {
+pub(super) enum TorOperation {
     Enable,
     Disable,
     Retry,
@@ -307,7 +303,7 @@ impl TorOperation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputPane {
+pub(super) enum OutputPane {
     Bitcoin,
     Electrs,
     Build,
@@ -661,7 +657,7 @@ impl BitcoinRpcStartup {
     clippy::struct_excessive_bools,
     reason = "UI process, synchronization, and independent RPC/P2P readiness facts must remain separately observable"
 )]
-pub struct App {
+pub(super) struct App {
     // ── Config ───────────────────────────────────────────────────────────────
     config: Config,
     #[cfg(test)]
@@ -754,7 +750,7 @@ pub struct App {
 }
 
 #[derive(Debug, Clone)]
-pub struct StatusPollResult {
+pub(super) struct StatusPollResult {
     identity: StatusPollIdentity,
     bitcoin_probe: Option<BitcoinProbeResult>,
     electrs_status: ElectrsStatus,
@@ -792,7 +788,7 @@ enum ManagedRpcReadiness {
 }
 
 impl App {
-    pub fn new(ssd_root: &Path) -> Self {
+    pub(super) fn new(ssd_root: &Path) -> Self {
         let (config, config_warning) = Config::load(ssd_root);
         Self::from_config(
             config,
@@ -801,7 +797,7 @@ impl App {
         )
     }
 
-    pub fn initial_task(&self) -> Task<Message> {
+    pub(super) fn initial_task(&self) -> Task<Message> {
         let initially_enabled = self.tor_runtime_requested;
         let config_file = Config::config_file_path();
         let start_tor_manager = Task::perform(
@@ -933,7 +929,7 @@ impl App {
 
     // ── update ────────────────────────────────────────────────────────────────
 
-    pub fn update(&mut self, message: Message) -> Task<Message> {
+    pub(super) fn update(&mut self, message: Message) -> Task<Message> {
         let task = match message {
             Message::OutputTick => self.handle_output_tick(),
             Message::RpcTick => self.handle_rpc_tick(),
@@ -1026,10 +1022,9 @@ impl App {
                 Task::none()
             }
         };
-        let mut tasks = vec![task];
-        tasks.extend(self.sync_tor_manager());
+        let tor_tasks = self.sync_tor_manager();
         self.refresh_connection_qr();
-        Task::batch(tasks)
+        Task::batch(std::iter::once(task).chain(tor_tasks))
     }
 
     fn pref(&mut self, message: PrefMsg) -> Task<Message> {
@@ -3248,6 +3243,10 @@ impl App {
                     summary.version,
                     summary.installed.join(", ")
                 ));
+                if let Some(warning) = summary.warning {
+                    self.binary_page.log_lines.push(warning.clone());
+                    self.overlay_message = Some(warning);
+                }
                 self.binary_page.error = None;
                 self.refresh_binary_info()
             }
@@ -3385,7 +3384,7 @@ impl App {
 
     // ── subscription ──────────────────────────────────────────────────────────
 
-    pub fn subscription(_: &Self) -> Subscription<Message> {
+    pub(super) fn subscription(_: &Self) -> Subscription<Message> {
         Subscription::batch([
             time::every(OUTPUT_POLL_INTERVAL).map(|_| Message::OutputTick),
             time::every(Duration::from_secs(5)).map(|_| Message::RpcTick),
@@ -3407,11 +3406,11 @@ impl App {
         ])
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
+    pub(super) fn view(&self) -> Element<'_, Message> {
         ui_render::view(self)
     }
 
-    pub const fn theme(&self) -> iced::Theme {
+    pub(super) const fn theme(&self) -> iced::Theme {
         match self.config.theme_preference {
             ThemePreference::Light => iced::Theme::Light,
             ThemePreference::Dark => iced::Theme::Dark,
@@ -6041,6 +6040,32 @@ mod tests {
         assert!(!app.binary_page.can_cancel());
         app.binary_page.stage = Some(BuildStage::Complete);
         assert!(!app.binary_page.can_cancel());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_build_log_warning_reaches_the_gui_without_changing_success() -> anyhow::Result<()>
+    {
+        let temporary = tempfile::tempdir()?;
+        let mut app = test_app(temporary.path());
+        let operation_id = BuildOperationId(6);
+        activate_build(&mut app, operation_id, BinaryKind::Electrs);
+        let warning = "Build log could not be finalized: fixture fsync failure";
+        drop(app.apply_build_finished(
+            operation_id,
+            Ok(BuildSummary {
+                kind: BinaryKind::Electrs,
+                version: "0.11.1".parse().map_err(anyhow::Error::msg)?,
+                installed: vec!["electrs".to_owned()],
+                log_path: temporary.path().join("build.log"),
+                warning: Some(warning.to_owned()),
+            }),
+        ));
+        assert_eq!(app.binary_page.stage, Some(BuildStage::Complete));
+        assert!(app.binary_page.success.is_some());
+        assert!(app.binary_page.error.is_none());
+        assert_eq!(app.overlay_message.as_deref(), Some(warning));
+        assert!(app.binary_page.log_lines.iter().any(|line| line == warning));
         Ok(())
     }
 

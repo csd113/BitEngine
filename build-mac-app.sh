@@ -14,6 +14,7 @@ APP_DIR="${APP_NAME}.app"
 INFO_PLIST="${APP_DIR}/Contents/Info.plist"
 REMOVABLE_VOLUMES_USAGE_DESCRIPTION="BitEngine needs access to removable volumes containing your configured node binaries and data."
 
+./scripts/check-rust-toolchain.sh
 cargo build --locked --release --target "${TARGET}"
 
 mkdir -p "${APP_DIR}/Contents/MacOS"
@@ -54,7 +55,7 @@ cat > "${INFO_PLIST}" <<EOF
     <string>APPL</string>
 
     <key>LSMinimumSystemVersion</key>
-    <string>10.13</string>
+    <string>12.0</string>
 
     <key>NSRemovableVolumesUsageDescription</key>
     <string>${REMOVABLE_VOLUMES_USAGE_DESCRIPTION}</string>

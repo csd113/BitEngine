@@ -2,6 +2,9 @@
 //!
 //! Stored as JSON in the platform config directory resolved by `directories`.
 
+// Sizes, counters, protocol values, and timeouts require explicit arithmetic.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
@@ -20,11 +23,11 @@ const LEGACY_APP_NAME: &str = "BitcoinNodeManager";
 const CONFIG_FILENAME: &str = "config.json";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 static TEMPORARY_FILE_ID: AtomicU64 = AtomicU64::new(0);
-pub const DEFAULT_ELECTRS_METRICS_ADDR: &str = "127.0.0.1:4224";
+pub(super) const DEFAULT_ELECTRS_METRICS_ADDR: &str = "127.0.0.1:4224";
 
 /// User-facing parallelism presets for native source builds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BuildPerformance {
+pub(super) enum BuildPerformance {
     Low,
     #[default]
     Balanced,
@@ -34,7 +37,7 @@ pub enum BuildPerformance {
 impl BuildPerformance {
     /// Map a friendly preset to the worker count accepted by `CMake` or Cargo.
     #[must_use]
-    pub fn jobs(self, kind: BinaryKind, available: usize) -> usize {
+    pub(super) fn jobs(self, kind: BinaryKind, available: usize) -> usize {
         let available = available.clamp(1, 64);
         match self {
             Self::Low => (available / 4).clamp(1, 4),
@@ -59,20 +62,20 @@ impl std::fmt::Display for BuildPerformance {
 
 /// Persistent settings exposed by Binaries → Advanced.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BuildSettings {
+pub(super) struct BuildSettings {
     #[serde(default)]
-    pub performance: BuildPerformance,
+    pub(super) performance: BuildPerformance,
     #[serde(default)]
-    pub keep_source: bool,
+    pub(super) keep_source: bool,
     #[serde(default)]
-    pub clean_build: bool,
+    pub(super) clean_build: bool,
     #[serde(default)]
-    pub verbose_output: bool,
+    pub(super) verbose_output: bool,
 }
 
 /// User-selectable application color scheme.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ThemePreference {
+pub(super) enum ThemePreference {
     /// Follow the operating system appearance.
     #[default]
     System,
@@ -84,7 +87,7 @@ pub enum ThemePreference {
 
 impl ThemePreference {
     /// Values displayed by the compact theme selector.
-    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+    pub(super) const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
 }
 
 impl std::fmt::Display for ThemePreference {
@@ -99,33 +102,33 @@ impl std::fmt::Display for ThemePreference {
 
 /// All persisted settings for the node manager.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
+pub(super) struct Config {
     /// Directory containing `bitcoind`, `bitcoin-cli`, `electrs`, etc.
-    pub binaries_path: PathBuf,
+    pub(super) binaries_path: PathBuf,
     /// Bitcoin data directory (holds `bitcoin.conf`, chainstate, blocks).
-    pub bitcoin_data_path: PathBuf,
+    pub(super) bitcoin_data_path: PathBuf,
     /// Electrs database directory.
-    pub electrs_data_path: PathBuf,
+    pub(super) electrs_data_path: PathBuf,
     /// Advanced native build settings.
     #[serde(default)]
-    pub build_settings: BuildSettings,
+    pub(super) build_settings: BuildSettings,
     /// Application appearance; defaults to the operating system preference.
     #[serde(default)]
-    pub theme_preference: ThemePreference,
+    pub(super) theme_preference: ThemePreference,
     /// Allow electrs to accept deliberately configured local-network clients.
     #[serde(default)]
-    pub local_network_access: bool,
+    pub(super) local_network_access: bool,
     /// Publish the electrs endpoint through `BitEngine`'s embedded Tor service.
     #[serde(default)]
-    pub tor_enabled: bool,
+    pub(super) tor_enabled: bool,
     /// Start an enabled Tor service when `BitEngine` launches.
     #[serde(default)]
-    pub tor_auto_start: bool,
+    pub(super) tor_auto_start: bool,
 }
 
 impl Config {
     /// Load from disk, falling back to sensible defaults derived from `ssd_root`.
-    pub fn load(ssd_root: &Path) -> (Self, Option<String>) {
+    pub(super) fn load(ssd_root: &Path) -> (Self, Option<String>) {
         let defaults = Self::defaults(ssd_root);
         let path = Self::config_file_path();
 
@@ -162,7 +165,11 @@ impl Config {
     }
 
     /// Persist the current config to disk.
-    pub fn save(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// Returns an error for invalid/overlapping paths, unsafe config storage,
+    /// serialization failure, or failed atomic persistence and directory sync.
+    pub(super) fn save(&self) -> Result<()> {
         self.validate_paths()?;
         self.save_after_path_validation()
     }
@@ -171,7 +178,11 @@ impl Config {
     /// probes on the UI thread. The path strings still receive the same lexical
     /// validation, while startup/path changes perform full live validation in a
     /// background recovery worker before any configured destination is used.
-    pub(crate) fn save_preferences(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// Returns an error for invalid path syntax, unsafe config storage, or failed
+    /// serialization, atomic replacement, or durability operations.
+    pub(super) fn save_preferences(&self) -> Result<()> {
         self.validate_paths_lexically()?;
         self.save_after_path_validation()
     }
@@ -187,7 +198,11 @@ impl Config {
 
     /// Validate persisted paths before they can drive directory creation,
     /// source cleanup, or binary installation.
-    pub fn validate_paths(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// Rejects relative, root-adjacent, traversing, overlapping, symlinked, or
+    /// non-directory destinations, including overlap revealed by canonicalization.
+    pub(super) fn validate_paths(&self) -> Result<()> {
         self.validate_paths_lexically()?;
         for (label, path) in [
             ("binaries", &self.binaries_path),
@@ -214,7 +229,10 @@ impl Config {
 
     /// Validate path syntax and lexical separation without touching configured
     /// storage. This is safe during pre-window config parsing.
-    pub(crate) fn validate_paths_lexically(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// Rejects unsafe path syntax and lexical overlap with node data or build storage.
+    pub(super) fn validate_paths_lexically(&self) -> Result<()> {
         for (label, path) in [
             ("binaries", &self.binaries_path),
             ("Bitcoin data", &self.bitcoin_data_path),
@@ -234,7 +252,7 @@ impl Config {
     }
 
     /// Path to the JSON config file on this platform.
-    pub fn config_file_path() -> PathBuf {
+    pub(super) fn config_file_path() -> PathBuf {
         ProjectDirs::from("", "", crate::platform::APP_NAME).map_or_else(
             || dirs_fallback(crate::platform::APP_NAME).join(CONFIG_FILENAME),
             |proj| proj.config_dir().join(CONFIG_FILENAME),
@@ -242,7 +260,7 @@ impl Config {
     }
 
     /// Durable state for the most recent native binary build.
-    pub fn build_state_file_path() -> PathBuf {
+    pub(super) fn build_state_file_path() -> PathBuf {
         Self::config_file_path().with_file_name("build-job.json")
     }
 
@@ -253,13 +271,13 @@ impl Config {
         )
     }
 
-    pub fn electrs_metrics_url() -> String {
+    pub(super) fn electrs_metrics_url() -> String {
         format!("http://{DEFAULT_ELECTRS_METRICS_ADDR}/metrics")
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    pub(crate) fn defaults(ssd_root: &Path) -> Self {
+    pub(super) fn defaults(ssd_root: &Path) -> Self {
         Self {
             binaries_path: ssd_root.join("Binaries"),
             bitcoin_data_path: ssd_root.join("BitcoinChain"),
@@ -360,8 +378,9 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 }
 
 fn validate_disjoint_paths(paths: &[(&str, &Path)]) -> Result<()> {
-    for (index, (left_label, left)) in paths.iter().enumerate() {
-        for (right_label, right) in &paths[index + 1..] {
+    let mut remaining = paths.iter();
+    while let Some((left_label, left)) = remaining.next() {
+        for (right_label, right) in remaining.clone() {
             if paths_overlap(left, right) {
                 anyhow::bail!(
                     "{left_label} and {right_label} paths must not overlap ({} and {})",
@@ -375,8 +394,9 @@ fn validate_disjoint_paths(paths: &[(&str, &Path)]) -> Result<()> {
 }
 
 fn validate_resolved_disjoint_paths(paths: &[(&str, &Path)]) -> Result<()> {
-    for (index, (left_label, left)) in paths.iter().enumerate() {
-        for (right_label, right) in &paths[index + 1..] {
+    let mut remaining = paths.iter();
+    while let Some((left_label, left)) = remaining.next() {
+        for (right_label, right) in remaining.clone() {
             if paths_overlap(left, right) {
                 anyhow::bail!(
                     "{left_label} and {right_label} paths resolve to overlapping locations ({} and {})",

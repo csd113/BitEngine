@@ -3,6 +3,9 @@
 //! Managed launches use the exact cookie path and numeric endpoint snapshotted
 //! for the active Bitcoin lifecycle generation.
 
+// Sizes, counters, protocol values, and timeouts require explicit arithmetic.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::{
     fs::OpenOptions,
     io::{Read as _, Write as _},
@@ -19,11 +22,15 @@ use serde_json::Value;
 use thiserror::Error;
 
 const MAX_COOKIE_BYTES: u64 = 4096;
+const MAX_RPC_RESPONSE_BYTES: usize = 1024 * 1024;
 const RPC_IN_WARMUP: i64 = -28;
 
 /// Lazily-built HTTP client (one per poll cycle is fine; keep it cheap).
 fn http_client() -> Result<Client> {
     Client::builder()
+        // Managed RPC credentials belong only to the snapshotted local socket,
+        // never to a proxy inherited from the application's environment.
+        .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()
         .context("build reqwest client")
@@ -81,7 +88,7 @@ struct RpcAuthenticationError;
 
 /// Return Bitcoin Core's startup status when an RPC call failed with
 /// `RPC_IN_WARMUP` (`-28`).
-pub fn rpc_warmup_message(error: &anyhow::Error) -> Option<&str> {
+pub(super) fn rpc_warmup_message(error: &anyhow::Error) -> Option<&str> {
     error
         .downcast_ref::<RpcResponseError>()
         .filter(|response| response.code == RPC_IN_WARMUP)
@@ -91,7 +98,7 @@ pub fn rpc_warmup_message(error: &anyhow::Error) -> Option<&str> {
 /// Return whether an RPC failure is expected while the managed service and its
 /// cookie are first becoming reachable. Protocol, authentication, and response
 /// validation errors are deliberately excluded.
-pub fn is_transient_startup_error(error: &anyhow::Error) -> bool {
+pub(super) fn is_transient_startup_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RpcTransportError>().is_some()
         || matches!(
             error.downcast_ref::<ManagedCookieError>(),
@@ -101,34 +108,47 @@ pub fn is_transient_startup_error(error: &anyhow::Error) -> bool {
 
 /// Parsed result of `getblockchaininfo`.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct BlockchainInfo {
-    pub blocks: u64,
-    pub headers: u64,
-    pub verification_progress: f64,
-    pub initial_block_download: bool,
-    pub pruned: bool,
+pub(super) struct BlockchainInfo {
+    pub(super) blocks: u64,
+    pub(super) headers: u64,
+    pub(super) verification_progress: f64,
+    pub(super) initial_block_download: bool,
+    pub(super) pruned: bool,
 }
 
 /// Parsed result of `getnetworkinfo` fields required by managed Electrs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NetworkInfo {
-    pub version: u64,
-    pub network_active: bool,
+pub(super) struct NetworkInfo {
+    pub(super) version: u64,
+    pub(super) network_active: bool,
 }
 
 // ── Authentication ────────────────────────────────────────────────────────────
 
 /// Authentication credentials for Bitcoin RPC.
-#[derive(Debug, Clone)]
-pub struct RpcAuth {
-    pub user: String,
-    pub password: String,
-    pub endpoint: SocketAddr,
+#[derive(Clone)]
+pub(super) struct RpcAuth {
+    user: String,
+    password: String,
+    pub(super) endpoint: SocketAddr,
+}
+
+impl std::fmt::Debug for RpcAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RpcAuth")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RpcAuth {
     /// Load the exact cookie and socket owned by the current managed launch.
-    pub fn from_managed_cookie(cookie_file: &Path, endpoint: SocketAddr) -> Result<Self> {
+    ///
+    /// # Errors
+    /// Returns a classified error if the cookie is missing, non-regular,
+    /// oversized, unreadable, or malformed. Cookie contents are never reported.
+    pub(super) fn from_managed_cookie(cookie_file: &Path, endpoint: SocketAddr) -> Result<Self> {
         let contents = read_bounded_regular(cookie_file, MAX_COOKIE_BYTES)?;
         let (user, password) = contents
             .trim()
@@ -196,8 +216,12 @@ fn read_bounded_regular(
 
 // ── RPC call ─────────────────────────────────────────────────────────────────
 
-/// Make a single synchronous-style async RPC call.
-pub async fn call(auth: &RpcAuth, method: &str, params: Value) -> Result<Value> {
+/// Make one asynchronous RPC call with a five-second timeout and a 1 MiB body limit.
+///
+/// # Errors
+/// Returns transport, authentication, bounded-response, JSON decoding, or Core
+/// RPC errors. Core warmup errors retain their code for startup retry decisions.
+pub(super) async fn call(auth: &RpcAuth, method: &str, params: Value) -> Result<Value> {
     let client = http_client()?;
     let url = format!("http://{}/", auth.endpoint);
 
@@ -208,7 +232,7 @@ pub async fn call(auth: &RpcAuth, method: &str, params: Value) -> Result<Value> 
         params,
     };
 
-    let resp = client
+    let mut resp = client
         .post(&url)
         .basic_auth(&auth.user, Some(&auth.password))
         .json(&req)
@@ -221,7 +245,19 @@ pub async fn call(auth: &RpcAuth, method: &str, params: Value) -> Result<Value> 
         return Err(RpcAuthenticationError.into());
     }
 
-    let rpc_resp: RpcResponse = resp.json().await.context("parse RPC response")?;
+    if resp.content_length().is_some_and(|length| {
+        usize::try_from(length).map_or(true, |length| length > MAX_RPC_RESPONSE_BYTES)
+    }) {
+        bail!("RPC response exceeded {MAX_RPC_RESPONSE_BYTES} bytes");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("read RPC response")? {
+        if body.len().saturating_add(chunk.len()) > MAX_RPC_RESPONSE_BYTES {
+            bail!("RPC response exceeded {MAX_RPC_RESPONSE_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let rpc_resp: RpcResponse = serde_json::from_slice(&body).context("parse RPC response")?;
 
     if let Some(err) = rpc_resp.error {
         return Err(err.into());
@@ -231,7 +267,10 @@ pub async fn call(auth: &RpcAuth, method: &str, params: Value) -> Result<Value> 
 }
 
 /// Call `getblockchaininfo` and return parsed data.
-pub async fn get_blockchain_info(auth: &RpcAuth) -> Result<BlockchainInfo> {
+///
+/// # Errors
+/// Returns an RPC failure or an error for missing or incorrectly typed chain fields.
+pub(super) async fn get_blockchain_info(auth: &RpcAuth) -> Result<BlockchainInfo> {
     let v = call(auth, "getblockchaininfo", Value::Array(vec![])).await?;
     parse_blockchain_info(&v)
 }
@@ -257,7 +296,10 @@ fn parse_blockchain_info(v: &Value) -> Result<BlockchainInfo> {
 }
 
 /// Call `getnetworkinfo` and retain the compatibility fields Electrs checks.
-pub async fn get_network_info(auth: &RpcAuth) -> Result<NetworkInfo> {
+///
+/// # Errors
+/// Returns an RPC failure or an error for missing or incorrectly typed network fields.
+pub(super) async fn get_network_info(auth: &RpcAuth) -> Result<NetworkInfo> {
     let v = call(auth, "getnetworkinfo", Value::Array(vec![])).await?;
     parse_network_info(&v)
 }
@@ -274,7 +316,10 @@ fn parse_network_info(v: &Value) -> Result<NetworkInfo> {
 }
 
 /// Send the `stop` RPC command.
-pub async fn stop_bitcoind(auth: &RpcAuth) -> Result<()> {
+///
+/// # Errors
+/// Returns the underlying RPC failure; callers retain responsibility for shutdown fallback.
+pub(super) async fn stop_bitcoind(auth: &RpcAuth) -> Result<()> {
     call(auth, "stop", Value::Array(vec![])).await?;
     Ok(())
 }
@@ -282,7 +327,11 @@ pub async fn stop_bitcoind(auth: &RpcAuth) -> Result<()> {
 // ── Default bitcoin.conf generator ───────────────────────────────────────────
 
 /// Create a minimal `bitcoin.conf` if one doesn't exist yet.
-pub fn ensure_bitcoin_conf(data_dir: &Path) -> Result<()> {
+///
+/// # Errors
+/// Returns an error for unsafe paths or any creation, write, or durability failure.
+/// An existing regular configuration is preserved.
+pub(super) fn ensure_bitcoin_conf(data_dir: &Path) -> Result<()> {
     let data_dir =
         crate::platform::prepare_real_directory(data_dir, "Bitcoin data directory", true)?;
     let conf_path = data_dir.join("bitcoin.conf");
@@ -328,6 +377,245 @@ pub fn ensure_bitcoin_conf(data_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn read_mock_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidData);
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 512];
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.len() > 4096 {
+                return Err(invalid());
+            }
+            let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&request[..header_end]).map_err(|_| invalid())?;
+            let length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .ok_or_else(invalid)?
+                .1
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| invalid())?;
+            let total = header_end
+                .checked_add(4)
+                .and_then(|headers| headers.checked_add(length))
+                .filter(|total| *total <= 4096)
+                .ok_or_else(invalid)?;
+            if request.len() >= total {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn mock_rpc_response(
+        response: Vec<u8>,
+    ) -> Result<(RpcAuth, tokio::task::JoinHandle<std::io::Result<()>>)> {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let endpoint = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            // Consume the complete request before closing the response side;
+            // an unread request body can otherwise cause a TCP reset.
+            read_mock_request(&mut stream).await?;
+            match stream.write_all(&response).await {
+                // A rejected oversized body can close the connection while
+                // this fixture is still writing its deliberately invalid data.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    Ok(())
+                }
+                result => result,
+            }
+        });
+        Ok((
+            RpcAuth {
+                user: "fixture-user".to_owned(),
+                password: "fixture-password".to_owned(),
+                endpoint,
+            },
+            server,
+        ))
+    }
+
+    #[tokio::test]
+    async fn rpc_response_limits_cover_declared_and_streamed_lengths() -> Result<()> {
+        let oversized_length = MAX_RPC_RESPONSE_BYTES.saturating_add(1);
+        let declared = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {oversized_length}\r\nConnection: close\r\n\r\n"
+        );
+        let mut streamed = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{oversized_length:x}\r\n"
+        );
+        streamed.push_str(&"x".repeat(oversized_length));
+        streamed.push_str("\r\n0\r\n\r\n");
+        for response in [declared, streamed] {
+            let (auth, server) = mock_rpc_response(response.into_bytes()).await?;
+            let error = call(&auth, "getblockchaininfo", json!([]))
+                .await
+                .expect_err("oversized RPC response must fail closed");
+            assert!(error.to_string().contains("RPC response exceeded"));
+            assert!(!is_transient_startup_error(&error));
+            server.await??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_rpc_responses_preserve_success_warmup_and_authentication_errors() -> Result<()>
+    {
+        enum Outcome {
+            Success,
+            Warmup,
+            Authentication,
+        }
+        for (status, body, expected) in [
+            (
+                "200 OK",
+                r#"{"result":42,"error":null,"id":"bnm"}"#,
+                Outcome::Success,
+            ),
+            (
+                "500 Internal Server Error",
+                r#"{"result":null,"error":{"code":-28,"message":"Loading block index"},"id":"bnm"}"#,
+                Outcome::Warmup,
+            ),
+            ("401 Unauthorized", "", Outcome::Authentication),
+        ] {
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (auth, server) = mock_rpc_response(response.into_bytes()).await?;
+            let result = call(&auth, "getblockchaininfo", json!([])).await;
+            match expected {
+                Outcome::Success => assert_eq!(result?, json!(42)),
+                Outcome::Warmup => assert_eq!(
+                    rpc_warmup_message(&result.expect_err("warmup must remain an error")),
+                    Some("Loading block index")
+                ),
+                Outcome::Authentication => assert!(result
+                    .expect_err("authentication must remain an error")
+                    .downcast_ref::<RpcAuthenticationError>()
+                    .is_some()),
+            }
+            server.await??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rpc_timeout_retains_the_transport_error_without_leaking_credentials() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let auth = RpcAuth {
+            user: "fixture-user".to_owned(),
+            password: "fixture-password".to_owned(),
+            endpoint: listener.local_addr()?,
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            read_mock_request(&mut stream).await?;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+            Ok::<(), std::io::Error>(())
+        });
+        let result = call(&auth, "getblockchaininfo", json!([])).await;
+        server.abort();
+        assert!(server
+            .await
+            .expect_err("fixture server was aborted")
+            .is_cancelled());
+        let error = result.expect_err("an unresponsive RPC peer must time out");
+        assert!(is_transient_startup_error(&error));
+        assert!(error
+            .downcast_ref::<RpcTransportError>()
+            .is_some_and(|error| error.source.is_timeout()));
+        let diagnostic = format!("{error:#}");
+        assert!(!diagnostic.contains(&auth.user));
+        assert!(!diagnostic.contains(&auth.password));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_rpc_ignores_proxy_environment() -> Result<()> {
+        const FIXTURE_ENDPOINT: &str = "BITENGINE_TEST_RPC_PROXY_ENDPOINT";
+        if let Ok(endpoint) = std::env::var(FIXTURE_ENDPOINT) {
+            let endpoint: SocketAddr = endpoint.parse()?;
+            anyhow::ensure!(
+                endpoint.ip().is_loopback(),
+                "fixture endpoint must be local"
+            );
+            let auth = RpcAuth {
+                user: "fixture-user".to_owned(),
+                password: "fixture-password".to_owned(),
+                endpoint,
+            };
+            assert_eq!(
+                call(&auth, "getblockchaininfo", json!([])).await?,
+                json!(42)
+            );
+            return Ok(());
+        }
+
+        let body = r#"{"result":42,"error":null,"id":"bnm"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (auth, server) = mock_rpc_response(response.into_bytes()).await?;
+        let proxy = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        proxy.set_nonblocking(true)?;
+        let proxy_url = format!("http://{}", proxy.local_addr()?);
+        // Isolate proxy settings in a child test process; global environment
+        // mutation would race with the rest of the network fixture suite.
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "rpc::tests::managed_rpc_ignores_proxy_environment",
+                ])
+                .env(FIXTURE_ENDPOINT, auth.endpoint.to_string())
+                .env("HTTP_PROXY", &proxy_url)
+                .env("http_proxy", &proxy_url)
+                .env("ALL_PROXY", &proxy_url)
+                .env("all_proxy", &proxy_url)
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .env_remove("REQUEST_METHOD")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .context("proxy fixture process timed out")??;
+        if !output.status.success() {
+            server.abort();
+            let _ = server.await;
+            bail!(
+                "proxy fixture failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        server.await??;
+        assert!(
+            matches!(proxy.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "managed RPC must never connect to the environment proxy"
+        );
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -398,6 +686,10 @@ mod tests {
         assert_eq!(auth.user, "managed-user");
         assert_eq!(auth.password, "managed-password");
         assert_eq!(auth.endpoint, endpoint);
+        let diagnostic = format!("{auth:?}");
+        assert!(diagnostic.contains("[::1]:18443"));
+        assert!(!diagnostic.contains("managed-user"));
+        assert!(!diagnostic.contains("managed-password"));
 
         let target = temporary.path().join("target-cookie");
         let alias = temporary.path().join("alias-cookie");
