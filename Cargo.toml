@@ -2,7 +2,7 @@
 name = "bitengine"
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.97.1"
+rust-version = "1.99.0"
 description = "BitEngine GUI for Bitcoin Core and Electrs"
 license = "MIT"
 repository = "https://github.com/csd113/BitEngine"
@@ -30,8 +30,40 @@ iced = { version = "0.14", default-features = false, features = [
     "x11",
 ] }
 
+# Encode connection QR matrices directly. Iced's canvas-backed QR widget does
+# not render with the Tiny-Skia backend used by BitEngine on macOS; drawing the
+# encoded cells as ordinary renderer quads keeps the software-rendered UI
+# scannable without adding another package to the dependency graph.
+qrcode = { version = "0.14", default-features = false }
+
 # Async runtime (iced tokio feature drives the executor)
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# Embedded Tor client and v3 onion service with a BitEngine-owned fixed-port
+# proxy. Arti 0.47 requires Rust 1.92; BitEngine builds with Rust 1.99.
+# Congestion control is always enabled.
+# Use rustls so no system Tor daemon or native TLS installation is required.
+arti-client = { version = "0.47", default-features = false, features = [
+    "onion-service-service",
+    "rustls",
+    "static-sqlite",
+    "tokio",
+    "vanguards",
+] }
+fs-mistrust = "0.16"
+futures = "0.3"
+futures-copy = "0.5"
+safelog = "0.10"
+tor-cell = "0.47"
+tor-hsservice = "0.47"
+tor-proto = { version = "0.47", default-features = false, features = [
+    "hs-service",
+] }
+tor-rtcompat = { version = "0.47", default-features = false, features = [
+    "rustls",
+    "tokio",
+] }
 
 # HTTP client for Bitcoin JSON-RPC calls
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
@@ -62,6 +94,13 @@ iced_runtime = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
+tor-keymgr = "0.47"
+
+[patch.crates-io]
+# Arti 0.47.0 accidentally discards still-valid onion-service introduction-point
+# publication records and retains expired ones. Keep this exact release vendored
+# with the predicate corrected until the upstream crate publishes a fix.
+tor-hsservice = { path = "vendor/tor-hsservice" }
 
 [profile.release]
 opt-level     = 3
@@ -71,3 +110,77 @@ strip         = true
 
 [profile.release.build-override]
 opt-level = 3
+
+# This is one first-party executable, not a multi-crate workspace. The patched
+# upstream tor-hsservice crate retains its own lint policy and provenance.
+[lints.rust]
+warnings = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+dead_code_pub_in_binary = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
+raw_borrows_via_references = "deny"
+unexpected_cfgs = "deny"
+unreachable_pub = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+# Recoverable production failures must preserve context and unwind resources.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+exit = "deny"
+missing_assert_message = "deny"
+# GUI diagnostics belong in the bounded service log or an explicit error path.
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Input-derived bounds, numeric values, and OS calls require explicit invariants.
+indexing_slicing = "deny"
+as_conversions = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+cast_precision_loss = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unnecessary_safety_comment = "deny"
+string_slice = "deny"
+suspicious_xor_used_as_pow = "deny"
+precedence_bits = "deny"
+as_pointer_underscore = "deny"
+as_underscore = "deny"
+fn_to_numeric_cast_any = "deny"
+default_union_representation = "deny"
+host_endian_bytes = "deny"
+pointer_format = "deny"
+# Keep ownership visible and prevent silent resource or diagnostic loss.
+clone_on_ref_ptr = "deny"
+mem_forget = "deny"
+rc_mutex = "deny"
+unused_result_ok = "deny"
+unused_trait_names = "deny"
+map_with_unused_argument_over_ranges = "deny"
+pathbuf_init_then_push = "deny"
+tests_outside_test_module = "deny"
+# Keep the existing small-function policy meaningful without splitting linear
+# installation transactions solely to satisfy a metric.
+cognitive_complexity = "deny"
+large_stack_arrays = "deny"
+large_stack_frames = "deny"
+# Expectations must remain justified and detect when an exemption is obsolete.
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+missing_safety_doc = "deny"

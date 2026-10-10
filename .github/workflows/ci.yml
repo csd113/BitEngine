@@ -13,40 +13,14 @@ permissions:
 env:
   RUSTC_WRAPPER: ""
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
 
 jobs:
-  lint-test:
-    name: Format, Clippy, Tests
-    runs-on: macos-14
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Format check
-        run: cargo fmt --all --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo
-
-      - name: Test
-        run: cargo test --workspace --all-features
-
-  build:
-    name: Build ${{ matrix.label }}
+  quality:
+    name: Rust 1.99.0 quality gate (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -54,18 +28,18 @@ jobs:
           - label: macOS Apple Silicon
             runner: macos-14
             target: aarch64-apple-darwin
-            binary: target/aarch64-apple-darwin/release/bitengine
             deps: none
           - label: Linux x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary: target/x86_64-unknown-linux-gnu/release/bitengine
             deps: linux
           - label: Linux ARM64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            binary: target/aarch64-unknown-linux-gnu/release/bitengine
             deps: linux
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
 
     steps:
       - name: Checkout
@@ -76,22 +50,57 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libx11-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev \
+            libx11-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev \
             libgtk-3-dev
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
+          components: rustfmt, clippy
           targets: ${{ matrix.target }}
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: |
+          rustc --version --verbose
+          test "$(rustc --version --verbose | sed -n 's/^host: //p')" = '${{ matrix.target }}'
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          key: quality-1.99.0-${{ matrix.target }}
 
-      - name: Release build
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Format, check, strict Clippy, tests, documentation, release
+        run: ./scripts/quality-gate.sh
 
-      - name: Verify binary exists
-        shell: bash
-        run: test -f "${{ matrix.binary }}"
+      - name: Verify release binary exists
+        run: test -f 'target/${{ matrix.target }}/release/bitengine'
+
+  # Preserve the existing early warning against future compiler changes. This
+  # supplementary job never selects the compiler used by the pinned gates above.
+  future-stable:
+    name: Future stable compatibility
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Print compiler version
+        run: rustc --version --verbose
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Check
+        run: cargo check --locked --workspace --all-targets --all-features
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo
+      - name: Test
+        run: cargo test --locked --workspace --all-features

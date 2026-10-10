@@ -1,3 +1,6 @@
+// Sizes, counters, protocol values, and timeouts require explicit arithmetic.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context as _, Result};
@@ -11,6 +14,7 @@ use tokio::{
 
 use crate::{
     config::Config,
+    connection::ElectrsListenAddr,
     rpc::{self, BlockchainInfo, RpcAuth},
 };
 
@@ -32,30 +36,49 @@ const ELECTRUM_PROBE_REQUEST: &str = concat!(
     clippy::struct_excessive_bools,
     reason = "process, dependency connection, index synchronization, and service readiness are independent protocol invariants"
 )]
-pub struct ElectrsStatus {
-    pub running: bool,
-    pub connected: bool,
-    pub synced: bool,
-    pub ready: bool,
-    pub electrs_height: Option<u64>,
-    pub bitcoin_blocks: Option<u64>,
-    pub bitcoin_headers: Option<u64>,
-    pub sync_percent: Option<f64>,
-    pub metrics_error: Option<String>,
-    pub bitcoin_error: Option<String>,
-    pub connect_error: Option<String>,
+pub(super) struct ElectrsStatus {
+    pub(super) running: bool,
+    pub(super) connected: bool,
+    pub(super) synced: bool,
+    pub(super) ready: bool,
+    pub(super) electrs_height: Option<u64>,
+    pub(super) bitcoin_blocks: Option<u64>,
+    pub(super) bitcoin_headers: Option<u64>,
+    pub(super) sync_percent: Option<f64>,
+    pub(super) metrics_error: Option<String>,
+    pub(super) bitcoin_error: Option<String>,
+    pub(super) connect_error: Option<String>,
 }
 
-pub async fn probe(
+impl ElectrsStatus {
+    /// Whether this exact managed electrs generation is safe to advertise to a
+    /// wallet. Protocol availability alone is insufficient while its index or
+    /// Bitcoin Core is still catching up.
+    #[must_use]
+    pub(super) const fn is_connection_ready(&self) -> bool {
+        self.running
+            && self.connected
+            && self.synced
+            && self.ready
+            && self.metrics_error.is_none()
+            && self.bitcoin_error.is_none()
+            && self.connect_error.is_none()
+    }
+}
+
+pub(super) async fn probe(
     process_running: bool,
     managed_bitcoin_rpc: Option<(PathBuf, SocketAddr)>,
+    managed_listener: Option<ElectrsListenAddr>,
 ) -> ElectrsStatus {
     if !process_running {
         return ElectrsStatus::default();
     }
 
     let metrics_url = Config::electrs_metrics_url();
-    let electrum_addr = Config::electrum_addr().to_owned();
+    let electrum_addr = managed_listener
+        .map(ElectrsListenAddr::socket_addr)
+        .context("managed electrs listener snapshot is unavailable");
     let bitcoin_probe = async move {
         let (cookie_file, endpoint) =
             managed_bitcoin_rpc.context("managed Bitcoin RPC endpoint snapshot is unavailable")?;
@@ -63,11 +86,11 @@ pub async fn probe(
         rpc::get_blockchain_info(&auth).await
     };
 
-    let (metrics_result, bitcoin_result, protocol_result) = tokio::join!(
-        fetch_metrics(&metrics_url),
-        bitcoin_probe,
-        check_electrum_protocol(&electrum_addr),
-    );
+    let (metrics_result, bitcoin_result, protocol_result) =
+        tokio::join!(fetch_metrics(&metrics_url), bitcoin_probe, async move {
+            let electrum_addr = electrum_addr?;
+            check_electrum_protocol(electrum_addr).await
+        },);
 
     build_status(
         process_running,
@@ -187,7 +210,7 @@ fn build_status(
     }
 }
 
-pub fn parse_tip_height(metrics: &str) -> Result<u64, String> {
+pub(super) fn parse_tip_height(metrics: &str) -> Result<u64, String> {
     let mut matching_lines = metrics
         .lines()
         .filter(|line| line.starts_with("electrs_index_height{") && line.contains("type=\"tip\""));
@@ -215,7 +238,7 @@ struct ElectrumProtocolStatus {
     error: Option<String>,
 }
 
-async fn check_electrum_protocol(addr: &str) -> Result<ElectrumProtocolStatus> {
+async fn check_electrum_protocol(addr: SocketAddr) -> Result<ElectrumProtocolStatus> {
     timeout(ELECTRUM_PROTOCOL_TIMEOUT, async {
         let mut stream = TcpStream::connect(addr)
             .await
@@ -249,14 +272,21 @@ async fn read_bounded_protocol_response(stream: &mut TcpStream) -> Result<Vec<u8
             anyhow::bail!("Electrum server closed before a newline-delimited response");
         }
 
-        let newline = buffer[..bytes_read].iter().position(|byte| *byte == b'\n');
+        let received = buffer
+            .get(..bytes_read)
+            .context("Electrum read exceeded its buffer")?;
+        let newline = received.iter().position(|byte| *byte == b'\n');
         let response_bytes = newline.unwrap_or(bytes_read);
         if response.len().saturating_add(response_bytes) > MAX_ELECTRUM_RESPONSE_BYTES {
             anyhow::bail!(
                 "Electrum protocol response exceeded {MAX_ELECTRUM_RESPONSE_BYTES} bytes"
             );
         }
-        response.extend_from_slice(&buffer[..response_bytes]);
+        response.extend_from_slice(
+            received
+                .get(..response_bytes)
+                .context("Electrum line exceeded its received bytes")?,
+        );
 
         if newline.is_some() {
             return Ok(response);
@@ -462,7 +492,9 @@ mod tests {
         }))
     }
 
-    async fn spawn_protocol_server(response: String) -> (String, tokio::task::JoinHandle<String>) {
+    async fn spawn_protocol_server(
+        response: String,
+    ) -> (SocketAddr, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -479,7 +511,7 @@ mod tests {
             let _ = stream.write_all(response.as_bytes()).await;
             request
         });
-        (addr.to_string(), server)
+        (addr, server)
     }
 
     #[test]
@@ -510,6 +542,7 @@ electrs_index_height{type=\"tip\"} 856201\n";
         assert!(status.connected);
         assert!(status.synced);
         assert!(status.ready);
+        assert!(status.is_connection_ready());
         assert_eq!(status.sync_percent, Some(100.0));
     }
 
@@ -539,9 +572,24 @@ electrs_index_height{type=\"tip\"} 856201\n";
         );
 
         assert!(!status.synced);
+        assert!(!status.is_connection_ready());
         assert_eq!(status.electrs_height, Some(856_100));
         assert_eq!(status.bitcoin_blocks, Some(856_201));
         assert!(status.sync_percent.is_some_and(|percent| percent < 100.0));
+    }
+
+    #[test]
+    fn contradictory_error_state_cannot_be_advertised_to_wallets() {
+        let mut status = build_status(
+            true,
+            Ok("electrs_index_height{type=\"tip\"} 856201".to_owned()),
+            Ok(blockchain_info(856_201, 856_201)),
+            Ok(connected_protocol(true)),
+        );
+        assert!(status.is_connection_ready());
+
+        status.connect_error = Some("listener changed during the status poll".to_owned());
+        assert!(!status.is_connection_ready());
     }
 
     #[test]
@@ -627,7 +675,7 @@ electrs_index_height{type=\"tip\"} 856201\n";
             true,
             Err("metrics down".to_owned()),
             Err("bitcoin down".to_owned()),
-            check_electrum_protocol(&addr.to_string())
+            check_electrum_protocol(addr)
                 .await
                 .map_err(|e| e.to_string()),
         );
@@ -646,7 +694,7 @@ electrs_index_height{type=\"tip\"} 856201\n";
     async fn valid_version_and_mainnet_features_mark_connected_and_ready() {
         let (addr, server) = spawn_protocol_server(ready_protocol_response()).await;
 
-        let protocol = check_electrum_protocol(&addr)
+        let protocol = check_electrum_protocol(addr)
             .await
             .expect("valid Electrum response");
         assert_eq!(protocol, connected_protocol(true));
@@ -777,7 +825,7 @@ electrs_index_height{type=\"tip\"} 856201\n";
         let response = format!("{}\n", "x".repeat(MAX_ELECTRUM_RESPONSE_BYTES + 1));
         let (addr, server) = spawn_protocol_server(response).await;
 
-        let error = check_electrum_protocol(&addr)
+        let error = check_electrum_protocol(addr)
             .await
             .expect_err("oversized response must be rejected");
 
@@ -814,9 +862,39 @@ electrs_index_height{type=\"tip\"} 856201\n";
 
     #[tokio::test]
     async fn probe_is_quiet_when_electrs_process_is_not_running() {
-        let status = probe(false, None).await;
+        let status = probe(false, None, None).await;
 
         assert_eq!(status, ElectrsStatus::default());
+    }
+
+    #[tokio::test]
+    async fn probe_uses_the_exact_managed_listener_snapshot() {
+        let (addr, server) = spawn_protocol_server(ready_protocol_response()).await;
+        let listener = crate::connection::ElectrsListenAddr::for_policy(
+            crate::connection::ElectrsBindPolicy::LoopbackOnly,
+            None,
+            addr.port(),
+        )
+        .expect("test listener");
+
+        let status = probe(true, None, Some(listener)).await;
+
+        assert!(status.connected, "{status:?}");
+        assert!(status.ready, "{status:?}");
+        assert!(!status.synced, "Bitcoin status is deliberately absent");
+        let request = server.await.expect("protocol server join");
+        assert!(request.contains("server.version"));
+    }
+
+    #[tokio::test]
+    async fn running_process_without_a_listener_snapshot_fails_closed() {
+        let status = probe(true, None, None).await;
+
+        assert!(!status.connected);
+        assert!(!status.ready);
+        assert!(status.connect_error.as_deref().is_some_and(|error| {
+            error.contains("managed electrs listener snapshot is unavailable")
+        }));
     }
 
     #[tokio::test]
@@ -827,7 +905,12 @@ electrs_index_height{type=\"tip\"} 856201\n";
             .context("set BITENGINE_LIVE_COOKIE_FILE to Core's cookie path")?;
         let rpc_addr = SocketAddr::from(([127, 0, 0, 1], 8332));
 
-        let status = probe(true, Some((cookie_file, rpc_addr))).await;
+        let listener = crate::connection::ElectrsListenAddr::for_policy(
+            crate::connection::ElectrsBindPolicy::LoopbackOnly,
+            None,
+            crate::connection::DEFAULT_ELECTRUM_PORT,
+        )?;
+        let status = probe(true, Some((cookie_file, rpc_addr)), Some(listener)).await;
 
         assert!(status.running, "{status:?}");
         assert!(status.connected, "{status:?}");

@@ -8,27 +8,29 @@ use std::{
 
 use anyhow::{Context as _, Result};
 
-pub const APP_NAME: &str = "BitEngine";
+pub(super) const APP_NAME: &str = "BitEngine";
 
 const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:49382";
 
 #[derive(Debug)]
-pub struct SingleInstanceGuard {
-    #[allow(dead_code)]
-    listener: TcpListener,
+pub(super) struct SingleInstanceGuard {
+    // Holding the socket reserves the single-instance address until Drop.
+    _listener: TcpListener,
 }
 
 impl SingleInstanceGuard {
     #[must_use]
-    pub fn acquire() -> Option<Self> {
+    pub(super) fn acquire() -> Option<Self> {
         TcpListener::bind(SINGLE_INSTANCE_ADDR)
             .ok()
-            .map(|listener| Self { listener })
+            .map(|listener| Self {
+                _listener: listener,
+            })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Platform {
+pub(super) enum Platform {
     MacOsAppleSilicon,
     LinuxX64,
     LinuxArm64,
@@ -37,7 +39,7 @@ pub enum Platform {
 
 impl Platform {
     #[must_use]
-    pub fn current() -> Self {
+    pub(super) fn current() -> Self {
         match (std::env::consts::OS, std::env::consts::ARCH) {
             ("macos", "aarch64") => Self::MacOsAppleSilicon,
             ("linux", "x86_64") => Self::LinuxX64,
@@ -47,7 +49,7 @@ impl Platform {
     }
 
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    pub(super) const fn label(self) -> &'static str {
         match self {
             Self::MacOsAppleSilicon => "macOS Apple Silicon",
             Self::LinuxX64 => "Linux x86_64",
@@ -58,24 +60,24 @@ impl Platform {
 }
 
 #[must_use]
-pub fn executable_name(base: &str) -> String {
+pub(super) fn executable_name(base: &str) -> String {
     base.to_owned()
 }
 
 #[must_use]
-pub fn electrs_binary_name() -> String {
+pub(super) fn electrs_binary_name() -> String {
     executable_name("electrs")
 }
 
 #[must_use]
-pub fn home_dir() -> PathBuf {
+pub(super) fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map_or_else(
         || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         PathBuf::from,
     )
 }
 
-pub fn set_executable_permissions(path: &Path) -> Result<()> {
+pub(super) fn set_executable_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let mut perms = std::fs::metadata(path)
@@ -87,7 +89,7 @@ pub fn set_executable_permissions(path: &Path) -> Result<()> {
 
 /// Resolve an application-managed directory only after rejecting a symbolic
 /// link or non-directory at its final path component.
-pub fn prepare_real_directory(path: &Path, label: &str, create: bool) -> Result<PathBuf> {
+pub(super) fn prepare_real_directory(path: &Path, label: &str, create: bool) -> Result<PathBuf> {
     if !path.is_absolute()
         || path.parent().is_none()
         || path
@@ -130,7 +132,7 @@ pub fn prepare_real_directory(path: &Path, label: &str, create: bool) -> Result<
     std::fs::canonicalize(path).with_context(|| format!("canonicalize {label} {}", path.display()))
 }
 
-pub fn terminate_child(child: &Child) {
+pub(super) fn terminate_child(child: &Child) {
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
         // SAFETY: `pid` comes from a live child process owned by this handle,
         // and `kill` only sends a signal to that operating-system process.
@@ -139,7 +141,7 @@ pub fn terminate_child(child: &Child) {
 }
 
 #[must_use]
-pub fn command_display(program: &Path, args: &[String]) -> String {
+pub(super) fn command_display(program: &Path, args: &[String]) -> String {
     std::iter::once(shell_display(program))
         .chain(args.iter().map(|arg| shell_display(Path::new(arg))))
         .collect::<Vec<_>>()

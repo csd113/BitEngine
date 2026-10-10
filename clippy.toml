@@ -1,0 +1,25 @@
+# Fixture assertions intentionally fail the test; production code must return
+# contextual errors instead. Bounds checking remains mandatory in production.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+allow-indexing-slicing-in-tests = true
+check-incompatible-msrv-in-tests = true
+# API documentation lints apply to exported APIs. Requiring Errors/Panics on
+# every private test fixture duplicates the assertion/Result test contract.
+check-private-items = false
+
+# Keep the normal limits explicit. Linear transaction/lifecycle exceptions must
+# stay local and justified instead of raising limits for the entire GUI.
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 7
+cognitive-complexity-threshold = 25
+type-complexity-threshold = 250
+enum-variant-size-threshold = 200
+stack-size-threshold = 512000
+
+# Build environments are constructed per child. Process-global environment
+# mutation races with other threads and must never implement a build setting.
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "Construct the child Command environment instead of mutating global process state." },
+    { path = "std::env::remove_var", reason = "Construct the child Command environment instead of mutating global process state." },
+]

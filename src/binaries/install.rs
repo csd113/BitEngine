@@ -26,14 +26,14 @@ const MAX_JOURNAL_BYTES: u64 = 1024 * 1024;
 const MAX_PATH_TOKEN_BYTES: usize = 96;
 
 #[derive(Debug, Clone)]
-pub struct InstallArtifact {
-    pub source: PathBuf,
-    pub name: String,
+pub(super) struct InstallArtifact {
+    pub(super) source: PathBuf,
+    pub(super) name: String,
 }
 
 /// Result of repairing a durable installation journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallRecovery {
+pub(super) enum InstallRecovery {
     /// No pending transaction existed.
     None,
     /// An uncommitted transaction was rolled back to the complete old set.
@@ -49,7 +49,12 @@ pub enum InstallRecovery {
 /// rollback. A durable journal is activated before any existing binary is
 /// renamed, allowing [`recover_pending_install`] to repair interruption at any
 /// later filesystem boundary.
-pub fn install_transaction_managed(
+///
+/// # Errors
+/// Rejects unsafe input, lock conflicts, identity mismatches, insufficient space,
+/// and failed staging/durability operations. Activation failures trigger recovery;
+/// ambiguous recovery retains the journal and blocks destination use.
+pub(super) fn install_transaction_managed(
     artifacts: &[InstallArtifact],
     managed_names: &[&str],
     destination: &Path,
@@ -114,7 +119,11 @@ pub fn install_transaction_managed(
 ///
 /// Recovery is serialized by the same destination lock used for installation.
 /// Ambiguous or non-regular entries fail closed and leave the journal in place.
-pub fn recover_pending_install(destination: &Path) -> Result<InstallRecovery> {
+///
+/// # Errors
+/// Returns an error for invalid paths, lock conflicts, malformed journals,
+/// unexpected file identities, or failed recovery/durability operations.
+pub(super) fn recover_pending_install(destination: &Path) -> Result<InstallRecovery> {
     let Some(destination) = prepare_destination(destination, false)? else {
         return Ok(InstallRecovery::None);
     };
@@ -1228,7 +1237,7 @@ fn validate_transaction_id(transaction_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn available_space_bytes(path: &Path) -> Option<u64> {
+pub(super) fn available_space_bytes(path: &Path) -> Option<u64> {
     let existing = nearest_existing_ancestor(path)?;
     let path = CString::new(existing.as_os_str().as_bytes()).ok()?;
     let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
@@ -1254,16 +1263,11 @@ fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
 pub(super) fn format_bytes(bytes: u64) -> String {
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
-    if bytes >= GIB {
-        format_decimal_units(bytes, GIB, "GiB")
+    let (whole, tenths, suffix) = if bytes >= GIB {
+        (bytes / GIB, (bytes % GIB).saturating_mul(10) / GIB, "GiB")
     } else {
-        format_decimal_units(bytes, MIB, "MiB")
-    }
-}
-
-fn format_decimal_units(bytes: u64, unit: u64, suffix: &str) -> String {
-    let whole = bytes / unit;
-    let tenths = bytes % unit * 10 / unit;
+        (bytes / MIB, (bytes % MIB).saturating_mul(10) / MIB, "MiB")
+    };
     format!("{whole}.{tenths} {suffix}")
 }
 
@@ -1277,6 +1281,14 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_space_display_handles_zero_boundaries_and_maximum_values() {
+        assert_eq!(format_bytes(0), "0.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(format_bytes(u64::MAX), "17179869183.9 GiB");
+    }
 
     fn write_file(path: &Path, contents: &[u8]) -> Result<()> {
         let mut file = File::create(path)?;

@@ -3,7 +3,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -34,7 +34,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
-pub enum CommandError {
+pub(super) enum CommandError {
     #[error("build cancelled")]
     Cancelled,
     #[error("could not find executable {program} in the build PATH")]
@@ -62,11 +62,25 @@ pub enum CommandError {
     LogUnavailable { program: String },
 }
 
+/// Complete specification for one cancellable child-process execution.
+pub(super) struct RunSpec<'a> {
+    pub(super) operation_id: BuildOperationId,
+    pub(super) program: &'a str,
+    pub(super) arguments: &'a [String],
+    pub(super) working_directory: Option<&'a Path>,
+    pub(super) environment: &'a BuildEnvironment,
+    pub(super) event_tx: &'a mpsc::Sender<BuildEvent>,
+    pub(super) log_tx: &'a mpsc::Sender<String>,
+    pub(super) cancelled: &'a Arc<AtomicBool>,
+    pub(super) verbose_output: bool,
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the operation identity and independent UI, durable-log, environment, and cancellation inputs are intentionally explicit"
 )]
-pub async fn run(
+#[cfg(test)]
+pub(super) async fn run(
     operation_id: BuildOperationId,
     program: &str,
     arguments: &[String],
@@ -76,6 +90,32 @@ pub async fn run(
     log_tx: &mpsc::Sender<String>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<(), CommandError> {
+    run_with_ui_output(RunSpec {
+        operation_id,
+        program,
+        arguments,
+        working_directory,
+        environment,
+        event_tx,
+        log_tx,
+        cancelled,
+        verbose_output: true,
+    })
+    .await
+}
+
+pub(super) async fn run_with_ui_output(spec: RunSpec<'_>) -> Result<(), CommandError> {
+    let RunSpec {
+        operation_id,
+        program,
+        arguments,
+        working_directory,
+        environment,
+        event_tx,
+        log_tx,
+        cancelled,
+        verbose_output,
+    } = spec;
     if cancelled.load(Ordering::Acquire) {
         return Err(CommandError::Cancelled);
     }
@@ -120,6 +160,7 @@ pub async fn run(
             event_tx.clone(),
             log_tx.clone(),
             "stdout",
+            verbose_output,
         ))
     });
     let mut stderr_task = stderr.map(|reader| {
@@ -129,6 +170,7 @@ pub async fn run(
             event_tx.clone(),
             log_tx.clone(),
             "stderr",
+            verbose_output,
         ))
     });
 
@@ -168,25 +210,31 @@ pub async fn run(
         return Err(CommandError::Cancelled);
     }
 
+    command_result(&executable, status, logs_available)
+}
+
+fn command_result(
+    executable: &Path,
+    status: ExitStatus,
+    logs_available: bool,
+) -> Result<(), CommandError> {
     if !logs_available {
         return Err(CommandError::LogUnavailable {
             program: executable.display().to_string(),
         });
     }
-
     if status.success() {
-        Ok(())
-    } else {
-        Err(CommandError::Failed {
-            program: executable.display().to_string(),
-            status: status
-                .code()
-                .map_or_else(|| "a signal".to_owned(), |code| format!("status {code}")),
-        })
+        return Ok(());
     }
+    Err(CommandError::Failed {
+        program: executable.display().to_string(),
+        status: status
+            .code()
+            .map_or_else(|| "a signal".to_owned(), |code| format!("status {code}")),
+    })
 }
 
-pub async fn probe(
+pub(super) async fn probe(
     program: &str,
     arguments: &[&str],
     working_directory: Option<&Path>,
@@ -204,7 +252,7 @@ pub async fn probe(
     .await
 }
 
-pub async fn probe_stderr(
+pub(super) async fn probe_stderr(
     program: &str,
     arguments: &[&str],
     working_directory: Option<&Path>,
@@ -374,10 +422,16 @@ impl ProcessGroupGuard {
         let Some(process_group_id) = self.process_group_id.filter(|_| self.armed) else {
             return Ok(());
         };
+        let target = process_group_id.checked_neg().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid build process group",
+            )
+        })?;
         // SAFETY: `process_group_id` comes from a successfully spawned child
         // placed in its own process group. Passing its negation targets that
         // group and does not dereference any pointer or access shared memory.
-        let result = unsafe { libc::kill(-process_group_id, signal) };
+        let result = unsafe { libc::kill(target, signal) };
         if result == 0 {
             return Ok(());
         }
@@ -397,9 +451,13 @@ impl ProcessGroupGuard {
         let Some(process_group_id) = self.process_group_id else {
             return false;
         };
+        let Some(target) = process_group_id.checked_neg() else {
+            // An unrepresentable target must still require cleanup.
+            return true;
+        };
         // SAFETY: signal zero only queries whether the child-owned process
         // group exists; it does not deliver a signal or access memory.
-        let result = unsafe { libc::kill(-process_group_id, 0) };
+        let result = unsafe { libc::kill(target, 0) };
         if result == 0 {
             return true;
         }
@@ -432,8 +490,9 @@ async fn terminate_child(child: &mut Child, process_group: &mut ProcessGroupGuar
     #[cfg(unix)]
     {
         let _ = process_group.signal(libc::SIGTERM);
-        let deadline = Instant::now() + TERMINATION_GRACE_PERIOD;
-        while process_group.is_alive() && Instant::now() < deadline {
+        let deadline = Instant::now().checked_add(TERMINATION_GRACE_PERIOD);
+        while process_group.is_alive() && deadline.is_some_and(|deadline| Instant::now() < deadline)
+        {
             let _ = child.try_wait();
             tokio::time::sleep(PROCESS_GROUP_POLL_INTERVAL).await;
         }
@@ -487,6 +546,7 @@ async fn drain<R>(
     event_tx: mpsc::Sender<BuildEvent>,
     log_tx: mpsc::Sender<String>,
     stream_name: &'static str,
+    verbose_output: bool,
 ) -> bool
 where
     R: AsyncRead + Unpin,
@@ -496,8 +556,26 @@ where
         match reader.read(&mut buffer).await {
             Ok(0) => return true,
             Ok(read) => {
-                let text = String::from_utf8_lossy(&buffer[..read]);
-                if !emit_log(operation_id, &event_tx, &log_tx, normalise_output(&text)).await {
+                let Some(received) = buffer.get(..read) else {
+                    let _ = emit_log(
+                        operation_id,
+                        &event_tx,
+                        &log_tx,
+                        format!("\nBuild {stream_name} read exceeded its output buffer.\n"),
+                    )
+                    .await;
+                    return false;
+                };
+                let text = String::from_utf8_lossy(received);
+                if !emit_process_output(
+                    operation_id,
+                    &event_tx,
+                    &log_tx,
+                    normalise_output(&text),
+                    verbose_output,
+                )
+                .await
+                {
                     return false;
                 }
             }
@@ -515,7 +593,7 @@ where
     }
 }
 
-pub async fn emit_log(
+pub(super) async fn emit_log(
     operation_id: BuildOperationId,
     event_tx: &mpsc::Sender<BuildEvent>,
     log_tx: &mpsc::Sender<String>,
@@ -525,6 +603,22 @@ pub async fn emit_log(
         operation_id,
         message: message.clone(),
     });
+    log_tx.send(message).await.is_ok()
+}
+
+async fn emit_process_output(
+    operation_id: BuildOperationId,
+    event_tx: &mpsc::Sender<BuildEvent>,
+    log_tx: &mpsc::Sender<String>,
+    message: String,
+    verbose_output: bool,
+) -> bool {
+    if verbose_output {
+        let _ = event_tx.try_send(BuildEvent::Log {
+            operation_id,
+            message: message.clone(),
+        });
+    }
     log_tx.send(message).await.is_ok()
 }
 
@@ -549,6 +643,52 @@ fn command_display(program: &str, arguments: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concise_output_keeps_raw_process_bytes_in_the_durable_log() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir()?;
+        let helper = temporary.path().join("compiler-fixture");
+        fs::write(&helper, "#!/bin/sh\nprintf 'FULL_COMPILER_OUTPUT\\n'\n")?;
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755))?;
+        let mut environment = BuildEnvironment::new();
+        environment.insert("PATH".to_owned(), temporary.path().display().to_string());
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (log_tx, mut log_rx) = mpsc::channel(16);
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        run_with_ui_output(RunSpec {
+            operation_id: BuildOperationId(77),
+            program: "compiler-fixture",
+            arguments: &[],
+            working_directory: None,
+            environment: &environment,
+            event_tx: &event_tx,
+            log_tx: &log_tx,
+            cancelled: &cancelled,
+            verbose_output: false,
+        })
+        .await?;
+        drop(log_tx);
+        drop(event_tx);
+
+        let mut durable = String::new();
+        while let Some(message) = log_rx.recv().await {
+            durable.push_str(&message);
+        }
+        let mut presented = String::new();
+        while let Some(event) = event_rx.recv().await {
+            if let BuildEvent::Log { message, .. } = event {
+                presented.push_str(&message);
+            }
+        }
+        assert!(durable.contains("FULL_COMPILER_OUTPUT"));
+        assert!(!presented.contains("FULL_COMPILER_OUTPUT"));
+        assert!(presented.contains("compiler-fixture"));
+        Ok(())
+    }
 
     #[cfg(unix)]
     async fn receive_descendant_pid(receiver: &mut mpsc::Receiver<String>) -> i32 {
@@ -580,7 +720,9 @@ mod tests {
 
     #[cfg(unix)]
     async fn assert_process_exits(process_id: i32) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(3))
+            .expect("test deadline should be representable");
         while process_exists(process_id) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

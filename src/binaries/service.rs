@@ -33,6 +33,8 @@ const MAX_BUILD_LOG_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BUILD_STATE_BYTES: u64 = 1024 * 1024;
 const RETAINED_JOB_LOGS: usize = 8;
 const WORKSPACE_LOCK_NAME: &str = ".bitengine-workspace.lock";
+const BUILD_CACHE_NAME: &str = "cache";
+const UNCOMMITTED_CACHE_MARKER: &str = ".uncommitted";
 const BITCOIN_MANAGED_BINARIES: &[&str] = &[
     "bitcoind",
     "bitcoin-cli",
@@ -63,35 +65,40 @@ const ELECTRS_LEGACY_OPENPGP_SIGNERS: &[&str] = &["15C8C3574AE4F1E25F3F35C587CAE
 
 /// Immutable inputs for one source build and installation.
 #[derive(Debug, Clone)]
-pub struct BuildRequest {
-    pub operation_id: BuildOperationId,
-    pub kind: BinaryKind,
-    pub version: ReleaseVersion,
-    pub binaries_dir: PathBuf,
-    pub workspace: PathBuf,
-    pub cores: usize,
+pub(crate) struct BuildRequest {
+    pub(crate) operation_id: BuildOperationId,
+    pub(crate) kind: BinaryKind,
+    pub(crate) version: ReleaseVersion,
+    pub(crate) binaries_dir: PathBuf,
+    pub(crate) workspace: PathBuf,
+    pub(crate) cores: usize,
+    pub(crate) keep_source: bool,
+    pub(crate) clean_build: bool,
+    pub(crate) verbose_output: bool,
 }
 
 /// Successful installation summary returned to the UI.
 #[derive(Debug, Clone)]
-pub struct BuildSummary {
-    pub kind: BinaryKind,
-    pub version: ReleaseVersion,
-    pub installed: Vec<String>,
-    pub log_path: PathBuf,
+pub(crate) struct BuildSummary {
+    pub(crate) kind: BinaryKind,
+    pub(crate) version: ReleaseVersion,
+    pub(crate) installed: Vec<String>,
+    pub(crate) log_path: PathBuf,
+    /// A post-installation diagnostic that does not invalidate the committed set.
+    pub(crate) warning: Option<String>,
 }
 
 /// A user-safe failure returned by a managed build.
 #[derive(Debug, Clone)]
-pub struct BuildFailure {
-    pub message: String,
-    pub cancelled: bool,
-    pub conflict: bool,
+pub(crate) struct BuildFailure {
+    pub(crate) message: String,
+    pub(crate) cancelled: bool,
+    pub(crate) conflict: bool,
 }
 
 /// Durable status stored in `BitEngine`'s configuration directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PersistedBuildStatus {
+pub(crate) enum PersistedBuildStatus {
     Running,
     Complete,
     Failed,
@@ -99,21 +106,23 @@ pub enum PersistedBuildStatus {
     Interrupted,
 }
 
-/// Durable state for the most recent build. Active jobs are converted to
-/// `Interrupted` when `BitEngine` starts again. A separate installation journal
+/// Durable state for the most recent build.
+///
+/// Active jobs are converted to `Interrupted` when `BitEngine` starts again.
+/// A separate installation journal
 /// then restores an uncommitted old set or finalizes a committed new set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedBuild {
-    pub id: String,
-    pub kind: BinaryKind,
-    pub version: ReleaseVersion,
-    pub stage: BuildStage,
-    pub status: PersistedBuildStatus,
-    pub started_at: u64,
-    pub updated_at: u64,
-    pub log_path: PathBuf,
-    pub error: Option<String>,
-    pub installed: Vec<String>,
+pub(crate) struct PersistedBuild {
+    pub(crate) id: String,
+    pub(crate) kind: BinaryKind,
+    pub(crate) version: ReleaseVersion,
+    pub(crate) stage: BuildStage,
+    pub(crate) status: PersistedBuildStatus,
+    pub(crate) started_at: u64,
+    pub(crate) updated_at: u64,
+    pub(crate) log_path: PathBuf,
+    pub(crate) error: Option<String>,
+    pub(crate) installed: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,31 +139,37 @@ struct Coordinator {
 
 /// Cloneable backend handle used by the Iced update loop and build task.
 #[derive(Debug, Clone)]
-pub struct BuildService {
+pub(crate) struct BuildService {
     coordinator: Arc<Coordinator>,
-    state_path: Arc<PathBuf>,
+    state_path: Arc<Path>,
     recovered: Arc<Option<PersistedBuild>>,
 }
 
 impl BuildService {
     #[must_use]
-    pub fn new(state_path: PathBuf) -> Self {
+    pub(crate) fn new(state_path: PathBuf) -> Self {
         let recovered = recover_interrupted_job(&state_path);
         Self {
             coordinator: Arc::new(Coordinator::default()),
-            state_path: Arc::new(state_path),
+            state_path: state_path.into(),
             recovered: Arc::new(recovered),
         }
     }
 
     #[must_use]
-    pub fn recovered(&self) -> Option<PersistedBuild> {
+    pub(crate) fn recovered(&self) -> Option<PersistedBuild> {
         self.recovered.as_ref().clone()
     }
 
     /// Complete or roll back a durable binary transaction before inventory or
     /// node launch. Callers must block use of the destination if this fails.
-    pub fn ensure_installation_recovered(destination: &Path) -> std::result::Result<(), String> {
+    ///
+    /// # Errors
+    /// Returns the complete installation recovery diagnostic when safety checks,
+    /// destination locking, recovery, or durability operations fail.
+    pub(crate) fn ensure_installation_recovered(
+        destination: &Path,
+    ) -> std::result::Result<(), String> {
         recover_destination_installation(destination)
             .map(|_| ())
             .map_err(|error| format!("{error:#}"))
@@ -162,7 +177,7 @@ impl BuildService {
 
     /// Request safe cancellation of the active child process.
     #[must_use]
-    pub fn cancel_current(&self) -> bool {
+    pub(crate) fn cancel_current(&self) -> bool {
         self.coordinator
             .active
             .lock()
@@ -176,11 +191,16 @@ impl BuildService {
 
     /// Start exactly one build. The coordinator rejects any overlapping
     /// Bitcoin Core/electrs request before it can mutate the workspace.
+    ///
+    /// # Errors
+    /// Returns a classified conflict, cancellation, or build/install failure.
+    /// Failure after the transaction boundary is never reported as an unchanged
+    /// cancellation; successful installs retain post-commit log warnings.
     #[expect(
         clippy::too_many_lines,
         reason = "the build lifetime keeps preflight, durable status, cleanup, and terminal outcome ordering visible in one place"
     )]
-    pub async fn run(
+    pub(crate) async fn run(
         &self,
         mut request: BuildRequest,
         event_tx: mpsc::Sender<BuildEvent>,
@@ -278,9 +298,21 @@ impl BuildService {
             Err(error) => Err(error),
         };
 
-        cleanup_current_job(&job_dir, &reporter).await;
+        if pipeline.is_err() {
+            if let Err(error) = cleanup_uncommitted_cache(&request).await {
+                reporter
+                    .log(format!(
+                        "Warning: could not clean an uncommitted retained-source entry: {error:#}\n"
+                    ))
+                    .await;
+            }
+        } else {
+            // Disposable source/work state is useful evidence after a failed
+            // build. Remove it only after installation has committed.
+            cleanup_current_job(&job_dir, &reporter).await;
+        }
 
-        let outcome = match pipeline {
+        let mut outcome = match pipeline {
             Ok(installed) => {
                 persisted.status = PersistedBuildStatus::Complete;
                 persisted.stage = BuildStage::Complete;
@@ -306,6 +338,7 @@ impl BuildService {
                     version: request.version,
                     installed,
                     log_path,
+                    warning: None,
                 })
             }
             Err(error) => {
@@ -346,11 +379,10 @@ impl BuildService {
         };
 
         drop(reporter);
-        if let Ok(Err(error)) = log_writer.await {
-            // Installation is already complete or definitively failed at this
-            // point, so do not misreport it as rolled back. The next run will
-            // expose the retained state and bounded log path.
-            eprintln!("BitEngine build log could not be finalized: {error:#}");
+        match log_writer.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => record_log_failure(&mut outcome, &format!("{error:#}")),
+            Err(error) => record_log_failure(&mut outcome, &error.to_string()),
         }
         outcome
     }
@@ -386,6 +418,15 @@ impl BuildService {
     }
 }
 
+/// Report a failed log finalization without misrepresenting a committed install.
+fn record_log_failure(outcome: &mut Result<BuildSummary, BuildFailure>, error: &str) {
+    let warning = format!("Build log could not be finalized: {error}");
+    match outcome {
+        Ok(summary) => summary.warning = Some(warning),
+        Err(failure) => failure.message = format!("{}\n{warning}", failure.message),
+    }
+}
+
 impl BuildFailure {
     const fn failed(message: String) -> Self {
         Self {
@@ -415,6 +456,16 @@ impl Drop for ActivePermit {
 #[derive(Debug)]
 struct WorkspaceLock {
     file: File,
+}
+
+#[derive(Debug)]
+struct BuildLayout {
+    source: PathBuf,
+    work: PathBuf,
+    cache_root: PathBuf,
+    cache_entry: PathBuf,
+    uses_cache: bool,
+    new_cache: bool,
 }
 
 impl WorkspaceLock {
@@ -470,7 +521,7 @@ struct Reporter {
     event_tx: mpsc::Sender<BuildEvent>,
     log_tx: mpsc::Sender<String>,
     log_failed: Arc<AtomicBool>,
-    state_path: Arc<PathBuf>,
+    state_path: Arc<Path>,
 }
 
 impl Reporter {
@@ -558,13 +609,32 @@ async fn run_pipeline(
     reporter
         .stage(persisted, BuildStage::DownloadingSource)
         .await?;
-    let source = prepare_source(request, job_dir, &base_environment, cancelled, reporter).await?;
+    let layout = prepare_source(request, job_dir, &base_environment, cancelled, reporter).await?;
 
     reporter
         .stage(persisted, BuildStage::VerifyingSource)
         .await?;
-    let source_commit =
-        verify_source(request.kind, &request.version, &source, &base_environment).await?;
+    let source_commit = match verify_source(
+        request.kind,
+        &request.version,
+        &layout.source,
+        &base_environment,
+    )
+    .await
+    {
+        Ok(commit) => commit,
+        Err(error) if layout.uses_cache && !layout.new_cache => {
+            let cache_root = layout.cache_root.clone();
+            let cache_entry = layout.cache_entry.clone();
+            tokio::task::spawn_blocking(move || remove_confined_entry(&cache_root, &cache_entry))
+                .await
+                .context("retained source cleanup task stopped unexpectedly")??;
+            bail!(
+                "retained source failed authentication and was discarded; retry the build to download a fresh copy: {error:#}"
+            );
+        }
+        Err(error) => return Err(error),
+    };
     reporter
         .log(format!(
             "Verified signed upstream tag {}, commit {source_commit}, origin, and pristine working tree.\n",
@@ -576,17 +646,14 @@ async fn run_pipeline(
     reporter
         .stage(persisted, BuildStage::PreparingBuild)
         .await?;
-    let build_dir = job_dir.join("work");
-    tokio::fs::create_dir_all(&build_dir)
-        .await
-        .with_context(|| format!("create job directory {}", build_dir.display()))?;
+    prepare_build_directory(&layout, request.clean_build).await?;
 
     let artifacts = match request.kind {
         BinaryKind::BitcoinCore => {
             build_bitcoin(
                 request,
-                &source,
-                &build_dir,
+                &layout.source,
+                &layout.work,
                 &base_environment,
                 cancelled,
                 reporter,
@@ -597,8 +664,8 @@ async fn run_pipeline(
         BinaryKind::Electrs => {
             build_electrs(
                 request,
-                &source,
-                &build_dir,
+                &layout.source,
+                &layout.work,
                 &base_environment,
                 cancelled,
                 reporter,
@@ -668,6 +735,13 @@ async fn run_pipeline(
             }
         }
     };
+    if let Err(error) = finalize_build_cache(request, job_dir, &layout).await {
+        reporter
+            .log(format!(
+                "Warning: the committed installation succeeded, but retained build state could not be finalized: {error:#}\n"
+            ))
+            .await;
+    }
     Ok(installed)
 }
 
@@ -733,13 +807,23 @@ async fn check_requirements(
     let base_environment = environment::build_environment();
     let dependency_report =
         dependencies::check(request.kind, &request.version, &base_environment).await;
-    for dependency in &dependency_report.found {
-        reporter.log(format!("Found {dependency}\n")).await;
+    for dependency in dependency_report
+        .items
+        .iter()
+        .filter(|dependency| dependency.state == dependencies::DependencyState::Ready)
+    {
+        let version = dependency
+            .detected_version
+            .as_deref()
+            .map_or(String::new(), |version| format!(" {version}"));
+        reporter
+            .log(format!("Found {}{version}\n", dependency.name))
+            .await;
     }
     if !dependency_report.is_ready() {
         bail!(
             "missing build requirements: {}. {}",
-            dependency_report.missing.join(", "),
+            dependency_report.issue_summary(),
             dependency_report.guidance
         );
     }
@@ -749,15 +833,75 @@ async fn check_requirements(
     Ok(base_environment)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "source cache validation and fresh-clone activation remain linear for security review"
+)]
 async fn prepare_source(
     request: &BuildRequest,
     job_dir: &Path,
     environment: &BuildEnvironment,
     cancelled: &Arc<AtomicBool>,
     reporter: &Reporter,
-) -> Result<PathBuf> {
-    let source = job_dir.join("source");
-    let partial = job_dir.join("source.partial");
+) -> Result<BuildLayout> {
+    let cache_root = prepare_managed_directory(&request.workspace, BUILD_CACHE_NAME)?;
+    let cache_entry = cache_root.join(build_cache_key(request));
+    cleanup_uncommitted_cache(request).await?;
+    match fs::symlink_metadata(&cache_entry) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "retained build cache is not a regular directory: {}",
+                    cache_entry.display()
+                );
+            }
+            let canonical = fs::canonicalize(&cache_entry).with_context(|| {
+                format!(
+                    "canonicalize retained build cache {}",
+                    cache_entry.display()
+                )
+            })?;
+            if canonical.parent() != Some(cache_root.as_path()) {
+                bail!(
+                    "retained build cache escaped its managed root: {}",
+                    cache_entry.display()
+                );
+            }
+            let source = canonical.join("source");
+            validate_cached_source_directory(&canonical, &source)?;
+            reporter
+                .log(format!(
+                    "Reusing retained authenticated source for {} {}.\n",
+                    request.kind.label(),
+                    request.version
+                ))
+                .await;
+            return Ok(BuildLayout {
+                source,
+                work: canonical.join("work"),
+                cache_root,
+                cache_entry: canonical,
+                uses_cache: true,
+                new_cache: false,
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspect retained build cache {}", cache_entry.display())
+            });
+        }
+    }
+
+    let (source_root, uses_cache, new_cache) = if request.keep_source {
+        create_private_directory(&cache_entry)?;
+        create_uncommitted_cache_marker(&cache_entry)?;
+        (cache_entry.clone(), true, true)
+    } else {
+        (job_dir.to_path_buf(), false, false)
+    };
+    let source = source_root.join("source");
+    let partial = source_root.join("source.partial");
 
     let arguments = vec![
         "clone".to_owned(),
@@ -774,28 +918,195 @@ async fn prepare_source(
         request.kind.repository().to_owned(),
         partial.display().to_string(),
     ];
-    let result = process::run(
-        request.operation_id,
-        "git",
-        &arguments,
-        Some(job_dir),
+    let result = process::run_with_ui_output(process::RunSpec {
+        operation_id: request.operation_id,
+        program: "git",
+        arguments: &arguments,
+        working_directory: Some(job_dir),
         environment,
-        &reporter.event_tx,
-        &reporter.log_tx,
+        event_tx: &reporter.event_tx,
+        log_tx: &reporter.log_tx,
         cancelled,
-    )
+        verbose_output: request.verbose_output,
+    })
     .await;
     if let Err(error) = result {
-        let _ = remove_job_entry(job_dir, &partial).await;
+        let _ = remove_job_entry(&source_root, &partial).await;
         return Err(error.into());
     }
 
     if let Err(error) = tokio::fs::rename(&partial, &source).await {
-        let _ = remove_job_entry(job_dir, &partial).await;
+        let _ = remove_job_entry(&source_root, &partial).await;
         return Err(error)
             .with_context(|| format!("activate verified source tree {}", source.display()));
     }
-    Ok(source)
+    Ok(BuildLayout {
+        source,
+        work: source_root.join("work"),
+        cache_root,
+        cache_entry,
+        uses_cache,
+        new_cache,
+    })
+}
+
+fn create_uncommitted_cache_marker(cache_entry: &Path) -> Result<()> {
+    let marker = cache_entry.join(UNCOMMITTED_CACHE_MARKER);
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&marker)
+        .with_context(|| format!("create retained-source marker {}", marker.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync retained-source marker {}", marker.display()))?;
+    File::open(cache_entry)
+        .with_context(|| format!("open retained-source entry {}", cache_entry.display()))?
+        .sync_all()
+        .with_context(|| format!("sync retained-source entry {}", cache_entry.display()))
+}
+
+fn build_cache_key(request: &BuildRequest) -> String {
+    format!(
+        "{}-{}",
+        request.kind.slug(),
+        request.version.tag().trim_start_matches('v')
+    )
+}
+
+fn validate_cached_source_directory(cache_entry: &Path, source: &Path) -> Result<()> {
+    if source.parent() != Some(cache_entry) {
+        bail!("retained source is outside its cache entry");
+    }
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("inspect retained source {}", source.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "retained source is not a regular directory: {}",
+            source.display()
+        );
+    }
+    let canonical = fs::canonicalize(source)
+        .with_context(|| format!("canonicalize retained source {}", source.display()))?;
+    if canonical.parent() != Some(cache_entry) {
+        bail!(
+            "retained source escaped its cache entry: {}",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+async fn prepare_build_directory(layout: &BuildLayout, clean_build: bool) -> Result<()> {
+    let root = if layout.uses_cache {
+        layout.cache_entry.clone()
+    } else {
+        layout
+            .work
+            .parent()
+            .context("job work directory has no parent")?
+            .to_path_buf()
+    };
+    let work = layout.work.clone();
+    tokio::task::spawn_blocking(move || {
+        if clean_build {
+            remove_confined_entry_if_present(&root, &work)?;
+        }
+        match fs::symlink_metadata(&work) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                bail!(
+                    "build work entry is not a regular directory: {}",
+                    work.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_private_directory(&work)?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect build work entry {}", work.display()));
+            }
+        }
+        let canonical = fs::canonicalize(&work)
+            .with_context(|| format!("canonicalize build work entry {}", work.display()))?;
+        if canonical.parent() != Some(root.as_path()) {
+            bail!(
+                "build work entry escaped its managed root: {}",
+                work.display()
+            );
+        }
+        Ok(())
+    })
+    .await
+    .context("build work preparation task stopped unexpectedly")?
+}
+
+async fn finalize_build_cache(
+    request: &BuildRequest,
+    _job_dir: &Path,
+    layout: &BuildLayout,
+) -> Result<()> {
+    let keep_source = request.keep_source;
+    let cache_root = layout.cache_root.clone();
+    let cache_entry = layout.cache_entry.clone();
+    let uses_cache = layout.uses_cache;
+    let new_cache = layout.new_cache;
+    tokio::task::spawn_blocking(move || {
+        if new_cache {
+            if !keep_source {
+                bail!("an uncommitted retained-source entry lost its keep-source setting");
+            }
+            let marker = cache_entry.join(UNCOMMITTED_CACHE_MARKER);
+            remove_confined_entry(&cache_entry, &marker)?;
+            return File::open(&cache_entry)
+                .with_context(|| {
+                    format!(
+                        "open committed retained-source entry {}",
+                        cache_entry.display()
+                    )
+                })?
+                .sync_all()
+                .with_context(|| {
+                    format!(
+                        "sync committed retained-source entry {}",
+                        cache_entry.display()
+                    )
+                });
+        }
+        if uses_cache {
+            if keep_source {
+                return Ok(());
+            }
+            return remove_confined_entry(&cache_root, &cache_entry);
+        }
+        Ok(())
+    })
+    .await
+    .context("retained build finalization task stopped unexpectedly")?
+}
+
+async fn cleanup_uncommitted_cache(request: &BuildRequest) -> Result<()> {
+    let cache_root = request.workspace.join(BUILD_CACHE_NAME);
+    let cache_entry = cache_root.join(build_cache_key(request));
+    tokio::task::spawn_blocking(move || {
+        let marker = cache_entry.join(UNCOMMITTED_CACHE_MARKER);
+        match fs::symlink_metadata(&marker) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                remove_confined_entry(&cache_root, &cache_entry)
+            }
+            Ok(_) => bail!(
+                "unsafe uncommitted retained-source marker: {}",
+                marker.display()
+            ),
+            Err(error) => Err(error)
+                .with_context(|| format!("inspect retained-source marker {}", marker.display())),
+        }
+    })
+    .await
+    .context("uncommitted retained-source cleanup task stopped unexpectedly")?
 }
 
 async fn verify_source(
@@ -1039,6 +1350,33 @@ fn valid_openpgp_fingerprint(fingerprint: &str) -> bool {
 fn write_electrs_allowed_signers(job_dir: &Path) -> Result<PathBuf> {
     let path = job_dir.join("electrs-allowed-signers");
     let contents = format!("{ELECTRS_SSH_SIGNER_PRINCIPAL} {ELECTRS_SSH_SIGNER_KEY}\n");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() != u64::try_from(contents.len()).unwrap_or(u64::MAX)
+            {
+                bail!("unsafe retained electrs signer data: {}", path.display());
+            }
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&path)
+                .with_context(|| format!("open retained electrs signer file {}", path.display()))?;
+            let mut retained = String::new();
+            file.read_to_string(&mut retained)
+                .with_context(|| format!("read retained electrs signer file {}", path.display()))?;
+            if retained != contents {
+                bail!("retained electrs signer data does not match BitEngine's pinned key");
+            }
+            return Ok(path);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect electrs signer file {}", path.display()));
+        }
+    }
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -1053,7 +1391,6 @@ fn write_electrs_allowed_signers(job_dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn build_bitcoin(
     request: &BuildRequest,
     source: &Path,
@@ -1089,16 +1426,17 @@ async fn build_bitcoin(
             "-DWITH_NATPMP=OFF".to_owned(),
         ]);
     }
-    process::run(
-        request.operation_id,
-        "cmake",
-        &configure,
-        None,
-        &environment,
-        &reporter.event_tx,
-        &reporter.log_tx,
+    process::run_with_ui_output(process::RunSpec {
+        operation_id: request.operation_id,
+        program: "cmake",
+        arguments: &configure,
+        working_directory: None,
+        environment: &environment,
+        event_tx: &reporter.event_tx,
+        log_tx: &reporter.log_tx,
         cancelled,
-    )
+        verbose_output: request.verbose_output,
+    })
     .await
     .context("CMake could not prepare the Bitcoin Core build")?;
     reporter.progress(0.34);
@@ -1110,16 +1448,17 @@ async fn build_bitcoin(
         "--parallel".to_owned(),
         request.cores.clamp(1, 64).to_string(),
     ];
-    process::run(
-        request.operation_id,
-        "cmake",
-        &build,
-        None,
-        &environment,
-        &reporter.event_tx,
-        &reporter.log_tx,
+    process::run_with_ui_output(process::RunSpec {
+        operation_id: request.operation_id,
+        program: "cmake",
+        arguments: &build,
+        working_directory: None,
+        environment: &environment,
+        event_tx: &reporter.event_tx,
+        log_tx: &reporter.log_tx,
         cancelled,
-    )
+        verbose_output: request.verbose_output,
+    })
     .await
     .context("Bitcoin Core compilation failed")?;
     reporter.progress(0.82);
@@ -1138,7 +1477,6 @@ async fn build_bitcoin(
     Ok(artifacts)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn build_electrs(
     request: &BuildRequest,
     source: &Path,
@@ -1158,16 +1496,17 @@ async fn build_electrs(
         request.cores.clamp(1, 64).to_string(),
         "--locked".to_owned(),
     ];
-    process::run(
-        request.operation_id,
-        "cargo",
-        &arguments,
-        Some(source),
-        &environment,
-        &reporter.event_tx,
-        &reporter.log_tx,
+    process::run_with_ui_output(process::RunSpec {
+        operation_id: request.operation_id,
+        program: "cargo",
+        arguments: &arguments,
+        working_directory: Some(source),
+        environment: &environment,
+        event_tx: &reporter.event_tx,
+        log_tx: &reporter.log_tx,
         cancelled,
-    )
+        verbose_output: request.verbose_output,
+    })
     .await
     .context("electrs compilation failed")?;
     reporter.progress(0.82);
@@ -1506,8 +1845,15 @@ async fn write_build_log_with_limit(
             .unwrap_or(usize::MAX)
             .min(bytes.len());
         if accepted > 0 {
-            file.write_all(&bytes[..accepted]).await?;
-            written = written.saturating_add(accepted as u64);
+            file.write_all(
+                bytes
+                    .get(..accepted)
+                    .context("build log slice exceeded its message")?,
+            )
+            .await?;
+            written = written
+                .checked_add(u64::try_from(accepted).context("build log length exceeded u64")?)
+                .context("build log byte count overflowed")?;
         }
         if accepted < bytes.len() || written == data_limit {
             file.write_all(MARKER).await?;
@@ -1662,6 +2008,111 @@ mod tests {
         assert!(failure.message.contains("Bitcoin Core"));
     }
 
+    #[tokio::test]
+    async fn clean_build_discards_only_reusable_work_artifacts() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace)?;
+        let workspace = fs::canonicalize(workspace)?;
+        let cache_root = prepare_managed_directory(&workspace, BUILD_CACHE_NAME)?;
+        let cache_entry = cache_root.join("bitcoin-31.1");
+        create_private_directory(&cache_entry)?;
+        let source = cache_entry.join("source");
+        let work = cache_entry.join("work");
+        create_private_directory(&source)?;
+        create_private_directory(&work)?;
+        fs::write(source.join("signed-tag-fixture"), b"authenticated source")?;
+        fs::write(work.join("object-file"), b"reusable artifact")?;
+        let outside = workspace.join("outside-sentinel");
+        fs::write(&outside, b"untouched")?;
+        let layout = BuildLayout {
+            source: source.clone(),
+            work: work.clone(),
+            cache_root,
+            cache_entry,
+            uses_cache: true,
+            new_cache: false,
+        };
+
+        prepare_build_directory(&layout, true).await?;
+
+        assert_eq!(
+            fs::read(source.join("signed-tag-fixture"))?,
+            b"authenticated source"
+        );
+        assert!(work.is_dir());
+        assert!(!work.join("object-file").exists());
+        assert_eq!(fs::read(outside)?, b"untouched");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keep_source_cache_commits_and_removes_only_inside_managed_entry() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace)?;
+        let workspace = fs::canonicalize(workspace)?;
+        let cache_root = prepare_managed_directory(&workspace, BUILD_CACHE_NAME)?;
+        let job_dir = workspace.join("job");
+        create_private_directory(&job_dir)?;
+        let cache_entry = cache_root.join("electrs-0.11.1");
+        create_private_directory(&cache_entry)?;
+        create_uncommitted_cache_marker(&cache_entry)?;
+        let source = cache_entry.join("source");
+        let work = cache_entry.join("work");
+        create_private_directory(&source)?;
+        create_private_directory(&work)?;
+        fs::write(source.join("authenticated-tag"), b"signed source")?;
+        fs::write(work.join("compiled-object"), b"object")?;
+        let layout = BuildLayout {
+            source,
+            work,
+            cache_root: cache_root.clone(),
+            cache_entry: cache_entry.clone(),
+            uses_cache: true,
+            new_cache: true,
+        };
+        let mut request = BuildRequest {
+            operation_id: BuildOperationId(88),
+            kind: BinaryKind::Electrs,
+            version: "v0.11.1".parse().map_err(anyhow::Error::msg)?,
+            binaries_dir: temporary.path().join("binaries"),
+            workspace,
+            cores: 1,
+            keep_source: true,
+            clean_build: false,
+            verbose_output: false,
+        };
+
+        finalize_build_cache(&request, &job_dir, &layout).await?;
+        assert!(!cache_entry.join(UNCOMMITTED_CACHE_MARKER).exists());
+        assert_eq!(
+            fs::read(cache_entry.join("source/authenticated-tag"))?,
+            b"signed source"
+        );
+        assert_eq!(
+            fs::read(cache_entry.join("work/compiled-object"))?,
+            b"object"
+        );
+
+        let outside = request.workspace.join("outside-sentinel");
+        fs::write(&outside, b"untouched")?;
+        request.keep_source = false;
+        let cached_layout = BuildLayout {
+            source: cache_entry.join("source"),
+            work: cache_entry.join("work"),
+            cache_root,
+            cache_entry: fs::canonicalize(&cache_entry)?,
+            uses_cache: true,
+            new_cache: false,
+        };
+        finalize_build_cache(&request, &job_dir, &cached_layout).await?;
+
+        assert!(!cache_entry.exists());
+        assert_eq!(fs::read(outside)?, b"untouched");
+        Ok(())
+    }
+
     #[test]
     fn running_job_is_recovered_as_interrupted() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -1730,6 +2181,36 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("further output was discarded"));
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         Ok(())
+    }
+
+    #[test]
+    fn log_finalization_failure_preserves_the_installation_outcome() {
+        let mut success = Ok(BuildSummary {
+            kind: BinaryKind::Electrs,
+            version: "0.11.1".parse().expect("fixture release"),
+            installed: vec!["electrs".to_owned()],
+            log_path: PathBuf::from("/fixture/build.log"),
+            warning: None,
+        });
+        record_log_failure(&mut success, "fixture fsync failure");
+        let summary = success.expect("committed installation must remain successful");
+        assert_eq!(summary.installed, ["electrs"]);
+        assert!(summary
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("fixture fsync failure")));
+
+        let mut failure = Err(BuildFailure {
+            message: "Build cancelled".to_owned(),
+            cancelled: true,
+            conflict: false,
+        });
+        record_log_failure(&mut failure, "fixture writer join failure");
+        let failure = failure.expect_err("failed installation must remain failed");
+        assert!(failure.cancelled);
+        assert!(!failure.conflict);
+        assert!(failure.message.starts_with("Build cancelled\n"));
+        assert!(failure.message.contains("fixture writer join failure"));
     }
 
     #[tokio::test]
@@ -1888,6 +2369,9 @@ mod tests {
             binaries_dir: destination.clone(),
             workspace: temporary.path().join("workspace"),
             cores: 1,
+            keep_source: false,
+            clean_build: false,
+            verbose_output: false,
         };
 
         let failure = service
@@ -1920,6 +2404,9 @@ mod tests {
             binaries_dir: destination.clone(),
             workspace,
             cores: 8,
+            keep_source: false,
+            clean_build: false,
+            verbose_output: false,
         };
 
         let summary = service

@@ -4,6 +4,9 @@
 //! effective mainnet configuration so it can connect Electrs to an existing
 //! listener without adding or changing `port`, `bind`, or `listen` arguments.
 
+// Sizes, counters, protocol values, and timeouts require explicit arithmetic.
+#![deny(clippy::arithmetic_side_effects)]
+
 use std::{
     collections::HashMap,
     fs::OpenOptions,
@@ -43,11 +46,11 @@ const RELEVANT_OPTIONS: &[&str] = &[
 
 /// Endpoints and authentication path fixed for one managed Bitcoin generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ManagedBitcoinEndpoints {
-    pub rpc_candidates: Vec<SocketAddr>,
-    pub rpc_port: u16,
-    pub p2p_candidates: Vec<SocketAddr>,
-    pub cookie_file: PathBuf,
+pub(super) struct ManagedBitcoinEndpoints {
+    pub(super) rpc_candidates: Vec<SocketAddr>,
+    pub(super) rpc_port: u16,
+    pub(super) p2p_candidates: Vec<SocketAddr>,
+    pub(super) cookie_file: PathBuf,
 }
 
 /// Resolve the endpoints that the managed Core process will expose to `BitEngine`.
@@ -60,7 +63,7 @@ pub struct ManagedBitcoinEndpoints {
 ///
 /// Returns an error when relevant configuration cannot be inspected exactly,
 /// contains an invalid endpoint, or disables the P2P service Electrs requires.
-pub fn resolve_managed_endpoints(data_dir: &Path) -> Result<ManagedBitcoinEndpoints> {
+pub(super) fn resolve_managed_endpoints(data_dir: &Path) -> Result<ManagedBitcoinEndpoints> {
     let data_dir = std::fs::canonicalize(data_dir)
         .with_context(|| format!("canonicalize Bitcoin data directory {}", data_dir.display()))?;
     let config = load_config(&data_dir)?;
@@ -187,7 +190,7 @@ fn parse_config(text: &str, path: &Path, config: &mut ConfigValues) -> Result<()
     let mut current_section = String::new();
 
     for (line_index, raw_line) in text.lines().enumerate() {
-        let line_number = line_index + 1;
+        let line_number = line_index.saturating_add(1);
         let line = raw_line
             .split_once('#')
             .map_or(raw_line, |(value, _)| value)
@@ -196,8 +199,11 @@ fn parse_config(text: &str, path: &Path, config: &mut ConfigValues) -> Result<()
             continue;
         }
 
-        if line.starts_with('[') && line.ends_with(']') {
-            line[1..line.len() - 1].clone_into(&mut current_section);
+        if let Some(section) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            section.clone_into(&mut current_section);
             continue;
         }
         if line.starts_with('-') {
@@ -259,7 +265,7 @@ fn config_source_scalar(values: &[RawValue]) -> Option<&RawValue> {
     let start = values
         .iter()
         .rposition(|value| matches!(value, RawValue::False))
-        .map_or(0, |index| index + 1);
+        .map_or(0, |index| index.saturating_add(1));
     values.get(start).or_else(|| values.last())
 }
 
@@ -267,7 +273,7 @@ fn config_source_list(values: &[RawValue]) -> Vec<RawValue> {
     let start = values
         .iter()
         .rposition(|value| matches!(value, RawValue::False))
-        .map_or(0, |index| index + 1);
+        .map_or(0, |index| index.saturating_add(1));
     values.get(start..).unwrap_or_default().to_vec()
 }
 
@@ -426,7 +432,7 @@ impl ListMerge {
         let last_negation = source
             .iter()
             .rposition(|value| matches!(value, RawValue::False));
-        let start = last_negation.map_or(0, |index| index + 1);
+        let start = last_negation.map_or(0, |index| index.saturating_add(1));
         let add_zombie_values = !self.previous_negated_empty;
         if !self.done || add_zombie_values {
             self.values
